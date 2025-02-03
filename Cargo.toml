@@ -1,0 +1,18 @@
+[package]
+name = "xchannel"
+version = "0.1.0"
+edition = "2024"
+
+license = "private"
+description = "Workspace "
+keywords = ["ipc", "channel"]
+
+[dependencies]
+memmap2 = "0.9.5"
+libc = "0.2.170"
+
+[dev-dependencies]
+anyhow = "1.0.96"
+
+[features]
+disabled = []
