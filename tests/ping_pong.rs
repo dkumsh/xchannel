@@ -145,20 +145,17 @@ fn test_ping_pong() -> io::Result<()> {
     let count = 100_000u64;
 
     // Pre-create the channel files so readers can open them immediately.
-    {
-        let _ = WriterBuilder::new(chan_a)
-            .region_size(region_size)
-            .file_roll_size(file_roll_size)
-            .build()
-            .expect("failed to pre-create chan_a");
-    }
-    {
-        let _ = WriterBuilder::new(chan_b)
-            .region_size(region_size)
-            .file_roll_size(file_roll_size)
-            .build()
-            .expect("failed to pre-create chan_b");
-    }
+    WriterBuilder::new(chan_a)
+        .region_size(region_size)
+        .file_roll_size(file_roll_size)
+        .precreate()
+        .expect("failed to pre-create chan_a");
+
+    WriterBuilder::new(chan_b)
+        .region_size(region_size)
+        .file_roll_size(file_roll_size)
+        .precreate()
+        .expect("failed to pre-create chan_b");
 
     unsafe {
         let pid = libc::fork();

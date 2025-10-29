@@ -2,10 +2,26 @@
 name = "xchannel"
 version = "0.1.0"
 edition = "2024"
+description = "mmap-backed IPC channels with regionized layout, alignment-safe headers, and file rolling."
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/dkumsh/xchannel"
+keywords = ["mmap", "ipc", "zero-copy", "shared-memory", "channels"]
+categories = ["concurrency", "memory-management", "os::unix-apis", "data-structures"]
+include = [
+    "src/**",
+    "README.md",
+    "LICENSE*",
+    "Cargo.toml",
+    "tests/**"
+]
 
-license = "private"
-description = "Workspace "
-keywords = ["ipc", "channel"]
+[lib]
+name = "xchannel"
+path = "src/lib.rs"
+
+[features]
+disabled = []
 
 [dependencies]
 memmap2 = "0.9.5"
@@ -14,5 +30,3 @@ libc = "0.2.170"
 [dev-dependencies]
 anyhow = "1.0.96"
 
-[features]
-disabled = []
