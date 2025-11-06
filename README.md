@@ -26,6 +26,7 @@
   unbounded memory usage or corrupted input.
 * **Atomic state management**: the shared write position and message
   count are tracked using atomic variables with proper memory orderin
+* **Active file suffix**: the writer always appends to a file ending in `.current` (e.g. `chan`, `chan.1.current`); on roll or writer drop the `.current` suffix is removed to mark the file complete so readers can distinguish active vs finalized files.
 
 ## Minimum example
 

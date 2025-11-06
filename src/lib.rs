@@ -4,6 +4,8 @@
 //! - Regionized file layout; region 0 starts with a `MessageHeader(Channel)` followed by `ChannelHeader`.
 //! - Messages are written as `MessageHeader(User)` + payload.
 //! - Special markers: `Skip` (pad to next region), `Roll` (file rolled).
+//! - Active file naming: writer always writes to `<base>[.<seq>].current`; when a file is rolled
+//!   or the writer drops, the `.current` suffix is atomically removed to mark the file complete.
 //!
 //! # Safety
 //! Writers produce `&mut` references into an mmap; do **not** run a reader in the
@@ -16,7 +18,7 @@ mod region;
 use channel::{ChannelHeader, HeaderType, MessageHeader};
 pub use region::{ReadOnly, RegionMapping, Writable, page_size};
 
-use std::fs::{File, OpenOptions, read_dir};
+use std::fs::{File, OpenOptions, read_dir, rename};
 use std::io::{self, ErrorKind};
 use std::mem::{align_of, size_of};
 use std::path::{Path, PathBuf};
@@ -294,13 +296,23 @@ impl Writer {
         region_size: usize,
         mtu: u64,
     ) -> io::Result<(File, RegionMapping<Writable>, RegionMapping<Writable>, u64)> {
-        let file_path = make_channel_file_path(base_path, sequence)?;
+        // Prefer current (active) variant. If only the completed file exists, promote it.
+        let current_path = make_current_file_path(base_path, sequence)?;
+        let completed_path = make_channel_file_path(base_path, sequence)?;
+        let (open_path, newly_created) = if path_exists(&current_path) {
+            (current_path.clone(), false)
+        } else if path_exists(&completed_path) {
+            rename(&completed_path, &current_path)?;
+            (current_path.clone(), false)
+        } else {
+            (current_path.clone(), true)
+        };
         let file = OpenOptions::new()
             .read(true)
             .write(true)
-            .create(true)
+            .create(newly_created)
             .truncate(false)
-            .open(&file_path)?;
+            .open(&open_path)?;
 
         let meta = file.metadata()?;
         if meta.len() == 0 {
@@ -509,6 +521,15 @@ impl Writer {
         // Bump old file write_position by one header (Release => header visible first)
         fetch_add_wp(&old_file, old_region_size, MESSAGE_HEADER_SIZE as u64)?;
         with_ch_mut(&old_file, old_region_size, |ch| ch.message_count += 1)?;
+        // Finalize old file name: remove `.current` suffix if present.
+        if let (Ok(curr), Ok(done)) = (
+            make_current_file_path(&self.base_path, old_seq),
+            make_channel_file_path(&self.base_path, old_seq),
+        ) {
+            if path_exists(&curr) {
+                let _ = rename(curr, done);
+            }
+        }
         Ok(())
     }
 
@@ -656,7 +677,9 @@ impl Reader {
     }
 
     fn open_sequence_file(base_path: PathBuf, sequence: u64, mode: ReaderMode) -> io::Result<Self> {
-        let file_path = make_channel_file_path(&base_path, sequence)?;
+        let completed = make_channel_file_path(&base_path, sequence)?;
+        let current = make_current_file_path(&base_path, sequence)?;
+        let file_path = if path_exists(&current) { current } else { completed };
         let file = OpenOptions::new()
             .read(true)
             .write(false)
@@ -774,7 +797,9 @@ impl Reader {
 
     fn open_next_file(&mut self) -> io::Result<()> {
         self.file_sequence += 1;
-        let file_path = make_channel_file_path(&self.base_path, self.file_sequence)?;
+        let completed = make_channel_file_path(&self.base_path, self.file_sequence)?;
+        let current = make_current_file_path(&self.base_path, self.file_sequence)?;
+        let file_path = if path_exists(&current) { current } else { completed };
         let file = OpenOptions::new()
             .read(true)
             .write(false)
@@ -848,6 +873,22 @@ fn make_channel_file_path(base_path: &Path, sequence: u64) -> io::Result<PathBuf
     })
 }
 
+/// Build the path for the active (currently written) file.
+fn make_current_file_path(base_path: &Path, sequence: u64) -> io::Result<PathBuf> {
+    let mut p = make_channel_file_path(base_path, sequence)?;
+    let name = p
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| err_other("invalid file name"))?;
+    let mut new_name = name.to_string();
+    new_name.push_str(".current");
+    p.set_file_name(new_name);
+    Ok(p)
+}
+
+#[inline]
+fn path_exists(p: &Path) -> bool { p.exists() }
+
 fn find_earliest_sequence(base_path: &Path) -> io::Result<u64> {
     find_sequence(base_path, false)
 }
@@ -874,13 +915,11 @@ fn find_sequence(path: &Path, latest: bool) -> io::Result<u64> {
             entry.ok().and_then(|e| {
                 let file_name = e.file_name();
                 let file_name = file_name.to_str()?;
-                if file_name == base_name {
+                if file_name == base_name || file_name == format!("{}.current", base_name) {
                     Some(0)
-                } else if file_name.starts_with(&format!("{}.", base_name)) {
-                    file_name
-                        .strip_prefix(&format!("{}.", base_name))?
-                        .parse()
-                        .ok()
+                } else if let Some(rest) = file_name.strip_prefix(&format!("{}.", base_name)) {
+                    let seq_part = rest.strip_suffix(".current").unwrap_or(rest);
+                    seq_part.parse().ok()
                 } else {
                     None
                 }
@@ -900,16 +939,25 @@ fn find_sequence(path: &Path, latest: bool) -> io::Result<u64> {
 pub fn cleanup_channel_files<P: AsRef<std::path::Path>>(base: P) {
     use std::fs;
     let base_path = base.as_ref();
-    // remove base (sequence 0)
-    let _ = fs::remove_file(base_path);
-    // remove rolled files (1..)
-    for i in 1.. {
-        if let Ok(p) = make_channel_file_path(base_path, i) {
-            if fs::remove_file(&p).is_err() {
-                break;
+    let _ = fs::remove_file(base_path); // sequence 0 completed
+    if let Ok(curr0) = make_current_file_path(base_path, 0) { let _ = fs::remove_file(&curr0); }
+    // Remove a generous range of possible rolled files; ignore gaps.
+    for i in 1..10_000 { // arbitrary upper bound for cleanup in tests
+        if let Ok(p) = make_channel_file_path(base_path, i) { let _ = fs::remove_file(&p); }
+        if let Ok(cp) = make_current_file_path(base_path, i) { let _ = fs::remove_file(&cp); }
+    }
+}
+
+impl Drop for Writer {
+    fn drop(&mut self) {
+        // Finalize active file: remove .current suffix so readers know it's complete.
+        if let (Ok(curr), Ok(done)) = (
+            make_current_file_path(&self.base_path, self.file_sequence),
+            make_channel_file_path(&self.base_path, self.file_sequence),
+        ) {
+            if path_exists(&curr) {
+                let _ = rename(curr, done);
             }
-        } else {
-            break;
         }
     }
 }
