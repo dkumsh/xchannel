@@ -39,7 +39,7 @@ fn run_pong(in_chan: &str, out_chan: &str, region_size: usize, file_roll_size: u
                 if let Some(buf) = writer.try_reserve(std::mem::size_of::<u64>()) {
                     buf.copy_from_slice(&value.to_le_bytes());
                     writer
-                        .commit(0, std::mem::size_of::<u64>() as u32)
+                        .commit(0, std::mem::size_of::<u64>() as u32, 0)
                         .expect("pong commit failed");
                     break;
                 } else {
@@ -80,7 +80,7 @@ fn run_ping(out_chan: &str, in_chan: &str, region_size: usize, file_roll_size: u
             if let Some(buf) = writer.try_reserve(std::mem::size_of::<u64>()) {
                 buf.copy_from_slice(&seq.to_le_bytes());
                 writer
-                    .commit(0, std::mem::size_of::<u64>() as u32)
+                    .commit(0, std::mem::size_of::<u64>() as u32, 0)
                     .expect("ping commit failed");
                 pending.push_back(seq);
                 break;

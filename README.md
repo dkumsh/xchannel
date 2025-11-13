@@ -42,7 +42,7 @@ let mut w = WriterBuilder::new("demo.xch")
 let payload = b"hello world";
 if let Some(buf) = w.try_reserve(payload.len()) {
     buf.copy_from_slice(payload);
-    w.commit(1, payload.len() as u32)?;
+    w.commit(1, payload.len() as u32, timestamp)?;
 }
 
 // read it back

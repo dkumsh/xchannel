@@ -8,32 +8,11 @@ pub type Writable = MmapMut;
 /// Return the OS page size.
 #[inline]
 pub fn page_size() -> usize {
-    // Using the `page_size` crate would be another option, but this avoids a dependency
-    // if you prefer. If you want the crate, replace with `page_size::get()`.
     // SAFETY: libc calls are safe here; fall back to 4096 if it fails.
     #[cfg(unix)]
     {
         let ps = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
         if ps > 0 { ps as usize } else { 4096 }
-    }
-    #[cfg(windows)]
-    {
-        // Windows: GetSystemInfo
-        use std::mem::MaybeUninit;
-        #[repr(C)]
-        struct SYSTEM_INFO {
-            w: [usize; 16],
-        } // avoid binding; we only read dwPageSize at [1]
-        extern "system" {
-            fn GetSystemInfo(lpSystemInfo: *mut SYSTEM_INFO);
-        }
-        let mut si = MaybeUninit::<SYSTEM_INFO>::uninit();
-        unsafe { GetSystemInfo(si.as_mut_ptr()) };
-        let si = unsafe { si.assume_init() };
-        // On Windows, page size is USHORT in struct; practical values 4K/8K/64K.
-        // Use a conservative default if something odd happens.
-        let ps = si.w[1];
-        if ps != 0 { ps } else { 4096 }
     }
 }
 
@@ -94,12 +73,18 @@ impl RegionMapping<Writable> {
         if file.metadata()?.len() < required_len {
             file.set_len(required_len)?;
         }
+
         let mmap = unsafe {
-            MmapOptions::new()
-                .offset(base_offset)
-                .len(region_size)
-                .map_mut(file)?
+            let mut opts = MmapOptions::new();
+            opts.offset(base_offset).len(region_size);
+            // Prefer MAP_POPULATE on Linux to avoid first-touch stalls
+            #[cfg(target_os = "linux")]
+            let mmap = opts.populate().map_mut(file)?;
+            #[cfg(not(target_os = "linux"))]
+            let mmap = opts.map_mut(file)?;
+            mmap
         };
+
         Ok(Self {
             mmap,
             region_offset: base_offset,
@@ -129,10 +114,13 @@ impl RegionMapping<ReadOnly> {
     pub fn create_read_only(file: &File, base_offset: u64, region_size: usize) -> io::Result<Self> {
         check_alignment(base_offset, region_size)?;
         let mmap = unsafe {
-            MmapOptions::new()
-                .offset(base_offset)
-                .len(region_size)
-                .map(file)?
+            let mut opts = MmapOptions::new();
+            opts.offset(base_offset).len(region_size);
+            #[cfg(target_os = "linux")]
+            let mmap = opts.populate().map(file)?;
+            #[cfg(not(target_os = "linux"))]
+            let mmap = opts.map(file)?;
+            mmap
         };
         Ok(Self {
             mmap,
@@ -140,7 +128,6 @@ impl RegionMapping<ReadOnly> {
             region_size,
         })
     }
-
     #[inline]
     pub fn as_ptr(&self) -> *const u8 {
         self.mmap.as_ptr()

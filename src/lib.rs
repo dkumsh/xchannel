@@ -2,13 +2,15 @@
 //!
 //! # Overview
 //! - Regionized file layout; region 0 starts with a `MessageHeader(Channel)` followed by `ChannelHeader`.
-//! - Messages are written as `MessageHeader(User)` + payload.
+//! - **Pre-header pipeline** for user records:
+//!   For record *i*: header(i) is pre-installed (committed=0), writer copies payload(i) after it,
+//!   then fills header(i) and sets committed=1 (Release), and finally pre-installs header(i+1).
 //! - Special markers: `Skip` (pad to next region), `Roll` (file rolled).
 //!
 //! # Safety
 //! Writers produce `&mut` references into an mmap; do **not** run a reader in the
 //! same process concurrently with a writer to the same file/region. For cross-process
-//! IPC this is fine. Publishing uses `Release` and reading uses `Acquire/SeqCst`.
+//! IPC this is fine. Publishing uses `Release` and reading uses `Acquire`.
 
 mod channel;
 mod region;
@@ -29,9 +31,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const MESSAGE_HEADER_SIZE: usize = size_of::<MessageHeader>();
 const CHANNEL_HEADER_SIZE: usize = size_of::<ChannelHeader>();
 
-// New: alignment controls
-const ALIGN: usize = align_of::<MessageHeader>(); // 8 on all supported targets
-#[inline]
+// Keep 8-byte alignment (can be revisited later).
+const ALIGN: usize = align_of::<MessageHeader>(); // 8 on supported targets
+
+// Header slot size == struct size (16B) for now.
+const HEADER_SLOT: usize = MESSAGE_HEADER_SIZE;
+
+#[inline(always)]
 fn align_up(x: usize) -> usize {
     (x + (ALIGN - 1)) & !(ALIGN - 1)
 }
@@ -64,7 +70,7 @@ where
 #[inline]
 fn store_wp(file: &File, region_size: usize, val: u64) -> io::Result<()> {
     with_ch_mut(file, region_size, |ch| {
-        ch.write_position.store(val, Ordering::SeqCst);
+        ch.write_position.store(val, Ordering::Release);
     })
 }
 
@@ -95,30 +101,6 @@ fn write_header_at(
     } else {
         Err(err_other("write_header_at: failed to get bytes"))
     }
-}
-
-#[inline]
-fn emit_skip_at(file: &File, region_size: usize, pos: usize, skip_len: usize) -> io::Result<()> {
-    write_header_at(
-        file,
-        region_size,
-        pos,
-        MessageHeader {
-            length: skip_len as u32,
-            header_type: HeaderType::Skip,
-            _reserved: 0,
-            message_type: 0,
-            timestamp_ns: 0,
-        },
-    )?;
-    fetch_add_wp(
-        file,
-        region_size,
-        MESSAGE_HEADER_SIZE as u64 + skip_len as u64,
-    )?;
-    // message_count bump:
-    with_ch_mut(file, region_size, |ch| ch.message_count += 1)?;
-    Ok(())
 }
 
 // ========== Builders ==========
@@ -212,6 +194,7 @@ pub struct Writer {
     base_path: PathBuf,
     file_sequence: u64,
     file: File,
+    file_len: u64,
 
     channel_region: RegionMapping<Writable>,
     current_region: RegionMapping<Writable>,
@@ -220,6 +203,10 @@ pub struct Writer {
     region_size: usize,
     file_roll_size: u64,
     mtu: u64,
+
+    // Pre-header pipeline state:
+    next_hdr_pos: usize, // absolute file offset of the pre-installed header slot
+    msgs_since_wp: u32,  // batched write_position heartbeat
 }
 
 impl Writer {
@@ -233,7 +220,7 @@ impl Writer {
     ) -> io::Result<Self> {
         // Validate region invariants
         let ps = region::page_size();
-        // Region must be a multiple of the OS page size (and the header alignment too)
+        // Region must be a multiple of the OS page size and header alignment
         if !region_size.is_multiple_of(ps) {
             return Err(io::Error::new(
                 ErrorKind::InvalidInput,
@@ -252,13 +239,13 @@ impl Writer {
                 ),
             ));
         }
-        if region_size < MESSAGE_HEADER_SIZE + CHANNEL_HEADER_SIZE {
+        if region_size < HEADER_SLOT + CHANNEL_HEADER_SIZE {
             return Err(io::Error::new(
                 ErrorKind::InvalidInput,
                 format!(
                     "region_size ({}) must be >= header space ({})",
                     region_size,
-                    MESSAGE_HEADER_SIZE + CHANNEL_HEADER_SIZE
+                    HEADER_SLOT + CHANNEL_HEADER_SIZE
                 ),
             ));
         }
@@ -271,29 +258,40 @@ impl Writer {
 
         let base_path = path.as_ref().to_path_buf();
         let sequence = find_latest_sequence(&base_path)?;
-        let (file, channel_region, current_region, current_region_index) =
+        let (file, channel_region, current_region, current_region_index, file_len, next_hdr_pos) =
             Self::open_file(&base_path, sequence, region_size, mtu)?;
 
         Ok(Self {
             base_path,
             file_sequence: sequence,
             file,
+            file_len,
             channel_region,
             current_region,
             current_region_index,
             region_size,
             file_roll_size,
             mtu,
+            next_hdr_pos,
+            msgs_since_wp: 0,
         })
     }
 
-    /// Open a specific sequence file. If new => init region0's ChannelHeader. Else read existing.
+    /// Open a specific sequence file. If new => init region0's ChannelHeader and **pre-install first user header**.
+    #[allow(clippy::type_complexity)]
     fn open_file(
         base_path: &Path,
         sequence: u64,
         region_size: usize,
         mtu: u64,
-    ) -> io::Result<(File, RegionMapping<Writable>, RegionMapping<Writable>, u64)> {
+    ) -> io::Result<(
+        File,
+        RegionMapping<Writable>,
+        RegionMapping<Writable>,
+        u64,
+        u64,
+        usize,
+    )> {
         let file_path = make_channel_file_path(base_path, sequence)?;
         let file = OpenOptions::new()
             .read(true)
@@ -308,31 +306,54 @@ impl Writer {
             file.set_len(region_size as u64)?;
             let mut region0 = RegionMapping::create_writable(&file, 0, region_size)?;
 
-            // 1) message header
+            // 1) message header (Channel)
             let mh_ptr = region0.as_mut_ptr();
             let mh = unsafe { &mut *(mh_ptr as *mut MessageHeader) };
+            mh.committed = 1; // committed system record
             mh.length = CHANNEL_HEADER_SIZE as u32;
             mh.header_type = HeaderType::Channel;
-            mh._reserved = 0;
             mh.message_type = 0;
             mh.timestamp_ns = 0;
 
             // 2) channel header
             let ch_ptr = unsafe { mh_ptr.add(MESSAGE_HEADER_SIZE) as *mut ChannelHeader };
             unsafe {
-                (*ch_ptr).write_position =
-                    AtomicU64::new((MESSAGE_HEADER_SIZE + CHANNEL_HEADER_SIZE) as u64);
-                (*ch_ptr).message_count = 1;
+                (*ch_ptr).write_position = AtomicU64::new(0); // set below after pre-install
+                (*ch_ptr).message_count = AtomicU64::new(1);
                 (*ch_ptr).region_size = region_size as u32;
                 (*ch_ptr).mtu = mtu as u32;
                 (*ch_ptr).channel_sequence = sequence;
-                (*ch_ptr).channel_name = [0; 64];
+                (*ch_ptr).channel_name = [0; 32];
             }
 
-            let current_region = RegionMapping::create_writable(&file, 0, region_size)?;
-            Ok((file, region0, current_region, 0))
+            // 3) current region and first user header pre-install
+            let mut current_region = RegionMapping::create_writable(&file, 0, region_size)?;
+            let start = align_up(MESSAGE_HEADER_SIZE + CHANNEL_HEADER_SIZE);
+            // pre-install first user header (committed=0)
+            if let Some(h) = current_region.get_bytes_mut(start, MESSAGE_HEADER_SIZE) {
+                unsafe {
+                    *(h.as_mut_ptr() as *mut MessageHeader) = MessageHeader {
+                        committed: 0,
+                        header_type: HeaderType::User,
+                        message_type: 0,
+                        length: 0,
+                        timestamp_ns: 0,
+                    };
+                }
+            } else {
+                return Err(err_other("open_file: cannot pre-install first header"));
+            }
+
+            // Publish write_position to the **next header slot** (start)
+            with_ch_mut(&file, region_size, |ch| {
+                ch.write_position
+                    .store((start + HEADER_SLOT) as u64, Ordering::Release);
+            })?;
+
+            Ok((file, region0, current_region, 0, region_size as u64, start))
         } else {
-            // Existing => verify region size and position
+            // Existing file: adopt next header slot from write_position
+            let mut file_len = meta.len();
             let region0 = RegionMapping::create_writable(&file, 0, region_size)?;
             let ch = get_channel_header(region0.as_ptr());
             if ch.region_size as usize != region_size {
@@ -342,14 +363,30 @@ impl Writer {
                 ));
             }
 
-            let wp = ch.write_position.load(Ordering::SeqCst) as usize;
-            let region_index = (wp / region_size) as u64;
+            // wp denotes the **next header slot offset**
+            let wp_payload = ch.write_position.load(Ordering::Acquire) as usize;
+            let next_hdr = wp_payload.saturating_sub(HEADER_SLOT);
+            let region_index = (next_hdr / region_size) as u64;
+
+            // Ensure the file actually covers the region we’re about to map.
+            let needed_end = (region_index + 1) as u64 * region_size as u64;
+            if needed_end > file_len {
+                file.set_len(needed_end)?;
+                file_len = needed_end;
+            }
             let current_region = RegionMapping::create_writable(
                 &file,
                 region_index * region_size as u64,
                 region_size,
             )?;
-            Ok((file, region0, current_region, region_index))
+            Ok((
+                file,
+                region0,
+                current_region,
+                region_index,
+                file_len,
+                next_hdr,
+            ))
         }
     }
 
@@ -357,18 +394,15 @@ impl Writer {
     fn channel_header(&self) -> &ChannelHeader {
         unsafe { &*(self.channel_region.as_ptr().add(MESSAGE_HEADER_SIZE) as *const ChannelHeader) }
     }
+
     #[inline]
-    fn channel_header_mut(&mut self) -> &mut ChannelHeader {
-        let ptr = unsafe { self.channel_region.as_mut_ptr().add(MESSAGE_HEADER_SIZE) }
-            as *mut ChannelHeader;
-        unsafe { &mut *ptr }
-    }
-    #[inline]
-    fn load_wp_usize(&self) -> usize {
-        self.channel_header().write_position.load(Ordering::Acquire) as usize
+    fn publish_wp_release(&self, pos: usize) {
+        let ch = self.channel_header();
+        ch.message_count.fetch_add(1, Ordering::Relaxed);
+        ch.write_position.store(pos as u64, Ordering::Release);
     }
 
-    /// Reserve space for a message payload of length `msg_size` + align padding.
+    /// Reserve space for a message payload of length `msg_size` placed **after** a pre-installed header.
     /// Returns a mutable slice the caller can fill, or `None` on failure (e.g. MTU/roll).
     pub fn try_reserve(&mut self, msg_size: usize) -> Option<&mut [u8]> {
         if self.mtu > 0 && msg_size as u64 > self.mtu {
@@ -376,22 +410,20 @@ impl Writer {
         }
 
         loop {
-            let wp = self.load_wp_usize();
-            debug_assert_eq!(wp % ALIGN, 0, "writer header must be 8-byte aligned");
+            let wp = self.next_hdr_pos; // header slot for this record
+            debug_assert_eq!(wp % ALIGN, 0, "next header must be 8-byte aligned");
 
             // Region-local offsets
-            let offset_in_region = wp % self.region_size;
+            let off = wp % self.region_size;
 
-            // Layout we're reserving now in THIS region:
-            //   [MessageHeader(User)] [payload(msg_size)] [padding(to ALIGN)]
-            // and additionally we require that after this record there remains
-            // space for at least ONE MORE MessageHeader so a Skip can be written.
-            let record_size = MESSAGE_HEADER_SIZE + msg_size;
+            // Layout now:
+            //   [HeaderSlot (16B)] [payload(msg_size)] [padding(to ALIGN)]
+            // We also require room for the **next** header slot immediately after this record.
+            let record_size = HEADER_SLOT + msg_size;
             let record_with_padding = align_up(record_size);
+            let needed_total = record_with_padding + HEADER_SLOT; // +next header slot
 
-            let needed_total = record_with_padding + MESSAGE_HEADER_SIZE; // spare header
-
-            // file roll check includes the spare header requirement
+            // file roll check includes next-header requirement
             if self.file_roll_size > 0 && wp + needed_total > self.file_roll_size as usize {
                 if self.roll_file().is_err() {
                     return None;
@@ -399,167 +431,255 @@ impl Writer {
                 continue;
             }
 
-            // region boundary check: if we cannot fit header+payload+pad+spare_header,
-            // proactively fill the region with a Skip and move to the next region.
-            if offset_in_region + needed_total > self.region_size {
+            // region boundary: if we cannot fit record+next-header, roll to next region
+            if off + needed_total > self.region_size {
                 if self.roll_over_region().is_err() {
                     return None;
                 }
                 continue;
             }
 
-            // There is enough room. Return just the payload slice; commit() will
-            // account for padding, and the leftover >= MESSAGE_HEADER_SIZE invariant holds.
-            let payload_off = offset_in_region + MESSAGE_HEADER_SIZE;
+            // There is enough room. Return the payload slice after the header slot.
+            let payload_off = off + HEADER_SLOT;
             return self.current_region.get_bytes_mut(payload_off, msg_size);
         }
     }
 
     /// Commit the message after filling the payload slice returned by `try_reserve`.
-    pub fn commit(&mut self, msg_type: u16, length: u32) -> io::Result<()> {
-        let wp = self.load_wp_usize();
-        debug_assert_eq!(wp % ALIGN, 0, "writer header must be 8-byte aligned");
+    /// Fills the pre-installed header at `next_hdr_pos`, sets committed=1 (Release),
+    /// and **pre-installs** the next header slot (committed=0).
+    pub fn commit(&mut self, msg_type: u16, length: u32, timestamp_ns: u64) -> io::Result<()> {
+        let hdr_off = self.next_hdr_pos % self.region_size;
 
-        let offset_in_region = wp % self.region_size;
-
-        // Write header at an aligned address
+        // 1) Fill fields (committed=0)
         let hdr_slice = self
             .current_region
-            .get_bytes_mut(offset_in_region, MESSAGE_HEADER_SIZE)
+            .get_bytes_mut(hdr_off, MESSAGE_HEADER_SIZE)
             .ok_or_else(|| err_other("No header to commit"))?;
         let hdr_ptr = hdr_slice.as_mut_ptr() as *mut MessageHeader;
-        let header = MessageHeader {
-            length,
-            header_type: HeaderType::User,
-            _reserved: 0,
-            message_type: msg_type,
-            timestamp_ns: now_ns(),
-        };
-        unsafe { *hdr_ptr = header };
 
-        // Advance by header + payload + padding (to align the NEXT header).
-        let payload_end = wp + MESSAGE_HEADER_SIZE + length as usize;
-        let aligned_end = align_up(payload_end);
-        let advance_by = aligned_end - wp;
+        unsafe {
+            (*hdr_ptr).committed = 0;
+            (*hdr_ptr).length = length;
+            (*hdr_ptr).header_type = HeaderType::User;
+            (*hdr_ptr).message_type = msg_type;
+            (*hdr_ptr).timestamp_ns = timestamp_ns;
+        }
 
-        // Actual commit: advancing write_position
-        self.channel_header()
-            .write_position
-            .fetch_add(advance_by as u64, Ordering::Release);
+        // 2) Publish (commit flag last)
+        unsafe {
+            use std::sync::atomic::{AtomicU8, Ordering};
+            let cptr = std::ptr::addr_of_mut!((*hdr_ptr).committed) as *mut AtomicU8;
+            (*cptr).store(1, Ordering::Release); // publish header/record
+        }
 
-        self.channel_header_mut().message_count += 1;
+        // 3) Advance to next header slot after payload+pad
+        let payload_end = self.next_hdr_pos + HEADER_SLOT + length as usize;
+        let next_pos = align_up(payload_end);
+        self.next_hdr_pos = next_pos;
+
+        // 4) Pre-install next header slot (committed=0)
+        let next_off = next_pos % self.region_size;
+        if let Some(bytes) = self
+            .current_region
+            .get_bytes_mut(next_off, MESSAGE_HEADER_SIZE)
+        {
+            unsafe {
+                *(bytes.as_mut_ptr() as *mut MessageHeader) = MessageHeader {
+                    committed: 0,
+                    header_type: HeaderType::User,
+                    message_type: 0,
+                    length: 0,
+                    timestamp_ns: 0,
+                };
+            }
+        } else {
+            return Err(err_other("Failed to pre-install next header"));
+        }
+
+        // 5) Publish write_position = *payload start* of the next record
+        let next_payload = next_pos + HEADER_SLOT;
+        self.publish_wp_release(next_payload);
+
         Ok(())
     }
 
-    /// Explicitly roll to the next file (writes a `Roll` marker first).
-    /// Explicitly roll to the next file:
-    /// 1) ensure room in the old file for a Roll header (move to next region if needed),
-    /// 2) create & initialize the new file,
+    /// Explicitly roll to the next file (writes a `Roll` marker first in the OLD file).
+    /// Steps:
+    /// 1) compute where to put the Roll header in OLD file (current header slot or next region start),
+    /// 2) create & initialize the NEW file and pre-install its first header,
     /// 3) switch Writer to the new file,
-    /// 4) publish a Roll header into the old file (after the new file exists).
+    /// 4) publish Roll header into the OLD file and bump its write_position.
     pub fn roll_file(&mut self) -> io::Result<()> {
-        // --- Capture OLD context up front ---
+        // OLD context
         let old_region_size = self.region_size;
         let old_seq = self.file_sequence;
-
-        // Make a duplicate FD for the old file so we can write to it after we switch `self` to the new file
         let old_file = self.file.try_clone()?;
 
-        // Ensure there's space in the OLD file for at least one header. If not, move to next region there.
-        let wp = self.load_wp_usize();
+        // Decide roll_pos in OLD file
+        let wp = self.next_hdr_pos; // current header slot
         let off = wp % old_region_size;
         let leftover = old_region_size - off;
 
-        // Compute where we will write the Roll header in the OLD file
-        let roll_pos: usize = if leftover < MESSAGE_HEADER_SIZE {
-            // Not enough for even a header: jump to next region start (no Skip written).
+        let (roll_pos, grow_to_end) = if leftover < HEADER_SLOT {
+            // put Roll at next region start in OLD file
             let next_region_start = ((wp / old_region_size) + 1) * old_region_size;
-            store_wp(&old_file, old_region_size, next_region_start as u64)?;
-            next_region_start
+            let next_idx = (next_region_start / old_region_size) as u64;
+            let needed_end = (next_idx + 1) * old_region_size as u64;
+            (next_region_start, Some(needed_end))
         } else {
-            // We can write a header right now at `roll_pos`.
-            wp
+            (wp, None)
         };
 
-        // --- Step 2: create NEW file fully initialized (region 0 with Channel header) ---
+        // NEW file: open and pre-install its first header
         let next_seq = old_seq + 1;
-        let (new_file, new_channel_region, new_current_region, new_index) =
-            Self::open_file(&self.base_path, next_seq, self.region_size, self.mtu)?;
+        let (
+            new_file,
+            new_channel_region,
+            new_current_region,
+            new_index,
+            new_file_len,
+            new_next_hdr,
+        ) = Self::open_file(&self.base_path, next_seq, self.region_size, self.mtu)?;
 
-        // --- Step 3: switch Writer to the NEW file ---
+        // Switch writer to NEW file
         self.file_sequence = next_seq;
         self.file = new_file;
         self.channel_region = new_channel_region;
         self.current_region = new_current_region;
         self.current_region_index = new_index;
+        self.file_len = new_file_len;
+        self.next_hdr_pos = new_next_hdr;
+        self.msgs_since_wp = 0;
+        // Publish wp for new file (Release already done in open_file new-case)
 
-        // --- Step 4: publish Roll record in the OLD file at `roll_pos` ---
+        // Publish Roll in OLD file
+        if let Some(needed_end) = grow_to_end {
+            old_file.set_len(needed_end)?; // ensure next region exists
+        }
+
+        // If we jumped to next region earlier in OLD file, put wp there first
+        if leftover < HEADER_SLOT {
+            store_wp(&old_file, old_region_size, roll_pos as u64)?;
+        }
+
+        // Now map & write the Roll header
         write_header_at(
             &old_file,
             old_region_size,
             roll_pos,
             MessageHeader {
+                committed: 1,
                 length: 0,
                 header_type: HeaderType::Roll,
-                _reserved: 0,
                 message_type: 0,
                 timestamp_ns: now_ns(),
             },
         )?;
-        // Bump old file write_position by one header (Release => header visible first)
-        fetch_add_wp(&old_file, old_region_size, MESSAGE_HEADER_SIZE as u64)?;
-        with_ch_mut(&old_file, old_region_size, |ch| ch.message_count += 1)?;
+        // Bump old wp by one header
+        fetch_add_wp(&old_file, old_region_size, HEADER_SLOT as u64)?;
+
         Ok(())
-    }
-
-    #[allow(dead_code)]
-    fn get_payload(&mut self, offset_in_region: usize, msg_size: usize) -> Option<&mut [u8]> {
-        let payload_off = offset_in_region + MESSAGE_HEADER_SIZE;
-        self.current_region.get_bytes_mut(payload_off, msg_size)
-    }
-
-    #[allow(dead_code)]
-    fn get_message_header(&mut self, offset_in_region: usize) -> Option<&mut MessageHeader> {
-        let hdr_slice = self
-            .current_region
-            .get_bytes_mut(offset_in_region, MESSAGE_HEADER_SIZE)?;
-        let hdr_ptr = hdr_slice.as_mut_ptr() as *mut MessageHeader;
-        Some(unsafe { &mut *hdr_ptr })
     }
 
     fn roll_over_region(&mut self) -> io::Result<()> {
-        let wp = self.load_wp_usize();
+        let wp = self.next_hdr_pos;
         debug_assert_eq!(wp % ALIGN, 0, "roll_over_region: wp must be aligned");
 
-        let offset_in_region = wp % self.region_size;
-        let leftover = self.region_size - offset_in_region;
+        let off = wp % self.region_size;
+        let leftover = self.region_size - off;
 
-        if leftover >= MESSAGE_HEADER_SIZE {
-            // Emit a Skip that consumes the entire remainder of this region.
-            let skip_len = leftover - MESSAGE_HEADER_SIZE;
-            emit_skip_at(&self.file, self.region_size, wp, skip_len)?;
+        if leftover >= HEADER_SLOT {
+            // Emit Skip covering the remainder so next header slot is at next region start
+            let skip_len = leftover - HEADER_SLOT;
+            let hdr_slice = self
+                .current_region
+                .get_bytes_mut(off, MESSAGE_HEADER_SIZE)
+                .ok_or_else(|| err_other("roll_over_region: header bytes"))?;
+            unsafe {
+                *(hdr_slice.as_mut_ptr() as *mut MessageHeader) = MessageHeader {
+                    committed: 1,
+                    length: skip_len as u32,
+                    header_type: HeaderType::Skip,
+                    message_type: 0,
+                    timestamp_ns: 0,
+                };
+            }
+
+            let new_wp = wp + HEADER_SLOT + skip_len; // == next region start
+            let next_idx = (new_wp / self.region_size) as u64;
+            let needed_end = (next_idx + 1) * self.region_size as u64;
+            self.ensure_len(needed_end)?;
+            self.current_region = RegionMapping::create_writable(
+                &self.file,
+                next_idx * self.region_size as u64,
+                self.region_size,
+            )?;
+            self.current_region_index = next_idx;
+
+            // Pre-install header at start of new region
+            if let Some(h) = self.current_region.get_bytes_mut(0, MESSAGE_HEADER_SIZE) {
+                unsafe {
+                    *(h.as_mut_ptr() as *mut MessageHeader) = MessageHeader {
+                        committed: 0,
+                        header_type: HeaderType::User,
+                        message_type: 0,
+                        length: 0,
+                        timestamp_ns: 0,
+                    };
+                }
+            } else {
+                return Err(err_other(
+                    "roll_over_region: cannot pre-install next header",
+                ));
+            }
+
+            // Publish wp to the **next header slot** (Release for cross-process visibility)
+            self.next_hdr_pos = new_wp;
+            self.publish_wp_release(new_wp + HEADER_SLOT);
+            self.msgs_since_wp = 0;
+            Ok(())
         } else {
-            // Not enough for even a header: jump to next region start.
+            // Not even space for a header: jump straight to next region start
             let next_region_start = ((wp / self.region_size) + 1) * self.region_size;
-            store_wp(&self.file, self.region_size, next_region_start as u64)?;
+
+            let next_idx = (next_region_start / self.region_size) as u64;
+            let needed_end = (next_idx + 1) * self.region_size as u64;
+            self.ensure_len(needed_end)?;
+            self.current_region = RegionMapping::create_writable(
+                &self.file,
+                next_idx * self.region_size as u64,
+                self.region_size,
+            )?;
+            self.current_region_index = next_idx;
+
+            // Pre-install header at start
+            if let Some(h) = self.current_region.get_bytes_mut(0, MESSAGE_HEADER_SIZE) {
+                unsafe {
+                    *(h.as_mut_ptr() as *mut MessageHeader) = MessageHeader {
+                        committed: 0,
+                        header_type: HeaderType::User,
+                        message_type: 0,
+                        length: 0,
+                        timestamp_ns: 0,
+                    };
+                }
+            }
+
+            self.next_hdr_pos = next_region_start;
+            self.publish_wp_release(next_region_start + HEADER_SLOT);
+            self.msgs_since_wp = 0;
+            Ok(())
         }
-
-        // Remap to the new region (writer's current view)
-        let new_wp = self.load_wp_usize();
-        self.remap_current_region_at(new_wp)?;
-
-        Ok(())
     }
 
     #[inline]
-    fn remap_current_region_at(&mut self, pos: usize) -> io::Result<()> {
-        let idx = (pos / self.region_size) as u64;
-        self.current_region = RegionMapping::create_writable(
-            &self.file,
-            idx * self.region_size as u64,
-            self.region_size,
-        )?;
-        self.current_region_index = idx;
+    fn ensure_len(&mut self, want: u64) -> io::Result<()> {
+        if want > self.file_len {
+            // ftruncate to grow before any mmap touches those pages.
+            self.file.set_len(want)?;
+            self.file_len = want;
+        }
         Ok(())
     }
 }
@@ -569,22 +689,23 @@ impl Writer {
 #[derive(Debug, Clone, Copy)]
 pub enum ReaderMode {
     LateJoin, // start from earliest existing file
-    Live,     // start from latest existing file
+    Live,     // start from latest existing file (at next header slot)
 }
 
 #[derive(Clone)]
-pub struct Message {
-    pub mapping: Arc<RegionMapping<ReadOnly>>,
-    pub header_offset: usize,
-    pub payload_len: usize,
+pub struct Message<'a> {
+    mapping: &'a RegionMapping<ReadOnly>,
+    header_offset: usize,
+    payload_len: usize,
 }
 
-impl Message {
+impl<'a> Message<'a> {
     #[inline]
     fn payload_offset(&self) -> usize {
-        self.header_offset + MESSAGE_HEADER_SIZE
+        self.header_offset + HEADER_SLOT
     }
 
+    #[inline]
     pub fn header(&self) -> Option<&MessageHeader> {
         if self.header_offset + MESSAGE_HEADER_SIZE > self.mapping.region_size() {
             return None;
@@ -593,6 +714,7 @@ impl Message {
         Some(unsafe { &*(ptr as *const MessageHeader) })
     }
 
+    #[inline]
     pub fn payload(&self) -> Option<&[u8]> {
         let payload_offset = self.payload_offset();
         let end = payload_offset + self.payload_len;
@@ -601,6 +723,11 @@ impl Message {
         }
         let ptr = self.mapping.as_ptr().wrapping_add(payload_offset);
         Some(unsafe { slice::from_raw_parts(ptr, self.payload_len) })
+    }
+    #[inline]
+    #[allow(clippy::len_without_is_empty)]
+    pub fn len(&self) -> usize {
+        self.payload_len
     }
 }
 
@@ -614,12 +741,16 @@ pub struct Reader {
     read_position: usize,
 
     mode: ReaderMode,
+
+    // cached published write position (points to next header slot)
+    cached_wp: usize,
+    region_size_cached: usize,
 }
 
 impl Reader {
     /// Open a Reader:
     /// - LateJoin => earliest file; read_position = 0
-    /// - Live => latest file; read_position = write_position
+    /// - Live => latest file; read_position = write_position (next header slot)
     pub fn open<P: AsRef<Path>>(path: P, mode: ReaderMode) -> io::Result<Self> {
         let base_path = path.as_ref().to_path_buf();
         let seq = match mode {
@@ -632,6 +763,8 @@ impl Reader {
     fn get_current_read_position(file: &File, mode: ReaderMode) -> io::Result<(usize, usize)> {
         let ps = region::page_size();
         let tmp_map = RegionMapping::create_read_only(file, 0, ps)?; // map one OS page
+
+        // Verify first record is Channel
         let mh = unsafe { &*(tmp_map.as_ptr() as *const MessageHeader) };
         if mh.header_type != HeaderType::Channel {
             return Err(io::Error::new(
@@ -645,11 +778,11 @@ impl Reader {
 
         let ch = get_channel_header(tmp_map.as_ptr());
         let region_size = ch.region_size as usize;
-        let wp = ch.write_position.load(Ordering::SeqCst) as usize;
+        let wp = ch.write_position.load(Ordering::Acquire) as usize; // next header slot
 
         let read_pos = match mode {
             ReaderMode::LateJoin => 0,
-            ReaderMode::Live => wp,
+            ReaderMode::Live => wp.saturating_sub(HEADER_SLOT), // header slot
         };
         drop(tmp_map);
         Ok((read_pos, region_size))
@@ -671,6 +804,11 @@ impl Reader {
             region_size,
         )?);
 
+        // prime cached_wp from channel header
+        let ch =
+            unsafe { &*(zero_region.as_ptr().add(MESSAGE_HEADER_SIZE) as *const ChannelHeader) };
+        let cached_wp = ch.write_position.load(Ordering::Acquire) as usize;
+
         Ok(Self {
             base_path,
             file_sequence: sequence,
@@ -679,89 +817,106 @@ impl Reader {
             read_position: read_pos,
             current_region,
             mode,
+            cached_wp,
+            region_size_cached: region_size,
         })
     }
 
-    #[inline]
+    #[inline(always)]
     fn channel_header(&self) -> &ChannelHeader {
         unsafe { &*(self.zero_region.as_ptr().add(MESSAGE_HEADER_SIZE) as *const ChannelHeader) }
     }
-    #[inline]
+    #[inline(always)]
     fn load_wp(&self) -> usize {
-        self.channel_header().write_position.load(Ordering::SeqCst) as usize
+        self.channel_header().write_position.load(Ordering::Acquire) as usize
     }
-    #[inline]
+    #[inline(always)]
     fn region_size(&self) -> usize {
-        self.channel_header().region_size as usize
-    }
-    #[inline]
-    fn offset_in_region(&self) -> usize {
-        self.read_position % self.region_size()
+        self.region_size_cached
     }
 
-    /// Read next message if available. If we see `Roll` => open next file.
-    pub fn try_read(&mut self) -> Option<Message> {
+    /// Read next message if available. Roll to next file on `Roll`.
+    /// Steady path: **do not** consult `write_position`; rely on per-record `committed`.
+    /// Boundary path (when < HEADER_SLOT remains): consult `write_position` to know if next region exists.
+    pub fn try_read(&mut self) -> Option<Message<'_>> {
         loop {
-            let wp = self.load_wp();
-            if self.read_position >= wp {
-                return None;
-            }
+            let region_size = self.region_size();
+            let off = self.read_position % region_size;
+            let leftover = region_size - off;
 
-            let offset_in_region = self.offset_in_region();
-            let leftover = self.region_size() - offset_in_region;
-            if leftover < MESSAGE_HEADER_SIZE {
-                self.roll_over_region();
-                continue;
-            }
+            // Region boundary: only jump when the next region **exists** (wp >= next_start)
+            if leftover < HEADER_SLOT {
+                let next_start = ((self.read_position / region_size) + 1) * region_size;
 
-            let base_ptr = unsafe { self.current_region.as_ptr().add(offset_in_region) }
-                as *const MessageHeader;
-            // Safe to take a reference: headers are guaranteed aligned
-            let mh = unsafe { &*base_ptr };
-            debug_assert_eq!((base_ptr as usize) % ALIGN, 0, "header must be aligned");
-
-            let total_size = MESSAGE_HEADER_SIZE + mh.length as usize;
-            if total_size > leftover {
-                return None; // partial in this region
-            }
-            let end_of_rec = self.read_position + total_size;
-            if end_of_rec > wp {
-                return None; // not fully committed yet
-            }
-
-            // Align to the next header boundary (skip padding)
-            let next_pos = align_up(end_of_rec);
-
-            match mh.header_type {
-                HeaderType::Channel | HeaderType::Skip => {
-                    self.read_position = next_pos;
-                    self.maybe_switch_region_for_pos(next_pos);
-                }
-                HeaderType::Roll => {
-                    self.read_position = next_pos;
-                    // Opening next file remaps `zero_region` and `current_region`.
-                    if self.open_next_file().is_err() {
+                if self.cached_wp < next_start {
+                    self.cached_wp = self.load_wp(); // Acquire
+                    if self.cached_wp < next_start {
                         return None;
                     }
                 }
+
+                self.read_position = next_start;
+                let _ = self.switch_region((next_start / region_size) as u64);
+                continue;
+            }
+
+            // Fast path: read committed first (Acquire)
+            let base_ptr = unsafe { self.current_region.as_ptr().add(off) } as *const MessageHeader;
+
+            let committed = unsafe {
+                use std::sync::atomic::{AtomicU8, Ordering};
+                let cptr = std::ptr::addr_of!((*base_ptr).committed) as *const AtomicU8;
+                (*cptr).load(Ordering::Acquire)
+            };
+
+            if committed == 0 {
+                // not ready yet
+                std::hint::spin_loop();
+                return None;
+            }
+
+            // Header can be read safely now
+            let mh = unsafe { &*base_ptr };
+            let total = HEADER_SLOT + mh.length as usize;
+
+            if total > leftover {
+                // Shouldn't happen for USER (writer never crosses region); if it does, wait
+                return None;
+            }
+
+            let next_pos = align_up(self.read_position + total);
+
+            match mh.header_type {
                 HeaderType::User => {
+                    let region_size = self.region_size();
+                    self.read_position = next_pos;
+                    if next_pos.is_multiple_of(region_size) {
+                        let _ = self.switch_region((next_pos / region_size) as u64);
+                    }
                     let msg = Message {
-                        mapping: Arc::clone(&self.current_region),
-                        header_offset: offset_in_region,
+                        mapping: &self.current_region,
+                        header_offset: off,
                         payload_len: mh.length as usize,
                     };
-                    self.read_position = next_pos;
-                    self.maybe_switch_region_for_pos(next_pos);
                     return Some(msg);
+                }
+                HeaderType::Skip | HeaderType::Channel => {
+                    let region_size = self.region_size();
+                    self.read_position = next_pos;
+                    if next_pos.is_multiple_of(region_size) {
+                        let _ = self.switch_region((next_pos / region_size) as u64);
+                    }
+                    continue;
+                }
+                HeaderType::Roll => {
+                    self.read_position = next_pos;
+                    if self.open_next_file().is_err() {
+                        return None;
+                    }
+                    continue;
                 }
             }
         }
-    }
-    fn roll_over_region(&mut self) {
-        let region_size = self.region_size();
-        let next_start = ((self.read_position / region_size) + 1) * region_size;
-        self.read_position = next_start;
-        let _ = self.switch_region((next_start / region_size) as u64);
     }
 
     fn switch_region(&mut self, idx: u64) -> io::Result<()> {
@@ -780,7 +935,7 @@ impl Reader {
             .write(false)
             .open(&file_path)?;
 
-        // Map region 0 to learn the region size & wp
+        // Map region 0 to learn region size & wp
         let zero_region = Arc::new(RegionMapping::create_read_only(
             &file,
             0,
@@ -788,11 +943,11 @@ impl Reader {
         )?);
         let ch =
             unsafe { &*(zero_region.as_ptr().add(MESSAGE_HEADER_SIZE) as *const ChannelHeader) };
-        let wp = ch.write_position.load(Ordering::SeqCst) as usize;
+        let wp = ch.write_position.load(Ordering::Acquire) as usize;
 
         let read_pos = match self.mode {
             ReaderMode::LateJoin => 0,
-            ReaderMode::Live => wp,
+            ReaderMode::Live => wp.saturating_sub(HEADER_SLOT),
         };
         let idx = read_pos / self.region_size();
         let current_region = Arc::new(RegionMapping::create_read_only(
@@ -805,16 +960,8 @@ impl Reader {
         self.zero_region = zero_region;
         self.read_position = read_pos;
         self.current_region = current_region;
+        self.cached_wp = wp;
         Ok(())
-    }
-
-    #[inline]
-    fn maybe_switch_region_for_pos(&mut self, pos: usize) {
-        if pos.is_multiple_of(self.region_size()) {
-            let idx = (pos / self.region_size()) as u64;
-            // Best-effort; any real error will surface on the next access
-            let _ = self.switch_region(idx);
-        }
     }
 }
 
@@ -925,7 +1072,7 @@ mod tests {
         let base = "test_rolling_seq";
         cleanup_channel_files(base);
 
-        let region_size = crate::page_size(); // portable: 4K/16K/etc.
+        let region_size = crate::page_size(); // portable
         let file_roll_size = (region_size as u64) * 100;
 
         let mut writer = WriterBuilder::new(base)
@@ -939,7 +1086,7 @@ mod tests {
             for b in buf.iter_mut() {
                 *b = 0xAA;
             }
-            writer.commit(101, 500)?;
+            writer.commit(101, 500, 0)?;
         }
 
         // Roll to file1
@@ -950,13 +1097,13 @@ mod tests {
             for b in buf.iter_mut() {
                 *b = 0xBB;
             }
-            writer.commit(102, 600)?;
+            writer.commit(102, 600, 1)?;
         }
         if let Some(buf) = writer.try_reserve(300) {
             for b in buf.iter_mut() {
                 *b = 0xCC;
             }
-            writer.commit(103, 300)?;
+            writer.commit(103, 300, 2)?;
         }
 
         // remove file0 so earliest existing is file1
@@ -1016,17 +1163,17 @@ mod tests {
 
         if let Some(payload) = writer.try_reserve(msg1.len()) {
             payload.copy_from_slice(&msg1);
-            writer.commit(201, msg1.len() as u32)?;
+            writer.commit(201, msg1.len() as u32, 0)?;
         }
         writer.roll_file()?;
         if let Some(payload) = writer.try_reserve(msg2.len()) {
             payload.copy_from_slice(&msg2);
-            writer.commit(202, msg2.len() as u32)?;
+            writer.commit(202, msg2.len() as u32, 1)?;
         }
         writer.roll_file()?;
         if let Some(payload) = writer.try_reserve(msg3.len()) {
             payload.copy_from_slice(&msg3);
-            writer.commit(203, msg3.len() as u32)?;
+            writer.commit(203, msg3.len() as u32, 2)?;
         }
 
         let mut reader = Reader::open(base, ReaderMode::LateJoin)?;
@@ -1064,14 +1211,14 @@ mod tests {
         let mut w = Writer::open_or_create(base, region, file_roll_size, 0)?;
 
         // Choose len so that after header + payload the aligned end is region - header_size.
-        let record_with_padding = region - MESSAGE_HEADER_SIZE;
+        let record_with_padding = region - HEADER_SLOT;
         assert_eq!(record_with_padding % ALIGN, 0);
-        let len = record_with_padding - MESSAGE_HEADER_SIZE;
+        let len = record_with_padding - HEADER_SLOT;
         if let Some(buf) = w.try_reserve(len) {
             for b in buf.iter_mut() {
                 *b = 0xAB;
             }
-            w.commit(1, len as u32)?;
+            w.commit(1, len as u32, 0)?;
         }
 
         // Next small message should force a Skip and write at the start of next region.
@@ -1079,7 +1226,7 @@ mod tests {
             for b in buf.iter_mut() {
                 *b = 0xCD;
             }
-            w.commit(2, 32)?;
+            w.commit(2, 32, 1)?;
         }
 
         let mut r = Reader::open(base, ReaderMode::LateJoin)?;

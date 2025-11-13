@@ -1,6 +1,6 @@
 [package]
 name = "xchannel"
-version = "0.1.0"
+version = "1.0.1"
 edition = "2024"
 description = "mmap-backed IPC channels with regionized layout, alignment-safe headers, and file rolling."
 license = "MIT OR Apache-2.0"
@@ -29,4 +29,6 @@ libc = "0.2.170"
 
 [dev-dependencies]
 anyhow = "1.0.96"
+clap = { version = "4.5.51", features = ["derive"] }
+hdrhistogram = "7.5.4"
 
