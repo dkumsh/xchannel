@@ -1,5 +1,6 @@
 use clap::{ArgAction, Parser, ValueEnum};
 use hdrhistogram::Histogram;
+use std::hint::black_box;
 use std::io;
 use std::path::PathBuf;
 
@@ -38,6 +39,11 @@ struct Opt {
     /// Message payload size in bytes (supports k/m/g suffixes). Must be >= 16.
     #[arg(short = 's', long = "msg-size", default_value = "64")]
     msg_size: String,
+
+    /// Number of payload bytes (after the 16-byte header) to actually touch.
+    /// Default: msg_size - 16 (i.e. touch the entire payload).
+    #[arg(long = "touch-bytes")]
+    touch_bytes: Option<String>,
 
     /// Region size in bytes (supports k/m/g; default = OS page * 256)
     #[arg(long = "region-size")]
@@ -134,6 +140,23 @@ fn main() -> io::Result<()> {
         std::process::exit(2);
     }
 
+    let payload_bytes = msg_size - FIXED_HEADER_BYTES;
+    let touch_bytes = opt
+        .touch_bytes
+        .as_deref()
+        .map(parse_size)
+        .transpose()
+        .expect("bad --touch-bytes")
+        .unwrap_or(payload_bytes);
+
+    if touch_bytes > payload_bytes && !opt.reader {
+        eprintln!(
+            "--touch-bytes ({}) cannot exceed payload size {} (msg_size - 16)",
+            touch_bytes, payload_bytes
+        );
+        std::process::exit(2);
+    }
+
     let default_region = page_size() * 256; // good general default
     let region_size = opt
         .region_size
@@ -154,9 +177,9 @@ fn main() -> io::Result<()> {
     let mtu = parse_size(&opt.mtu).expect("bad --mtu") as u64;
 
     if opt.writer {
-        run_writer(opt, msg_size, region_size, roll_size, mtu)
+        run_writer(opt, msg_size, touch_bytes, region_size, roll_size, mtu)
     } else {
-        run_reader(opt, msg_size)
+        run_reader(opt, msg_size, touch_bytes)
     }
 }
 
@@ -165,6 +188,7 @@ fn main() -> io::Result<()> {
 fn run_writer(
     opt: Opt,
     msg_size: usize,
+    touch_bytes: usize,
     region_size: usize,
     roll_size: u64,
     mtu: u64,
@@ -183,18 +207,19 @@ fn run_writer(
 
     if opt.verbose {
         eprintln!(
-            "[writer] file={:?} region={} roll={} mtu={} msg_size={} pps={}",
+            "[writer] file={:?} region={} roll={} mtu={} msg_size={} touch_bytes={}  pps={}",
             opt.file.display(),
             region_size,
             roll_size,
             mtu,
             msg_size,
+            touch_bytes,
             pps
         );
     }
 
     let mut seq: u64 = 0;
-    let mut next_deadline = mono_time_ns();
+    let payload_len = msg_size.saturating_sub(FIXED_HEADER_BYTES);
 
     // Simple rate control (optional)
     let interval_ns = if opt.interval_us > 0 {
@@ -202,43 +227,104 @@ fn run_writer(
     } else {
         0
     };
+    let data = vec![0xA5u8; touch_bytes];
+    let mut reserve_hist = Histogram::<u64>::new_with_bounds(1, 60_000_000_000, 3).unwrap();
+    let mut copy_hist = Histogram::<u64>::new_with_bounds(1, 60_000_000_000, 3).unwrap();
+    let mut commit_hist = Histogram::<u64>::new_with_bounds(1, 60_000_000_000, 3).unwrap();
+    let mut total_hist = Histogram::<u64>::new_with_bounds(1, 60_000_000_000, 3).unwrap();
+    let report_interval_ns = opt.report_ms.saturating_mul(1_000_000);
+    let mut next_deadline = mono_time_ns();
+    let mut next_report_deadline = next_deadline + report_interval_ns;
 
     loop {
         // throttle if requested
-        if interval_ns > 0 {
+        if interval_ns > 0 || report_interval_ns > 0 {
             let now = mono_time_ns();
-            if now < next_deadline {
-                // busy wait very lightly
-                while mono_time_ns() < next_deadline {
-                    std::hint::spin_loop();
-                }
+            if report_interval_ns > 0 && now >= next_report_deadline {
+                let p50_tot = total_hist.value_at_quantile(0.50);
+                let p99_tot = total_hist.value_at_quantile(0.99);
+                let max_tot = total_hist.max();
+
+                let p50_reserve = reserve_hist.value_at_quantile(0.50);
+                let p99_reserve = reserve_hist.value_at_quantile(0.99);
+                let max_reserve = reserve_hist.max();
+
+                let p50_copy = copy_hist.value_at_quantile(0.50);
+                let p99_copy = copy_hist.value_at_quantile(0.99);
+                let max_copy = copy_hist.max();
+
+                let p50_commit = commit_hist.value_at_quantile(0.50);
+                let p99_commit = commit_hist.value_at_quantile(0.99);
+                let max_commit = commit_hist.max();
+
+                eprintln!(
+                    "[writer] total: p50={} p99={} max={}|reserve: p50={} p99={} max={}| copy: p50={} p99={} max={}| commit: p50={} p99={} max={}",
+                    fmt_ns(p50_tot),
+                    fmt_ns(p99_tot),
+                    fmt_ns(max_tot),
+                    fmt_ns(p50_reserve),
+                    fmt_ns(p99_reserve),
+                    fmt_ns(max_reserve),
+                    fmt_ns(p50_copy),
+                    fmt_ns(p99_copy),
+                    fmt_ns(max_copy),
+                    fmt_ns(p50_commit),
+                    fmt_ns(p99_commit),
+                    fmt_ns(max_commit),
+                );
+
+                total_hist.reset();
+                reserve_hist.reset();
+                copy_hist.reset();
+                commit_hist.reset();
+
+                next_report_deadline = next_report_deadline.saturating_add(report_interval_ns);
             }
-            next_deadline = next_deadline.saturating_add(interval_ns);
+            if interval_ns > 0 {
+                if now < next_deadline {
+                    // busy wait very lightly
+                    while mono_time_ns() < next_deadline {
+                        std::hint::spin_loop();
+                    }
+                }
+                next_deadline = next_deadline.saturating_add(interval_ns);
+            }
         }
 
-        if let Some(buf) = writer.try_reserve(msg_size) {
+        let t0 = mono_time_ns();
+        let buf = writer.try_reserve(msg_size)?;
+        let t1 = mono_time_ns();
+        if touch_bytes > 0 {
+            let n = touch_bytes.min(payload_len);
+            let payload = &mut buf[FIXED_HEADER_BYTES..];
+            payload[..n].copy_from_slice(&data[..n]);
+        }
+        let t2 = mono_time_ns();
+        {
+            let t_ns = t0;
             seq = seq.wrapping_add(1);
-            let t_ns = mono_time_ns();
-
             // Write sequence (LE) and timestamp (LE)
             buf[..8].copy_from_slice(&seq.to_le_bytes());
             buf[8..16].copy_from_slice(&t_ns.to_le_bytes());
-
-            // The rest can be whatever; leave zero or pattern if you want
-            // for i in 16..buf.len() { buf[i] = 0xA5; }
-
-            // msg_type is arbitrary (e.g., 1)
             writer.commit(1, msg_size as u32, t_ns)?;
-        } else {
-            // Couldn't reserve (e.g., MTU exceeded or a roll in progress). Spin a little.
-            // std::hint::spin_loop();
         }
+        let t3 = mono_time_ns();
+        // Histograms:
+        let dt_reserve = (t1 - t0).max(1); // “copy only” (plus any stall happening during copy)
+        let dt_copy = (t2 - t1).max(1); // “copy only” (plus any stall happening during copy)
+        let dt_commit = (t3 - t2).max(1);
+        let dt_total = (t3 - t0).max(1);
+
+        let _ = reserve_hist.record(dt_reserve);
+        let _ = copy_hist.record(dt_copy);
+        let _ = commit_hist.record(dt_commit);
+        let _ = total_hist.record(dt_total);
     }
 }
 
 // ---------------- Reader ----------------
 
-fn run_reader(opt: Opt, msg_size: usize) -> io::Result<()> {
+fn run_reader(opt: Opt, msg_size: usize, touch_bytes: usize) -> io::Result<()> {
     let mode = match opt.start {
         StartMode::Live => ReaderMode::Live,
         StartMode::Latejoin => ReaderMode::LateJoin,
@@ -247,11 +333,12 @@ fn run_reader(opt: Opt, msg_size: usize) -> io::Result<()> {
 
     if opt.verbose {
         eprintln!(
-            "[reader] file={:?} start={:?} report={}ms msg_size={}",
+            "[reader] file={:?} start={:?} report={}ms msg_size={}  touch_bytes={}",
             opt.file.display(),
             opt.start,
             opt.report_ms,
-            msg_size
+            msg_size,
+            touch_bytes
         );
     }
 
@@ -279,6 +366,19 @@ fn run_reader(opt: Opt, msg_size: usize) -> io::Result<()> {
             let mut ts_bytes = [0u8; 8];
             ts_bytes.copy_from_slice(&payload[8..16]);
             let sent_ns = u64::from_le_bytes(ts_bytes);
+
+            // Touch the configured number of payload bytes (after the 16-byte header)
+            let touch_bytes = (msg.len() - FIXED_HEADER_BYTES).min(touch_bytes);
+            if touch_bytes > 0 {
+                let body = &payload[FIXED_HEADER_BYTES..];
+                let to_touch = &body[..touch_bytes];
+                let mut acc: u8 = 0;
+                for b in to_touch {
+                    acc ^= *b;
+                }
+                // Prevent the compiler from optimizing the loop away
+                black_box(acc);
+            }
 
             let now_ns = mono_time_ns();
             let mut delta = now_ns.saturating_sub(sent_ns);

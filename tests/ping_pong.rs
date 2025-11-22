@@ -1,8 +1,6 @@
-// #![cfg(feature = "disabled")]
 use std::collections::VecDeque;
 use std::io;
 use std::time::{Duration, Instant};
-
 use xchannel::{ReaderBuilder, WriterBuilder, cleanup_channel_files, page_size};
 
 /// Forward messages from the ping channel to the pong channel.
@@ -36,7 +34,7 @@ fn run_pong(in_chan: &str, out_chan: &str, region_size: usize, file_roll_size: u
             let value = u64::from_le_bytes(arr);
             // Forward the payload to the out channel.  Use message_type=0.
             loop {
-                if let Some(buf) = writer.try_reserve(std::mem::size_of::<u64>()) {
+                if let Ok(buf) = writer.try_reserve(std::mem::size_of::<u64>()) {
                     buf.copy_from_slice(&value.to_le_bytes());
                     writer
                         .commit(0, std::mem::size_of::<u64>() as u32, 0)
@@ -77,7 +75,7 @@ fn run_ping(out_chan: &str, in_chan: &str, region_size: usize, file_roll_size: u
     for seq in 0..count {
         // Write the sequence value to the out channel
         loop {
-            if let Some(buf) = writer.try_reserve(std::mem::size_of::<u64>()) {
+            if let Ok(buf) = writer.try_reserve(std::mem::size_of::<u64>()) {
                 buf.copy_from_slice(&seq.to_le_bytes());
                 writer
                     .commit(0, std::mem::size_of::<u64>() as u32, 0)
@@ -88,6 +86,7 @@ fn run_ping(out_chan: &str, in_chan: &str, region_size: usize, file_roll_size: u
                 std::thread::yield_now();
             }
         }
+
         // Give the pong process a chance to forward the message
         std::thread::yield_now();
         // Read back the corresponding pong value, timing out after 1 second
@@ -127,7 +126,7 @@ fn run_ping(out_chan: &str, in_chan: &str, region_size: usize, file_roll_size: u
 /// message to `b`.  The test ensures that messages arrive in order,
 /// that mismatches are detected, and that timeouts are handled.
 #[test]
-fn test_ping_pong() -> io::Result<()> {
+fn xchannel_ping_pong() -> io::Result<()> {
     let chan_a = "ping_ch_a";
     let chan_b = "ping_ch_b";
     // Remove any leftover files

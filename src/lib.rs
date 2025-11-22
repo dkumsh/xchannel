@@ -24,7 +24,7 @@ use std::mem::{align_of, size_of};
 use std::path::{Path, PathBuf};
 use std::slice;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // ========== Constants ==========
@@ -54,6 +54,7 @@ fn get_channel_header_ptr(region_ptr: *const u8) -> *const ChannelHeader {
 fn get_channel_header<'a>(region_ptr: *const u8) -> &'a ChannelHeader {
     unsafe { &*get_channel_header_ptr(region_ptr) }
 }
+// -------- Error types: --------
 
 // -------- Small internal helpers (low-level ops) --------
 #[inline]
@@ -70,7 +71,7 @@ where
 #[inline]
 fn store_wp(file: &File, region_size: usize, val: u64) -> io::Result<()> {
     with_ch_mut(file, region_size, |ch| {
-        ch.write_position.store(val, Ordering::Release);
+        ch.write_position.store(val, Ordering::Relaxed);
     })
 }
 
@@ -78,28 +79,38 @@ fn store_wp(file: &File, region_size: usize, val: u64) -> io::Result<()> {
 fn fetch_add_wp(file: &File, region_size: usize, delta: u64) -> io::Result<u64> {
     let mut out = 0u64;
     with_ch_mut(file, region_size, |ch| {
-        out = ch.write_position.fetch_add(delta, Ordering::Release);
+        out = ch.write_position.fetch_add(delta, Ordering::Relaxed);
     })?;
     Ok(out)
 }
 
 #[inline]
-fn write_header_at(
+fn write_roll_header_at(
     file: &File,
     region_size: usize,
     pos: usize,
-    hdr: MessageHeader,
+    timestamp_ns: u64,
 ) -> io::Result<()> {
+    let hdr: MessageHeader = MessageHeader {
+        committed: 0,
+        length: 0,
+        header_type: HeaderType::Roll,
+        message_type: 0,
+        timestamp_ns,
+    };
     let ridx = (pos / region_size) as u64;
     let off = pos % region_size;
     let mut rm = RegionMapping::create_writable(file, ridx * region_size as u64, region_size)?;
     if let Some(bytes) = rm.get_bytes_mut(off, MESSAGE_HEADER_SIZE) {
         unsafe {
-            *(bytes.as_mut_ptr() as *mut MessageHeader) = hdr;
+            let hdr_ptr = bytes.as_mut_ptr() as *mut MessageHeader;
+            *hdr_ptr = hdr;
+            let committed_ptr = std::ptr::addr_of_mut!((*hdr_ptr).committed) as *mut AtomicU8;
+            (*committed_ptr).store(1, Ordering::Release);
         }
         Ok(())
     } else {
-        Err(err_other("write_header_at: failed to get bytes"))
+        Err(err_other("write_roll_header_at: failed to get bytes"))
     }
 }
 
@@ -364,7 +375,7 @@ impl Writer {
             }
 
             // wp denotes the **next header slot offset**
-            let wp_payload = ch.write_position.load(Ordering::Acquire) as usize;
+            let wp_payload = ch.write_position.load(Ordering::Relaxed) as usize;
             let next_hdr = wp_payload.saturating_sub(HEADER_SLOT);
             let region_index = (next_hdr / region_size) as u64;
 
@@ -396,17 +407,17 @@ impl Writer {
     }
 
     #[inline]
-    fn publish_wp_release(&self, pos: usize) {
+    fn publish_wp(&self, pos: usize) {
         let ch = self.channel_header();
         ch.message_count.fetch_add(1, Ordering::Relaxed);
-        ch.write_position.store(pos as u64, Ordering::Release);
+        ch.write_position.store(pos as u64, Ordering::Relaxed);
     }
 
     /// Reserve space for a message payload of length `msg_size` placed **after** a pre-installed header.
     /// Returns a mutable slice the caller can fill, or `None` on failure (e.g. MTU/roll).
-    pub fn try_reserve(&mut self, msg_size: usize) -> Option<&mut [u8]> {
+    pub fn try_reserve(&mut self, msg_size: usize) -> io::Result<&mut [u8]> {
         if self.mtu > 0 && msg_size as u64 > self.mtu {
-            return None;
+            return Err(err_other("MTU exceeded"));
         }
 
         loop {
@@ -425,23 +436,22 @@ impl Writer {
 
             // file roll check includes next-header requirement
             if self.file_roll_size > 0 && wp + needed_total > self.file_roll_size as usize {
-                if self.roll_file().is_err() {
-                    return None;
-                }
+                self.roll_file()?;
                 continue;
             }
 
             // region boundary: if we cannot fit record+next-header, roll to next region
             if off + needed_total > self.region_size {
-                if self.roll_over_region().is_err() {
-                    return None;
-                }
+                self.roll_over_region()?;
                 continue;
             }
 
             // There is enough room. Return the payload slice after the header slot.
             let payload_off = off + HEADER_SLOT;
-            return self.current_region.get_bytes_mut(payload_off, msg_size);
+            return self
+                .current_region
+                .get_bytes_mut(payload_off, msg_size)
+                .ok_or_else(|| err_other("message crosses region boundary"));
         }
     }
 
@@ -499,7 +509,7 @@ impl Writer {
 
         // 5) Publish write_position = *payload start* of the next record
         let next_payload = next_pos + HEADER_SLOT;
-        self.publish_wp_release(next_payload);
+        self.publish_wp(next_payload);
 
         Ok(())
     }
@@ -564,18 +574,7 @@ impl Writer {
         }
 
         // Now map & write the Roll header
-        write_header_at(
-            &old_file,
-            old_region_size,
-            roll_pos,
-            MessageHeader {
-                committed: 1,
-                length: 0,
-                header_type: HeaderType::Roll,
-                message_type: 0,
-                timestamp_ns: now_ns(),
-            },
-        )?;
+        write_roll_header_at(&old_file, old_region_size, roll_pos, now_ns())?;
         // Bump old wp by one header
         fetch_add_wp(&old_file, old_region_size, HEADER_SLOT as u64)?;
 
@@ -590,35 +589,21 @@ impl Writer {
         let leftover = self.region_size - off;
 
         if leftover >= HEADER_SLOT {
-            // Emit Skip covering the remainder so next header slot is at next region start
             let skip_len = leftover - HEADER_SLOT;
-            let hdr_slice = self
-                .current_region
-                .get_bytes_mut(off, MESSAGE_HEADER_SIZE)
-                .ok_or_else(|| err_other("roll_over_region: header bytes"))?;
-            unsafe {
-                *(hdr_slice.as_mut_ptr() as *mut MessageHeader) = MessageHeader {
-                    committed: 1,
-                    length: skip_len as u32,
-                    header_type: HeaderType::Skip,
-                    message_type: 0,
-                    timestamp_ns: 0,
-                };
-            }
-
             let new_wp = wp + HEADER_SLOT + skip_len; // == next region start
             let next_idx = (new_wp / self.region_size) as u64;
             let needed_end = (next_idx + 1) * self.region_size as u64;
+
+            // 1) Grow file and map the *next* region first.
             self.ensure_len(needed_end)?;
-            self.current_region = RegionMapping::create_writable(
+            let mut new_region = RegionMapping::create_writable(
                 &self.file,
                 next_idx * self.region_size as u64,
                 self.region_size,
             )?;
-            self.current_region_index = next_idx;
 
-            // Pre-install header at start of new region
-            if let Some(h) = self.current_region.get_bytes_mut(0, MESSAGE_HEADER_SIZE) {
+            // Pre-install header at the start of the new region (committed = 0).
+            if let Some(h) = new_region.get_bytes_mut(0, MESSAGE_HEADER_SIZE) {
                 unsafe {
                     *(h.as_mut_ptr() as *mut MessageHeader) = MessageHeader {
                         committed: 0,
@@ -634,9 +619,31 @@ impl Writer {
                 ));
             }
 
-            // Publish wp to the **next header slot** (Release for cross-process visibility)
+            // 2) Now write and commit the Skip in the *old* region.
+            {
+                let hdr_slice = self
+                    .current_region
+                    .get_bytes_mut(off, MESSAGE_HEADER_SIZE)
+                    .ok_or_else(|| err_other("roll_over_region: header bytes"))?;
+                unsafe {
+                    let hdr_ptr = hdr_slice.as_mut_ptr() as *mut MessageHeader;
+                    *hdr_ptr = MessageHeader {
+                        committed: 0,
+                        length: skip_len as u32,
+                        header_type: HeaderType::Skip,
+                        message_type: 0,
+                        timestamp_ns: 0,
+                    };
+                    let cptr = std::ptr::addr_of_mut!((*hdr_ptr).committed) as *mut AtomicU8;
+                    (*cptr).store(1, Ordering::Release);
+                }
+            }
+
+            // 3) Switch writer state to the new region and publish wp.
+            self.current_region = new_region;
+            self.current_region_index = next_idx;
             self.next_hdr_pos = new_wp;
-            self.publish_wp_release(new_wp + HEADER_SLOT);
+            self.publish_wp(new_wp + HEADER_SLOT);
             self.msgs_since_wp = 0;
             Ok(())
         } else {
@@ -667,7 +674,7 @@ impl Writer {
             }
 
             self.next_hdr_pos = next_region_start;
-            self.publish_wp_release(next_region_start + HEADER_SLOT);
+            self.publish_wp(next_region_start + HEADER_SLOT);
             self.msgs_since_wp = 0;
             Ok(())
         }
@@ -742,8 +749,6 @@ pub struct Reader {
 
     mode: ReaderMode,
 
-    // cached published write position (points to next header slot)
-    cached_wp: usize,
     region_size_cached: usize,
 }
 
@@ -778,7 +783,7 @@ impl Reader {
 
         let ch = get_channel_header(tmp_map.as_ptr());
         let region_size = ch.region_size as usize;
-        let wp = ch.write_position.load(Ordering::Acquire) as usize; // next header slot
+        let wp = ch.write_position.load(Ordering::Relaxed) as usize; // next header slot
 
         let read_pos = match mode {
             ReaderMode::LateJoin => 0,
@@ -804,11 +809,6 @@ impl Reader {
             region_size,
         )?);
 
-        // prime cached_wp from channel header
-        let ch =
-            unsafe { &*(zero_region.as_ptr().add(MESSAGE_HEADER_SIZE) as *const ChannelHeader) };
-        let cached_wp = ch.write_position.load(Ordering::Acquire) as usize;
-
         Ok(Self {
             base_path,
             file_sequence: sequence,
@@ -817,19 +817,10 @@ impl Reader {
             read_position: read_pos,
             current_region,
             mode,
-            cached_wp,
             region_size_cached: region_size,
         })
     }
 
-    #[inline(always)]
-    fn channel_header(&self) -> &ChannelHeader {
-        unsafe { &*(self.zero_region.as_ptr().add(MESSAGE_HEADER_SIZE) as *const ChannelHeader) }
-    }
-    #[inline(always)]
-    fn load_wp(&self) -> usize {
-        self.channel_header().write_position.load(Ordering::Acquire) as usize
-    }
     #[inline(always)]
     fn region_size(&self) -> usize {
         self.region_size_cached
@@ -844,21 +835,13 @@ impl Reader {
             let off = self.read_position % region_size;
             let leftover = region_size - off;
 
-            // Region boundary: only jump when the next region **exists** (wp >= next_start)
-            if leftover < HEADER_SLOT {
-                let next_start = ((self.read_position / region_size) + 1) * region_size;
-
-                if self.cached_wp < next_start {
-                    self.cached_wp = self.load_wp(); // Acquire
-                    if self.cached_wp < next_start {
-                        return None;
-                    }
-                }
-
-                self.read_position = next_start;
-                let _ = self.switch_region((next_start / region_size) as u64);
-                continue;
-            }
+            // Invariant: for any header slot produced by Writer,
+            // there is always at least HEADER_SLOT bytes left in the region.
+            debug_assert!(
+                leftover >= HEADER_SLOT,
+                "xchannel: read_position in impossible boundary hole; \
+             writer invariants violated or file corrupted"
+            );
 
             // Fast path: read committed first (Acquire)
             let base_ptr = unsafe { self.current_region.as_ptr().add(off) } as *const MessageHeader;
@@ -943,7 +926,7 @@ impl Reader {
         )?);
         let ch =
             unsafe { &*(zero_region.as_ptr().add(MESSAGE_HEADER_SIZE) as *const ChannelHeader) };
-        let wp = ch.write_position.load(Ordering::Acquire) as usize;
+        let wp = ch.write_position.load(Ordering::Relaxed) as usize;
 
         let read_pos = match self.mode {
             ReaderMode::LateJoin => 0,
@@ -960,7 +943,6 @@ impl Reader {
         self.zero_region = zero_region;
         self.read_position = read_pos;
         self.current_region = current_region;
-        self.cached_wp = wp;
         Ok(())
     }
 }
@@ -1082,7 +1064,8 @@ mod tests {
             .build()?;
 
         // #101 in file0
-        if let Some(buf) = writer.try_reserve(500) {
+        {
+            let buf = writer.try_reserve(500)?;
             for b in buf.iter_mut() {
                 *b = 0xAA;
             }
@@ -1093,13 +1076,15 @@ mod tests {
         writer.roll_file()?;
 
         // #102 and #103 in file1
-        if let Some(buf) = writer.try_reserve(600) {
+        {
+            let buf = writer.try_reserve(600)?;
             for b in buf.iter_mut() {
                 *b = 0xBB;
             }
             writer.commit(102, 600, 1)?;
         }
-        if let Some(buf) = writer.try_reserve(300) {
+        {
+            let buf = writer.try_reserve(300)?;
             for b in buf.iter_mut() {
                 *b = 0xCC;
             }
@@ -1161,17 +1146,20 @@ mod tests {
         let msg2: Vec<u8> = vec![0x55; 200];
         let msg3: Vec<u8> = vec![1, 2, 3, 4, 5, 6, 7, 8, 9];
 
-        if let Some(payload) = writer.try_reserve(msg1.len()) {
+        {
+            let payload = writer.try_reserve(msg1.len())?;
             payload.copy_from_slice(&msg1);
             writer.commit(201, msg1.len() as u32, 0)?;
         }
         writer.roll_file()?;
-        if let Some(payload) = writer.try_reserve(msg2.len()) {
+        {
+            let payload = writer.try_reserve(msg2.len())?;
             payload.copy_from_slice(&msg2);
             writer.commit(202, msg2.len() as u32, 1)?;
         }
         writer.roll_file()?;
-        if let Some(payload) = writer.try_reserve(msg3.len()) {
+        {
+            let payload = writer.try_reserve(msg3.len())?;
             payload.copy_from_slice(&msg3);
             writer.commit(203, msg3.len() as u32, 2)?;
         }
@@ -1214,7 +1202,8 @@ mod tests {
         let record_with_padding = region - HEADER_SLOT;
         assert_eq!(record_with_padding % ALIGN, 0);
         let len = record_with_padding - HEADER_SLOT;
-        if let Some(buf) = w.try_reserve(len) {
+        {
+            let buf = w.try_reserve(len)?;
             for b in buf.iter_mut() {
                 *b = 0xAB;
             }
@@ -1222,7 +1211,8 @@ mod tests {
         }
 
         // Next small message should force a Skip and write at the start of next region.
-        if let Some(buf) = w.try_reserve(32) {
+        {
+            let buf = w.try_reserve(32)?;
             for b in buf.iter_mut() {
                 *b = 0xCD;
             }

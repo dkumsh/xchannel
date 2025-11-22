@@ -4,17 +4,17 @@ use std::sync::atomic::AtomicU64;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct MessageHeader {
-    pub(crate) committed: u8,
-    pub(crate) header_type: HeaderType,
+    pub committed: u8,
+    pub header_type: HeaderType,
     pub message_type: u16,
-    pub(crate) length: u32,
+    pub length: u32,
     pub timestamp_ns: u64,
 }
 
 /// The kind of record at the current offset.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum HeaderType {
+pub enum HeaderType {
     Channel = 0,
     User = 1,
     Skip = 2,

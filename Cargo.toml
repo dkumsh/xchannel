@@ -1,6 +1,6 @@
 [package]
 name = "xchannel"
-version = "1.0.1"
+version = "1.2.0"
 edition = "2024"
 description = "mmap-backed IPC channels with regionized layout, alignment-safe headers, and file rolling."
 license = "MIT OR Apache-2.0"
@@ -19,9 +19,6 @@ include = [
 [lib]
 name = "xchannel"
 path = "src/lib.rs"
-
-[features]
-disabled = []
 
 [dependencies]
 memmap2 = "0.9.5"
