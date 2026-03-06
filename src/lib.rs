@@ -23,7 +23,6 @@ use std::io::{self, ErrorKind};
 use std::mem::{align_of, size_of};
 use std::path::{Path, PathBuf};
 use std::slice;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -36,6 +35,9 @@ const ALIGN: usize = align_of::<MessageHeader>(); // 8 on supported targets
 
 // Header slot size == struct size (16B) for now.
 const HEADER_SLOT: usize = MESSAGE_HEADER_SIZE;
+const DEFAULT_BATCH_SEGS_CAP: usize = 16;
+const DEFAULT_BATCH_POS_CAP: usize = 1024;
+const DEFAULT_BATCH_MAPS_CAP: usize = 16;
 
 #[inline(always)]
 fn align_up(x: usize) -> usize {
@@ -167,6 +169,7 @@ impl WriterBuilder {
 pub struct ReaderBuilder {
     path: PathBuf,
     mode: ReaderMode,
+    batch_limit: Option<u16>,
 }
 
 impl ReaderBuilder {
@@ -174,6 +177,7 @@ impl ReaderBuilder {
         Self {
             path: path.as_ref().to_path_buf(),
             mode: ReaderMode::LateJoin,
+            batch_limit: None,
         }
     }
 
@@ -193,10 +197,20 @@ impl ReaderBuilder {
         self
     }
 
+    /// Default batch size limit used when `try_read_batch(None)` is called.
+    /// `None` means unlimited.
+    #[inline]
+    pub fn batch_limit(mut self, limit: u16) -> Self {
+        self.batch_limit = Some(limit);
+        self
+    }
+
     /// Open a Reader according to the configured mode.
     #[inline]
     pub fn build(self) -> io::Result<Reader> {
-        Reader::open(self.path, self.mode)
+        let mut reader = Reader::open(self.path, self.mode)?;
+        reader.batch_limit = self.batch_limit;
+        Ok(reader)
     }
 }
 
@@ -699,42 +713,160 @@ pub enum ReaderMode {
     Live,     // start from latest existing file (at next header slot)
 }
 
-#[derive(Clone)]
-pub struct Message<'a> {
+/// Borrowed view of a message payload and header.
+pub struct MessageRef<'a> {
     mapping: &'a RegionMapping<ReadOnly>,
     header_offset: usize,
     payload_len: usize,
 }
 
-impl<'a> Message<'a> {
+impl<'a> MessageRef<'a> {
     #[inline]
     fn payload_offset(&self) -> usize {
         self.header_offset + HEADER_SLOT
     }
 
     #[inline]
-    pub fn header(&self) -> Option<&MessageHeader> {
-        if self.header_offset + MESSAGE_HEADER_SIZE > self.mapping.region_size() {
-            return None;
-        }
-        let ptr = self.mapping.as_ptr().wrapping_add(self.header_offset);
-        Some(unsafe { &*(ptr as *const MessageHeader) })
+    pub fn header(&self) -> &MessageHeader {
+        let ptr = unsafe { self.mapping.as_ptr().add(self.header_offset) };
+        unsafe { &*(ptr as *const MessageHeader) }
     }
 
     #[inline]
-    pub fn payload(&self) -> Option<&[u8]> {
+    pub fn payload(&self) -> &'a [u8] {
         let payload_offset = self.payload_offset();
-        let end = payload_offset + self.payload_len;
-        if end > self.mapping.region_size() {
-            return None;
-        }
-        let ptr = self.mapping.as_ptr().wrapping_add(payload_offset);
-        Some(unsafe { slice::from_raw_parts(ptr, self.payload_len) })
+        let ptr = unsafe { self.mapping.as_ptr().add(payload_offset) };
+        unsafe { slice::from_raw_parts(ptr, self.payload_len) }
     }
+
     #[inline]
     #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.payload_len
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MsgPos {
+    // Index into Reader.batch_segs (not maps).
+    seg: u16,
+    // Offset within the segment's mapping where the message header starts.
+    off: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BatchSeg {
+    // Index into Reader.maps for the mapping that backs this segment.
+    map_idx: usize,
+    // Start offset within the mapping (inclusive).
+    start: u32,
+    // End offset within the mapping (exclusive).
+    end: u32,
+}
+
+struct MappedRegion {
+    file_sequence: u64,
+    region_idx: u64,
+    mapping: RegionMapping<ReadOnly>,
+}
+
+fn map_batch_region(
+    maps: &mut Vec<MappedRegion>,
+    file: &File,
+    file_sequence: u64,
+    region_size: usize,
+    region_idx: u64,
+    current_map: Option<(u64, u64, usize)>,
+) -> Option<usize> {
+    if let Some(last) = maps.last()
+        && last.file_sequence == file_sequence
+        && last.region_idx > region_idx
+    {
+        debug_assert!(false, "batch scan moved backward across regions");
+        return None;
+    }
+    if let Some((cur_file, cur_idx, map_idx)) = current_map
+        && cur_file == file_sequence
+        && cur_idx == region_idx
+    {
+        return Some(map_idx);
+    }
+    let map =
+        RegionMapping::create_read_only(file, region_idx * region_size as u64, region_size).ok()?;
+    let map_idx = maps.len();
+    maps.push(MappedRegion {
+        file_sequence,
+        region_idx,
+        mapping: map,
+    });
+    Some(map_idx)
+}
+
+/// Borrowed view over a batch of user messages.
+pub struct MessageBatch<'a> {
+    segs: &'a [BatchSeg],
+    pos: &'a [MsgPos],
+    maps: &'a [MappedRegion],
+}
+
+impl<'a> MessageBatch<'a> {
+    #[inline]
+    /// Number of user messages in this batch.
+    pub fn len(&self) -> usize {
+        self.pos.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.pos.is_empty()
+    }
+
+    #[inline]
+    /// Access a user message by index in scan order (0..len()).
+    pub fn get(&self, index: usize) -> Option<MessageRef<'a>> {
+        self.pos.get(index).map(|pos| self.message_at(*pos))
+    }
+
+    #[inline]
+    /// Access a user message by index without bounds checks.
+    ///
+    /// # Safety
+    /// Caller must ensure `index < self.len()`.
+    pub unsafe fn get_unchecked(&self, index: usize) -> MessageRef<'a> {
+        let pos = *unsafe { self.pos.get_unchecked(index) };
+        self.message_at(pos)
+    }
+
+    #[inline]
+    fn message_at(&self, pos: MsgPos) -> MessageRef<'a> {
+        let seg = &self.segs[pos.seg as usize];
+        debug_assert!(pos.off >= seg.start);
+        debug_assert!(pos.off < seg.end);
+        let map = &self.maps[seg.map_idx].mapping;
+        let header_offset = pos.off as usize;
+        let header_end = header_offset + MESSAGE_HEADER_SIZE;
+        assert!(
+            header_end <= map.region_size(),
+            "message header out of bounds"
+        );
+        let hdr_ptr = unsafe { map.as_ptr().add(header_offset) as *const MessageHeader };
+        let mh = unsafe { &*hdr_ptr };
+        let payload_end = header_offset + HEADER_SLOT + mh.length as usize;
+        assert!(
+            payload_end <= map.region_size(),
+            "message payload out of bounds"
+        );
+        debug_assert_eq!(mh.header_type, HeaderType::User);
+        MessageRef {
+            mapping: map,
+            header_offset,
+            payload_len: mh.length as usize,
+        }
+    }
+
+    #[inline]
+    /// Iterate user messages in this batch (supports `.rev()`).
+    pub fn iter(&'a self) -> impl DoubleEndedIterator<Item = MessageRef<'a>> + 'a {
+        self.pos.iter().map(|p| self.message_at(*p))
     }
 }
 
@@ -742,14 +874,12 @@ pub struct Reader {
     base_path: PathBuf,
     file_sequence: u64,
     file: File,
-
-    zero_region: Arc<RegionMapping<ReadOnly>>,
-    current_region: Arc<RegionMapping<ReadOnly>>,
     read_position: usize,
-
-    mode: ReaderMode,
-
     region_size_cached: usize,
+    batch_limit: Option<u16>,
+    batch_segs: Vec<BatchSeg>,
+    batch_pos: Vec<MsgPos>,
+    maps: Vec<MappedRegion>, // last entry is current; older entries kept for batch segments
 }
 
 impl Reader {
@@ -802,22 +932,25 @@ impl Reader {
 
         let (read_pos, region_size) = Self::get_current_read_position(&file, mode)?;
         let region_index = (read_pos / region_size) as u64;
-        let zero_region = Arc::new(RegionMapping::create_read_only(&file, 0, region_size)?);
-        let current_region = Arc::new(RegionMapping::create_read_only(
-            &file,
-            region_index * region_size as u64,
-            region_size,
-        )?);
+        let current_region =
+            RegionMapping::create_read_only(&file, region_index * region_size as u64, region_size)?;
+        let mut maps = Vec::with_capacity(DEFAULT_BATCH_MAPS_CAP);
+        maps.push(MappedRegion {
+            file_sequence: sequence,
+            region_idx: region_index,
+            mapping: current_region,
+        });
 
         Ok(Self {
             base_path,
             file_sequence: sequence,
             file,
-            zero_region,
             read_position: read_pos,
-            current_region,
-            mode,
             region_size_cached: region_size,
+            batch_limit: None,
+            batch_segs: Vec::with_capacity(DEFAULT_BATCH_SEGS_CAP),
+            batch_pos: Vec::with_capacity(DEFAULT_BATCH_POS_CAP),
+            maps,
         })
     }
 
@@ -826,10 +959,210 @@ impl Reader {
         self.region_size_cached
     }
 
+    #[inline]
+    fn current_map(&self) -> Option<&MappedRegion> {
+        self.maps.last()
+    }
+
+    #[inline]
+    fn current_region(&self) -> Option<&RegionMapping<ReadOnly>> {
+        self.current_map().map(|map| &map.mapping)
+    }
+
+    fn prune_to_current(&mut self) {
+        let Some(last) = self.current_map() else {
+            panic!("no current map");
+        };
+        let region_size = self.region_size();
+        let expected_region = (self.read_position / region_size) as u64;
+        let expected_file = self.file_sequence;
+        if last.file_sequence != expected_file || last.region_idx != expected_region {
+            panic!("current map does not match reader position");
+        }
+        if self.maps.len() > 1 {
+            let map = self.maps.pop().expect("maps is non-empty");
+            self.maps.clear();
+            self.maps.push(map);
+        }
+    }
+
+    /// Read currently-available user messages into a batch.
+    /// `None` uses the reader's default; if unset, unlimited.
+    /// `Some(0)` returns `None` without scanning.
+    /// Advances the reader position past scanned records when progress is made.
+    /// Returns `None` if there are no user messages available.
+    pub fn try_read_batch(&mut self, max_batch: Option<u16>) -> Option<MessageBatch<'_>> {
+        let max_batch = max_batch.or(self.batch_limit).unwrap_or(u16::MAX) as usize;
+        if max_batch == 0 {
+            return None;
+        }
+        self.batch_segs.clear();
+        self.batch_pos.clear();
+
+        self.prune_to_current();
+
+        let region_size = self.region_size();
+        let mut file_seq = self.file_sequence;
+        let mut file_override: Option<File> = None;
+        let mut cursor = self.read_position;
+        let mut progressed = false;
+
+        let current_map_idx = self.maps.len() - 1;
+        let current_region_idx = self.maps[current_map_idx].region_idx;
+        let mut current_reuse = Some((file_seq, current_region_idx, current_map_idx));
+
+        'scan: loop {
+            // Outer loop: advance across regions/files; each iteration starts a new segment.
+            let region_index = (cursor / region_size) as u64;
+            let region_start = region_index as usize * region_size;
+            let mut cursor_off = cursor - region_start;
+
+            let file_ref = file_override.as_ref().unwrap_or(&self.file);
+            let map_idx = match map_batch_region(
+                &mut self.maps,
+                file_ref,
+                file_seq,
+                region_size,
+                region_index,
+                current_reuse,
+            ) {
+                Some(idx) => idx,
+                None => break 'scan,
+            };
+
+            if self.batch_segs.len() > u16::MAX as usize {
+                break 'scan;
+            }
+            let seg_idx = self.batch_segs.len();
+            self.batch_segs.push(BatchSeg {
+                map_idx,
+                start: cursor_off as u32,
+                end: cursor_off as u32,
+            });
+
+            loop {
+                // Inner loop: sequential scan within a single mapping segment.
+                if cursor_off + HEADER_SLOT > region_size {
+                    self.batch_segs[seg_idx].end = cursor_off as u32;
+                    break 'scan;
+                }
+
+                let base_ptr = unsafe {
+                    self.maps[map_idx].mapping.as_ptr().add(cursor_off) as *const MessageHeader
+                };
+
+                let committed = unsafe {
+                    let cptr = std::ptr::addr_of!((*base_ptr).committed) as *const AtomicU8;
+                    (*cptr).load(Ordering::Acquire)
+                };
+
+                if committed == 0 {
+                    // Stop at the first uncommitted header; next call will resume here.
+                    std::hint::spin_loop();
+                    self.batch_segs[seg_idx].end = cursor_off as u32;
+                    break 'scan;
+                }
+
+                let mh = unsafe { &*base_ptr };
+                let total = HEADER_SLOT + mh.length as usize;
+                if cursor_off + total > region_size {
+                    self.batch_segs[seg_idx].end = cursor_off as u32;
+                    break 'scan;
+                }
+
+                let roll_pos = region_start + cursor_off;
+                let next_pos = align_up(roll_pos + total);
+                let next_off = next_pos - region_start;
+
+                match mh.header_type {
+                    HeaderType::User => {
+                        self.batch_pos.push(MsgPos {
+                            seg: seg_idx as u16,
+                            off: cursor_off as u32,
+                        });
+                        if self.batch_pos.len() >= max_batch {
+                            // Cap batch size to avoid scanning too far in one call.
+                            progressed = true;
+                            cursor = next_pos;
+                            self.batch_segs[seg_idx].end = next_off as u32;
+                            break 'scan;
+                        }
+                    }
+                    HeaderType::Channel | HeaderType::Skip => {}
+                    HeaderType::Roll => {
+                        // Switch to the next file and continue scanning from its start.
+                        let next_seq = file_seq + 1;
+                        let file_path = match make_channel_file_path(&self.base_path, next_seq) {
+                            Ok(path) => path,
+                            Err(_) => {
+                                self.batch_segs[seg_idx].end = cursor_off as u32;
+                                break 'scan;
+                            }
+                        };
+                        let next_file =
+                            match OpenOptions::new().read(true).write(false).open(&file_path) {
+                                Ok(f) => f,
+                                Err(_) => {
+                                    self.batch_segs[seg_idx].end = cursor_off as u32;
+                                    break 'scan;
+                                }
+                            };
+                        progressed = true;
+                        self.batch_segs[seg_idx].end = next_off as u32;
+                        file_seq = next_seq;
+                        file_override = Some(next_file);
+                        current_reuse = None;
+                        cursor = 0;
+                        continue 'scan;
+                    }
+                }
+
+                progressed = true;
+                cursor = next_pos;
+                if next_off == region_size {
+                    self.batch_segs[seg_idx].end = next_off as u32;
+                    continue 'scan;
+                }
+                cursor_off = next_off;
+            }
+        }
+
+        if self.batch_pos.is_empty() {
+            if !progressed {
+                self.batch_segs.clear();
+                self.batch_pos.clear();
+                return None;
+            }
+
+            self.read_position = cursor;
+            self.file_sequence = file_seq;
+            if let Some(file) = file_override {
+                self.file = file;
+            }
+
+            self.batch_segs.clear();
+            self.batch_pos.clear();
+            self.prune_to_current();
+            return None;
+        }
+
+        self.read_position = cursor;
+        self.file_sequence = file_seq;
+        if let Some(file) = file_override {
+            self.file = file;
+        }
+
+        Some(MessageBatch {
+            segs: &self.batch_segs,
+            pos: &self.batch_pos,
+            maps: &self.maps,
+        })
+    }
+
     /// Read next message if available. Roll to next file on `Roll`.
-    /// Steady path: **do not** consult `write_position`; rely on per-record `committed`.
-    /// Boundary path (when < HEADER_SLOT remains): consult `write_position` to know if next region exists.
-    pub fn try_read(&mut self) -> Option<Message<'_>> {
+    /// Steady path: rely on per-record `committed` plus Skip/Roll markers; no `write_position`.
+    pub fn try_read(&mut self) -> Option<MessageRef<'_>> {
+        self.prune_to_current();
         loop {
             let region_size = self.region_size();
             let off = self.read_position % region_size;
@@ -844,7 +1177,8 @@ impl Reader {
             );
 
             // Fast path: read committed first (Acquire)
-            let base_ptr = unsafe { self.current_region.as_ptr().add(off) } as *const MessageHeader;
+            let base_ptr =
+                unsafe { self.current_region()?.as_ptr().add(off) } as *const MessageHeader;
 
             let committed = unsafe {
                 use std::sync::atomic::{AtomicU8, Ordering};
@@ -859,7 +1193,7 @@ impl Reader {
             }
 
             // Header can be read safely now
-            let mh = unsafe { &*base_ptr };
+            let mh = unsafe { *base_ptr };
             let total = HEADER_SLOT + mh.length as usize;
 
             if total > leftover {
@@ -872,12 +1206,15 @@ impl Reader {
             match mh.header_type {
                 HeaderType::User => {
                     let region_size = self.region_size();
+                    let msg_map_idx = self.maps.len() - 1;
                     self.read_position = next_pos;
-                    if next_pos.is_multiple_of(region_size) {
-                        let _ = self.switch_region((next_pos / region_size) as u64);
+                    if next_pos.is_multiple_of(region_size)
+                        && self.switch_region((next_pos / region_size) as u64).is_err()
+                    {
+                        return None;
                     }
-                    let msg = Message {
-                        mapping: &self.current_region,
+                    let msg = MessageRef {
+                        mapping: &self.maps[msg_map_idx].mapping,
                         header_offset: off,
                         payload_len: mh.length as usize,
                     };
@@ -887,7 +1224,10 @@ impl Reader {
                     let region_size = self.region_size();
                     self.read_position = next_pos;
                     if next_pos.is_multiple_of(region_size) {
-                        let _ = self.switch_region((next_pos / region_size) as u64);
+                        if self.switch_region((next_pos / region_size) as u64).is_err() {
+                            return None;
+                        }
+                        self.prune_to_current();
                     }
                     continue;
                 }
@@ -903,10 +1243,20 @@ impl Reader {
     }
 
     fn switch_region(&mut self, idx: u64) -> io::Result<()> {
+        if let Some(last) = self.current_map()
+            && last.file_sequence == self.file_sequence
+            && last.region_idx == idx
+        {
+            return Ok(());
+        }
         let region_size = self.region_size();
         let new_map =
             RegionMapping::create_read_only(&self.file, idx * region_size as u64, region_size)?;
-        self.current_region = Arc::new(new_map);
+        self.maps.push(MappedRegion {
+            file_sequence: self.file_sequence,
+            region_idx: idx,
+            mapping: new_map,
+        });
         Ok(())
     }
 
@@ -918,31 +1268,25 @@ impl Reader {
             .write(false)
             .open(&file_path)?;
 
-        // Map region 0 to learn region size & wp
-        let zero_region = Arc::new(RegionMapping::create_read_only(
-            &file,
-            0,
-            self.region_size(),
-        )?);
-        let ch =
-            unsafe { &*(zero_region.as_ptr().add(MESSAGE_HEADER_SIZE) as *const ChannelHeader) };
-        let wp = ch.write_position.load(Ordering::Relaxed) as usize;
-
-        let read_pos = match self.mode {
-            ReaderMode::LateJoin => 0,
-            ReaderMode::Live => wp.saturating_sub(HEADER_SLOT),
-        };
-        let idx = read_pos / self.region_size();
-        let current_region = Arc::new(RegionMapping::create_read_only(
-            &file,
-            (idx * self.region_size()) as u64,
-            self.region_size(),
-        )?);
+        let region_size = self.region_size();
+        let region0 = RegionMapping::create_read_only(&file, 0, region_size)?;
+        let mh = unsafe { &*(region0.as_ptr() as *const MessageHeader) };
+        if mh.header_type != HeaderType::Channel {
+            return Err(err_other("next file missing Channel header"));
+        }
+        let ch = get_channel_header(region0.as_ptr());
+        if ch.region_size as usize != region_size {
+            return Err(err_other("next file has unexpected region_size"));
+        }
 
         self.file = file;
-        self.zero_region = zero_region;
-        self.read_position = read_pos;
-        self.current_region = current_region;
+        self.read_position = 0;
+        self.maps.clear();
+        self.maps.push(MappedRegion {
+            file_sequence: self.file_sequence,
+            region_idx: 0,
+            mapping: region0,
+        });
         Ok(())
     }
 }
@@ -1100,19 +1444,19 @@ mod tests {
                 .mode(ReaderMode::LateJoin)
                 .build()?;
             let msg1 = reader.try_read().expect("missing msg #102");
-            let hdr1 = msg1.header().unwrap();
+            let hdr1 = msg1.header();
             assert_eq!(hdr1.message_type, 102);
             assert_eq!(hdr1.length, 600);
-            let payload = msg1.payload().unwrap();
+            let payload = msg1.payload();
             for &b in payload {
                 assert_eq!(b, 0xBB);
             }
 
             let msg2 = reader.try_read().expect("missing msg #103");
-            let hdr2 = msg2.header().unwrap();
+            let hdr2 = msg2.header();
             assert_eq!(hdr2.message_type, 103);
             assert_eq!(hdr2.length, 300);
-            let payload2 = msg2.payload().unwrap();
+            let payload2 = msg2.payload();
             for &b in payload2 {
                 assert_eq!(b, 0xCC);
             }
@@ -1167,22 +1511,65 @@ mod tests {
         let mut reader = Reader::open(base, ReaderMode::LateJoin)?;
         {
             let msg = reader.try_read().expect("missing msg1");
-            let hdr = msg.header().unwrap();
+            let hdr = msg.header();
             assert_eq!(hdr.message_type, 201);
-            assert_eq!(msg.payload().unwrap(), &msg1[..]);
+            assert_eq!(msg.payload(), &msg1[..]);
         }
         {
             let msg = reader.try_read().expect("missing msg2");
-            let hdr = msg.header().unwrap();
+            let hdr = msg.header();
             assert_eq!(hdr.message_type, 202);
-            assert_eq!(msg.payload().unwrap(), &msg2[..]);
+            assert_eq!(msg.payload(), &msg2[..]);
         }
         {
             let msg = reader.try_read().expect("missing msg3");
-            let hdr = msg.header().unwrap();
+            let hdr = msg.header();
             assert_eq!(hdr.message_type, 203);
-            assert_eq!(msg.payload().unwrap(), &msg3[..]);
+            assert_eq!(msg.payload(), &msg3[..]);
         }
+        assert!(reader.try_read().is_none());
+
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    #[test]
+    fn test_live_roll_reads_new_file_from_start() -> anyhow::Result<()> {
+        let base = "test_live_roll_from_start";
+        cleanup_channel_files(base);
+
+        let region_size = crate::page_size();
+        let file_roll_size = (region_size as u64) * 10;
+        let mut writer = Writer::open_or_create(base, region_size, file_roll_size, 0)?;
+
+        let payload0 = vec![0x10; 16];
+        {
+            let buf = writer.try_reserve(payload0.len())?;
+            buf.copy_from_slice(&payload0);
+            writer.commit(1, payload0.len() as u32, 0)?;
+        }
+
+        let mut reader = Reader::open(base, ReaderMode::Live)?;
+
+        writer.roll_file()?;
+
+        let payload1 = vec![0x22; 24];
+        let payload2 = vec![0x33; 8];
+        {
+            let buf = writer.try_reserve(payload1.len())?;
+            buf.copy_from_slice(&payload1);
+            writer.commit(2, payload1.len() as u32, 0)?;
+        }
+        {
+            let buf = writer.try_reserve(payload2.len())?;
+            buf.copy_from_slice(&payload2);
+            writer.commit(3, payload2.len() as u32, 0)?;
+        }
+
+        let msg1 = reader.try_read().expect("missing msg1");
+        assert_eq!(msg1.payload(), &payload1[..]);
+        let msg2 = reader.try_read().expect("missing msg2");
+        assert_eq!(msg2.payload(), &payload2[..]);
         assert!(reader.try_read().is_none());
 
         cleanup_channel_files(base);
@@ -1221,12 +1608,173 @@ mod tests {
 
         let mut r = Reader::open(base, ReaderMode::LateJoin)?;
         let m1 = r.try_read().expect("m1");
-        assert_eq!(m1.header().unwrap().message_type, 1);
+        assert_eq!(m1.header().message_type, 1);
         assert_eq!(m1.header_offset % ALIGN, 0);
 
         let m2 = r.try_read().expect("m2");
-        assert_eq!(m2.header().unwrap().message_type, 2);
+        assert_eq!(m2.header().message_type, 2);
         assert_eq!(m2.header_offset % ALIGN, 0);
+
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    #[test]
+    fn test_try_read_batch_skips_service_messages() -> anyhow::Result<()> {
+        let base = "test_batch_skip_service";
+        cleanup_channel_files(base);
+
+        let region_size = crate::page_size();
+        let file_roll_size = (region_size as u64) * 10;
+        let mut writer = Writer::open_or_create(base, region_size, file_roll_size, 0)?;
+
+        let payload1 = vec![0xA1; 32];
+        let payload2 = vec![0xB2; 48];
+
+        {
+            let buf = writer.try_reserve(payload1.len())?;
+            buf.copy_from_slice(&payload1);
+            writer.commit(1, payload1.len() as u32, 0)?;
+        }
+        {
+            let buf = writer.try_reserve(payload2.len())?;
+            buf.copy_from_slice(&payload2);
+            writer.commit(2, payload2.len() as u32, 0)?;
+        }
+
+        let mut reader = Reader::open(base, ReaderMode::LateJoin)?;
+        let batch = reader.try_read_batch(None).expect("missing batch");
+        assert_eq!(batch.len(), 2);
+
+        let msg0 = batch.get(0).unwrap();
+        assert_eq!(msg0.header().header_type, HeaderType::User);
+        assert_eq!(msg0.payload(), &payload1[..]);
+
+        let msg1 = batch.get(1).unwrap();
+        assert_eq!(msg1.header().header_type, HeaderType::User);
+        assert_eq!(msg1.payload(), &payload2[..]);
+
+        assert!(reader.try_read_batch(None).is_none());
+
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    #[test]
+    fn test_try_read_batch_across_regions() -> anyhow::Result<()> {
+        let base = "test_batch_across_regions";
+        cleanup_channel_files(base);
+
+        let region_size = crate::page_size();
+        let file_roll_size = (region_size as u64) * 10;
+        let mut writer = Writer::open_or_create(base, region_size, file_roll_size, 0)?;
+
+        let start = align_up(MESSAGE_HEADER_SIZE + CHANNEL_HEADER_SIZE);
+        let record_with_padding = region_size - start - HEADER_SLOT;
+        assert_eq!(record_with_padding % ALIGN, 0);
+        let len = record_with_padding - HEADER_SLOT;
+
+        let payload1 = vec![0x11; len];
+        let payload2 = vec![0x22; 32];
+
+        {
+            let buf = writer.try_reserve(payload1.len())?;
+            buf.copy_from_slice(&payload1);
+            writer.commit(10, payload1.len() as u32, 0)?;
+        }
+        {
+            let buf = writer.try_reserve(payload2.len())?;
+            buf.copy_from_slice(&payload2);
+            writer.commit(11, payload2.len() as u32, 0)?;
+        }
+
+        let mut reader = Reader::open(base, ReaderMode::LateJoin)?;
+        let batch = reader.try_read_batch(None).expect("missing batch");
+        assert_eq!(batch.len(), 2);
+        assert!(batch.maps.len() > 1);
+        let file_seq = batch.maps[0].file_sequence;
+        assert!(batch.maps.iter().all(|m| m.file_sequence == file_seq));
+
+        let msg0 = batch.get(0).unwrap();
+        assert_eq!(msg0.payload(), &payload1[..]);
+        let msg1 = batch.get(1).unwrap();
+        assert_eq!(msg1.payload(), &payload2[..]);
+
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    #[test]
+    fn test_try_read_batch_across_files() -> anyhow::Result<()> {
+        let base = "test_batch_across_files";
+        cleanup_channel_files(base);
+
+        let region_size = crate::page_size();
+        let file_roll_size = (region_size as u64) * 10;
+        let mut writer = Writer::open_or_create(base, region_size, file_roll_size, 0)?;
+
+        let payload1 = vec![0x3A; 64];
+        let payload2 = vec![0x7B; 48];
+
+        {
+            let buf = writer.try_reserve(payload1.len())?;
+            buf.copy_from_slice(&payload1);
+            writer.commit(20, payload1.len() as u32, 0)?;
+        }
+        writer.roll_file()?;
+        {
+            let buf = writer.try_reserve(payload2.len())?;
+            buf.copy_from_slice(&payload2);
+            writer.commit(21, payload2.len() as u32, 0)?;
+        }
+
+        let mut reader = Reader::open(base, ReaderMode::LateJoin)?;
+        let batch = reader.try_read_batch(None).expect("missing batch");
+        assert_eq!(batch.len(), 2);
+        assert!(batch.maps.len() > 1);
+        let file_seq = batch.maps[0].file_sequence;
+        assert!(batch.maps.iter().any(|m| m.file_sequence != file_seq));
+
+        let msg0 = batch.get(0).unwrap();
+        assert_eq!(msg0.payload(), &payload1[..]);
+        let msg1 = batch.get(1).unwrap();
+        assert_eq!(msg1.payload(), &payload2[..]);
+
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    #[test]
+    fn test_try_read_batch_empty_does_not_advance() -> anyhow::Result<()> {
+        let base = "test_batch_empty";
+        cleanup_channel_files(base);
+
+        let region_size = crate::page_size();
+        let file_roll_size = (region_size as u64) * 10;
+        let _writer = Writer::open_or_create(base, region_size, file_roll_size, 0)?;
+
+        let mut reader = Reader::open(base, ReaderMode::Live)?;
+        let before = reader.read_position;
+        assert!(reader.try_read_batch(None).is_none());
+        assert_eq!(reader.read_position, before);
+
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    #[test]
+    fn test_try_read_batch_service_only_advances() -> anyhow::Result<()> {
+        let base = "test_batch_service_only_advances";
+        cleanup_channel_files(base);
+
+        let region_size = crate::page_size();
+        let file_roll_size = (region_size as u64) * 10;
+        let _writer = Writer::open_or_create(base, region_size, file_roll_size, 0)?;
+
+        let mut reader = Reader::open(base, ReaderMode::LateJoin)?;
+        let before = reader.read_position;
+        assert!(reader.try_read_batch(None).is_none());
+        assert!(reader.read_position > before);
 
         cleanup_channel_files(base);
         Ok(())

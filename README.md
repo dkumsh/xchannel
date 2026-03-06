@@ -47,11 +47,31 @@ if let Some(buf) = w.try_reserve(payload.len()) {
 }
 
 // read it back
-let mut r = ReaderBuilder::new("demo.xch").late_join().build()?;
+let mut r = ReaderBuilder::new("demo.xch")
+    .late_join()
+    .batch_limit(1000)
+    .build()?;
 if let Some(msg) = r.try_read() {
-    let hdr = msg.header().unwrap();
+    let hdr = msg.header();
     println!("type={}, len={}", hdr.message_type, hdr.length);
-    println!("payload={:?}", msg.payload().unwrap());
+    println!("payload={:?}", msg.payload());
+}
+```
+
+## Batch read example
+
+```rust
+use xchannel::ReaderBuilder;
+
+let mut r = ReaderBuilder::new("demo.xch").late_join().build()?;
+if let Some(batch) = r.try_read_batch(None) {
+    for idx in (0..batch.len()).rev() {
+        let msg = batch.get(idx).unwrap();
+        let hdr = msg.header();
+        let payload = msg.payload();
+        // payload is opaque bytes; parse as needed.
+        println!("type={}, len={}, first={:?}", hdr.message_type, hdr.length, payload.get(0));
+    }
 }
 ```
 
@@ -379,8 +399,8 @@ fn main() -> std::io::Result<()> {
 
     while let Some(msg) = reader.try_read() {
 
-        let header = msg.header().unwrap();
-        let payload = msg.payload().unwrap();
+        let header = msg.header();
+        let payload = msg.payload();
 
         println!(
             "type={} len={} payload={:?}",
@@ -671,4 +691,3 @@ xchannel provides:
 * Rust-safe memory access model
 
 ---
-

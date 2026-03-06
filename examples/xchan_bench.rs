@@ -358,7 +358,7 @@ fn run_reader(opt: Opt, msg_size: usize, touch_bytes: usize) -> io::Result<()> {
             if msg.len() < FIXED_HEADER_BYTES {
                 continue;
             }
-            let payload = msg.payload().unwrap();
+            let payload = msg.payload();
             let mut seq_bytes = [0u8; 8];
             seq_bytes.copy_from_slice(&payload[..8]);
             let seq = u64::from_le_bytes(seq_bytes);

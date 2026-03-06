@@ -23,7 +23,7 @@ fn run_pong(in_chan: &str, out_chan: &str, region_size: usize, file_roll_size: u
     let mut forwarded = 0u64;
     while forwarded < count {
         if let Some(msg) = reader.try_read() {
-            let payload = msg.payload().expect("pong no payload");
+            let payload = msg.payload();
             if payload.len() != 8 {
                 // Ignore malformed messages
                 continue;
@@ -93,7 +93,7 @@ fn run_ping(out_chan: &str, in_chan: &str, region_size: usize, file_roll_size: u
         let start = Instant::now();
         loop {
             if let Some(msg) = reader.try_read() {
-                let payload = msg.payload().expect("ping no payload");
+                let payload = msg.payload();
                 assert_eq!(payload.len(), 8);
                 let mut arr = [0u8; 8];
                 arr.copy_from_slice(payload);
