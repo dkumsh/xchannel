@@ -1,6 +1,6 @@
 [package]
 name = "xchannel"
-version = "1.2.0"
+version = "1.3.0"
 edition = "2024"
 description = "mmap-backed IPC channels with regionized layout, alignment-safe headers, and file rolling."
 license = "MIT OR Apache-2.0"
@@ -10,6 +10,7 @@ keywords = ["mmap", "ipc", "zero-copy", "shared-memory", "channels"]
 categories = ["concurrency", "memory-management", "os::unix-apis", "data-structures"]
 include = [
     "src/**",
+    "CHANGELOG.md",
     "README.md",
     "LICENSE*",
     "Cargo.toml",
@@ -28,4 +29,3 @@ libc = "0.2.170"
 anyhow = "1.0.96"
 clap = { version = "4.5.51", features = ["derive"] }
 hdrhistogram = "7.5.4"
-
