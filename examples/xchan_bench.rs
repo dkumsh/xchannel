@@ -353,7 +353,7 @@ fn run_reader(opt: Opt, msg_size: usize, touch_bytes: usize) -> io::Result<()> {
     let mut gaps: u64 = 0;
 
     loop {
-        if let Some(msg) = reader.try_read() {
+        if let Some(msg) = reader.try_read()? {
             // Safety: we wrote at least 16 bytes
             if msg.len() < FIXED_HEADER_BYTES {
                 continue;

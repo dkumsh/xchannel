@@ -1,4 +1,5 @@
-use std::sync::atomic::AtomicU64;
+use std::io::{self, ErrorKind};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 /// Header written before every record.
 #[repr(C)]
@@ -9,6 +10,33 @@ pub struct MessageHeader {
     pub message_type: u16,
     pub length: u32,
     pub timestamp_ns: u64,
+}
+static _MESSAGE_HEADER_SIZE: () = {
+    assert!(size_of::<MessageHeader>() == 16);
+};
+
+impl MessageHeader {
+    const NOT_COMMITTED: u8 = 0;
+    const COMMITTED: u8 = 1;
+
+    #[inline]
+    pub fn is_committed(&self) -> io::Result<bool> {
+        let cptr = std::ptr::addr_of!(self.committed) as *const AtomicU8;
+        match unsafe { (*cptr).load(Ordering::Acquire) } {
+            Self::NOT_COMMITTED => Ok(false),
+            Self::COMMITTED => Ok(true),
+            _ => Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "invalid committed flag",
+            )),
+        }
+    }
+
+    #[inline]
+    pub fn commit(hdr_ptr: *mut MessageHeader) {
+        let cptr = unsafe { std::ptr::addr_of_mut!((*hdr_ptr).committed) as *mut AtomicU8 };
+        unsafe { (*cptr).store(Self::COMMITTED, Ordering::Release) }
+    }
 }
 
 /// The kind of record at the current offset.

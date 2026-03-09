@@ -41,17 +41,16 @@ let mut w = WriterBuilder::new("demo.xch")
             
 // write a message
 let payload = b"hello world";
-if let Some(buf) = w.try_reserve(payload.len()) {
-    buf.copy_from_slice(payload);
-    w.commit(1, payload.len() as u32, timestamp)?;
-}
+let buf = w.try_reserve(payload.len())?;
+buf.copy_from_slice(payload);
+w.commit(1, payload.len() as u32, timestamp)?;
 
 // read it back
 let mut r = ReaderBuilder::new("demo.xch")
     .late_join()
     .batch_limit(1000)
     .build()?;
-if let Some(msg) = r.try_read() {
+if let Some(msg) = r.try_read()? {
     let hdr = msg.header();
     println!("type={}, len={}", hdr.message_type, hdr.length);
     println!("payload={:?}", msg.payload());
@@ -64,7 +63,7 @@ if let Some(msg) = r.try_read() {
 use xchannel::ReaderBuilder;
 
 let mut r = ReaderBuilder::new("demo.xch").late_join().build()?;
-if let Some(batch) = r.try_read_batch(None) {
+if let Some(batch) = r.try_read_batch(None)? {
     for idx in (0..batch.len()).rev() {
         let msg = batch.get(idx).unwrap();
         let hdr = msg.header();
@@ -211,7 +210,7 @@ Each record looks like:
 
 Header fields include:
 
-* committed flag
+* committed flag (`u8`: `0` = not committed, `1` = committed)
 * message type
 * payload length
 * timestamp
@@ -219,7 +218,7 @@ Header fields include:
 Readers check:
 
 ```
-header.committed
+header.is_committed()?
 ```
 
 ---
@@ -289,7 +288,7 @@ Meaning:
 When a reader sees:
 
 ```
-header(i).committed == true
+header(i).is_committed()? == true
 ```
 
 then:
@@ -355,9 +354,9 @@ Each message has its **own commit flag**.
 Readers check different cache lines as they scan.
 
 ```
-msg1.header.committed
-msg2.header.committed
-msg3.header.committed
+msg1.header.is_committed()?
+msg2.header.is_committed()?
+msg3.header.is_committed()?
 ```
 
 Benefits:
@@ -397,7 +396,7 @@ fn main() -> std::io::Result<()> {
         .late_join()
         .build()?;
 
-    while let Some(msg) = reader.try_read() {
+    while let Some(msg) = reader.try_read()? {
 
         let header = msg.header();
         let payload = msg.payload();
@@ -459,7 +458,7 @@ The algorithm guarantees:
 Except one field:
 
 ```
-AtomicBool committed
+AtomicU8 committed
 ```
 
 ---
@@ -497,16 +496,18 @@ Writer:
 ```
 write payload
 prepare next header
-commit = true (Release)
+commit = 1 (Release)
 ```
 
 Reader:
 
 ```
-if committed.load(Acquire) {
+if committed.load(Acquire) == 1 {
     read payload
 }
 ```
+
+with `0 = not committed`, `1 = committed`, and any other value treated as invalid data.
 
 Guarantees:
 
@@ -547,7 +548,7 @@ Rust’s **non-aliasing guarantee is preserved**.
 Both sides access only:
 
 ```
-AtomicBool committed
+AtomicU8 committed
 ```
 
 Safe because:

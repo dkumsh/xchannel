@@ -23,7 +23,7 @@ use std::io::{self, ErrorKind};
 use std::mem::{align_of, size_of};
 use std::path::{Path, PathBuf};
 use std::slice;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // ========== Constants ==========
@@ -47,6 +47,11 @@ fn align_up(x: usize) -> usize {
 #[inline]
 fn err_other<S: Into<String>>(s: S) -> io::Error {
     io::Error::other(s.into())
+}
+
+#[inline]
+fn err_invalid_data<S: Into<String>>(s: S) -> io::Error {
+    io::Error::new(ErrorKind::InvalidData, s.into())
 }
 
 #[inline]
@@ -107,8 +112,7 @@ fn write_roll_header_at(
         unsafe {
             let hdr_ptr = bytes.as_mut_ptr() as *mut MessageHeader;
             *hdr_ptr = hdr;
-            let committed_ptr = std::ptr::addr_of_mut!((*hdr_ptr).committed) as *mut AtomicU8;
-            (*committed_ptr).store(1, Ordering::Release);
+            MessageHeader::commit(hdr_ptr);
         }
         Ok(())
     } else {
@@ -491,11 +495,7 @@ impl Writer {
         }
 
         // 2) Publish (commit flag last)
-        unsafe {
-            use std::sync::atomic::{AtomicU8, Ordering};
-            let cptr = std::ptr::addr_of_mut!((*hdr_ptr).committed) as *mut AtomicU8;
-            (*cptr).store(1, Ordering::Release); // publish header/record
-        }
+        MessageHeader::commit(hdr_ptr);
 
         // 3) Advance to next header slot after payload+pad
         let payload_end = self.next_hdr_pos + HEADER_SLOT + length as usize;
@@ -648,8 +648,7 @@ impl Writer {
                         message_type: 0,
                         timestamp_ns: 0,
                     };
-                    let cptr = std::ptr::addr_of_mut!((*hdr_ptr).committed) as *mut AtomicU8;
-                    (*cptr).store(1, Ordering::Release);
+                    MessageHeader::commit(hdr_ptr);
                 }
             }
 
@@ -776,29 +775,27 @@ fn map_batch_region(
     region_size: usize,
     region_idx: u64,
     current_map: Option<(u64, u64, usize)>,
-) -> Option<usize> {
+) -> io::Result<usize> {
     if let Some(last) = maps.last()
         && last.file_sequence == file_sequence
         && last.region_idx > region_idx
     {
-        debug_assert!(false, "batch scan moved backward across regions");
-        return None;
+        return Err(err_invalid_data("batch scan moved backward across regions"));
     }
     if let Some((cur_file, cur_idx, map_idx)) = current_map
         && cur_file == file_sequence
         && cur_idx == region_idx
     {
-        return Some(map_idx);
+        return Ok(map_idx);
     }
-    let map =
-        RegionMapping::create_read_only(file, region_idx * region_size as u64, region_size).ok()?;
+    let map = RegionMapping::create_read_only(file, region_idx * region_size as u64, region_size)?;
     let map_idx = maps.len();
     maps.push(MappedRegion {
         file_sequence,
         region_idx,
         mapping: map,
     });
-    Some(map_idx)
+    Ok(map_idx)
 }
 
 /// Borrowed view over a batch of user messages.
@@ -980,9 +977,10 @@ impl Reader {
             panic!("current map does not match reader position");
         }
         if self.maps.len() > 1 {
-            let map = self.maps.pop().expect("maps is non-empty");
-            self.maps.clear();
-            self.maps.push(map);
+            let first = 0;
+            let last = self.maps.len() - 1;
+            self.maps.swap(first, last);
+            self.maps.truncate(1);
         }
     }
 
@@ -990,11 +988,14 @@ impl Reader {
     /// `None` uses the reader's default; if unset, unlimited.
     /// `Some(0)` returns `None` without scanning.
     /// Advances the reader position past scanned records when progress is made.
-    /// Returns `None` if there are no user messages available.
-    pub fn try_read_batch(&mut self, max_batch: Option<u16>) -> Option<MessageBatch<'_>> {
+    /// Returns `Ok(None)` if there are no user messages available.
+    pub fn try_read_batch(
+        &mut self,
+        max_batch: Option<u16>,
+    ) -> io::Result<Option<MessageBatch<'_>>> {
         let max_batch = max_batch.or(self.batch_limit).unwrap_or(u16::MAX) as usize;
         if max_batch == 0 {
-            return None;
+            return Ok(None);
         }
         self.batch_segs.clear();
         self.batch_pos.clear();
@@ -1018,20 +1019,17 @@ impl Reader {
             let mut cursor_off = cursor - region_start;
 
             let file_ref = file_override.as_ref().unwrap_or(&self.file);
-            let map_idx = match map_batch_region(
+            let map_idx = map_batch_region(
                 &mut self.maps,
                 file_ref,
                 file_seq,
                 region_size,
                 region_index,
                 current_reuse,
-            ) {
-                Some(idx) => idx,
-                None => break 'scan,
-            };
+            )?;
 
             if self.batch_segs.len() > u16::MAX as usize {
-                break 'scan;
+                return Err(err_other("too many batch segments"));
             }
             let seg_idx = self.batch_segs.len();
             self.batch_segs.push(BatchSeg {
@@ -1043,31 +1041,27 @@ impl Reader {
             loop {
                 // Inner loop: sequential scan within a single mapping segment.
                 if cursor_off + HEADER_SLOT > region_size {
-                    self.batch_segs[seg_idx].end = cursor_off as u32;
-                    break 'scan;
+                    return Err(err_invalid_data(
+                        "batch scan landed in an invalid header slot",
+                    ));
                 }
 
-                let base_ptr = unsafe {
-                    self.maps[map_idx].mapping.as_ptr().add(cursor_off) as *const MessageHeader
+                let mh = unsafe {
+                    &*(self.maps[map_idx].mapping.as_ptr().add(cursor_off) as *const MessageHeader)
                 };
 
-                let committed = unsafe {
-                    let cptr = std::ptr::addr_of!((*base_ptr).committed) as *const AtomicU8;
-                    (*cptr).load(Ordering::Acquire)
-                };
-
-                if committed == 0 {
+                if !mh.is_committed()? {
                     // Stop at the first uncommitted header; next call will resume here.
                     std::hint::spin_loop();
                     self.batch_segs[seg_idx].end = cursor_off as u32;
                     break 'scan;
                 }
 
-                let mh = unsafe { &*base_ptr };
                 let total = HEADER_SLOT + mh.length as usize;
                 if cursor_off + total > region_size {
-                    self.batch_segs[seg_idx].end = cursor_off as u32;
-                    break 'scan;
+                    return Err(err_invalid_data(
+                        "message payload extends past region boundary",
+                    ));
                 }
 
                 let roll_pos = region_start + cursor_off;
@@ -1092,21 +1086,11 @@ impl Reader {
                     HeaderType::Roll => {
                         // Switch to the next file and continue scanning from its start.
                         let next_seq = file_seq + 1;
-                        let file_path = match make_channel_file_path(&self.base_path, next_seq) {
-                            Ok(path) => path,
-                            Err(_) => {
-                                self.batch_segs[seg_idx].end = cursor_off as u32;
-                                break 'scan;
-                            }
-                        };
-                        let next_file =
-                            match OpenOptions::new().read(true).write(false).open(&file_path) {
-                                Ok(f) => f,
-                                Err(_) => {
-                                    self.batch_segs[seg_idx].end = cursor_off as u32;
-                                    break 'scan;
-                                }
-                            };
+                        let file_path = make_channel_file_path(&self.base_path, next_seq)?;
+                        let next_file = OpenOptions::new()
+                            .read(true)
+                            .write(false)
+                            .open(&file_path)?;
                         progressed = true;
                         self.batch_segs[seg_idx].end = next_off as u32;
                         file_seq = next_seq;
@@ -1131,7 +1115,7 @@ impl Reader {
             if !progressed {
                 self.batch_segs.clear();
                 self.batch_pos.clear();
-                return None;
+                return Ok(None);
             }
 
             self.read_position = cursor;
@@ -1143,7 +1127,7 @@ impl Reader {
             self.batch_segs.clear();
             self.batch_pos.clear();
             self.prune_to_current();
-            return None;
+            return Ok(None);
         }
 
         self.read_position = cursor;
@@ -1152,16 +1136,16 @@ impl Reader {
             self.file = file;
         }
 
-        Some(MessageBatch {
+        Ok(Some(MessageBatch {
             segs: &self.batch_segs,
             pos: &self.batch_pos,
             maps: &self.maps,
-        })
+        }))
     }
 
     /// Read next message if available. Roll to next file on `Roll`.
     /// Steady path: rely on per-record `committed` plus Skip/Roll markers; no `write_position`.
-    pub fn try_read(&mut self) -> Option<MessageRef<'_>> {
+    pub fn try_read(&mut self) -> io::Result<Option<MessageRef<'_>>> {
         self.prune_to_current();
         loop {
             let region_size = self.region_size();
@@ -1177,28 +1161,24 @@ impl Reader {
             );
 
             // Fast path: read committed first (Acquire)
-            let base_ptr =
-                unsafe { self.current_region()?.as_ptr().add(off) } as *const MessageHeader;
+            let region = self
+                .current_region()
+                .ok_or_else(|| err_other("reader has no current region mapped"))?;
+            let mh = unsafe { &*(region.as_ptr().add(off) as *const MessageHeader) };
 
-            let committed = unsafe {
-                use std::sync::atomic::{AtomicU8, Ordering};
-                let cptr = std::ptr::addr_of!((*base_ptr).committed) as *const AtomicU8;
-                (*cptr).load(Ordering::Acquire)
-            };
-
-            if committed == 0 {
+            if !mh.is_committed()? {
                 // not ready yet
                 std::hint::spin_loop();
-                return None;
+                return Ok(None);
             }
 
             // Header can be read safely now
-            let mh = unsafe { *base_ptr };
             let total = HEADER_SLOT + mh.length as usize;
 
             if total > leftover {
-                // Shouldn't happen for USER (writer never crosses region); if it does, wait
-                return None;
+                return Err(err_invalid_data(
+                    "message payload extends past remaining region bytes",
+                ));
             }
 
             let next_pos = align_up(self.read_position + total);
@@ -1208,34 +1188,28 @@ impl Reader {
                     let region_size = self.region_size();
                     let msg_map_idx = self.maps.len() - 1;
                     self.read_position = next_pos;
-                    if next_pos.is_multiple_of(region_size)
-                        && self.switch_region((next_pos / region_size) as u64).is_err()
-                    {
-                        return None;
+                    if next_pos.is_multiple_of(region_size) {
+                        self.switch_region((next_pos / region_size) as u64)?;
                     }
                     let msg = MessageRef {
                         mapping: &self.maps[msg_map_idx].mapping,
                         header_offset: off,
                         payload_len: mh.length as usize,
                     };
-                    return Some(msg);
+                    return Ok(Some(msg));
                 }
                 HeaderType::Skip | HeaderType::Channel => {
                     let region_size = self.region_size();
                     self.read_position = next_pos;
                     if next_pos.is_multiple_of(region_size) {
-                        if self.switch_region((next_pos / region_size) as u64).is_err() {
-                            return None;
-                        }
+                        self.switch_region((next_pos / region_size) as u64)?;
                         self.prune_to_current();
                     }
                     continue;
                 }
                 HeaderType::Roll => {
                     self.read_position = next_pos;
-                    if self.open_next_file().is_err() {
-                        return None;
-                    }
+                    self.open_next_file()?;
                     continue;
                 }
             }
@@ -1443,7 +1417,7 @@ mod tests {
             let mut reader = ReaderBuilder::new(base)
                 .mode(ReaderMode::LateJoin)
                 .build()?;
-            let msg1 = reader.try_read().expect("missing msg #102");
+            let msg1 = reader.try_read()?.expect("missing msg #102");
             let hdr1 = msg1.header();
             assert_eq!(hdr1.message_type, 102);
             assert_eq!(hdr1.length, 600);
@@ -1452,7 +1426,7 @@ mod tests {
                 assert_eq!(b, 0xBB);
             }
 
-            let msg2 = reader.try_read().expect("missing msg #103");
+            let msg2 = reader.try_read()?.expect("missing msg #103");
             let hdr2 = msg2.header();
             assert_eq!(hdr2.message_type, 103);
             assert_eq!(hdr2.length, 300);
@@ -1461,13 +1435,13 @@ mod tests {
                 assert_eq!(b, 0xCC);
             }
 
-            assert!(reader.try_read().is_none());
+            assert!(reader.try_read()?.is_none());
         }
 
         // Live => picks latest existing (file1), read_position=write_position => no new messages
         {
             let mut reader = Reader::open(base, ReaderMode::Live)?;
-            assert!(reader.try_read().is_none());
+            assert!(reader.try_read()?.is_none());
         }
 
         cleanup_channel_files(base);
@@ -1510,24 +1484,24 @@ mod tests {
 
         let mut reader = Reader::open(base, ReaderMode::LateJoin)?;
         {
-            let msg = reader.try_read().expect("missing msg1");
+            let msg = reader.try_read()?.expect("missing msg1");
             let hdr = msg.header();
             assert_eq!(hdr.message_type, 201);
             assert_eq!(msg.payload(), &msg1[..]);
         }
         {
-            let msg = reader.try_read().expect("missing msg2");
+            let msg = reader.try_read()?.expect("missing msg2");
             let hdr = msg.header();
             assert_eq!(hdr.message_type, 202);
             assert_eq!(msg.payload(), &msg2[..]);
         }
         {
-            let msg = reader.try_read().expect("missing msg3");
+            let msg = reader.try_read()?.expect("missing msg3");
             let hdr = msg.header();
             assert_eq!(hdr.message_type, 203);
             assert_eq!(msg.payload(), &msg3[..]);
         }
-        assert!(reader.try_read().is_none());
+        assert!(reader.try_read()?.is_none());
 
         cleanup_channel_files(base);
         Ok(())
@@ -1566,11 +1540,11 @@ mod tests {
             writer.commit(3, payload2.len() as u32, 0)?;
         }
 
-        let msg1 = reader.try_read().expect("missing msg1");
+        let msg1 = reader.try_read()?.expect("missing msg1");
         assert_eq!(msg1.payload(), &payload1[..]);
-        let msg2 = reader.try_read().expect("missing msg2");
+        let msg2 = reader.try_read()?.expect("missing msg2");
         assert_eq!(msg2.payload(), &payload2[..]);
-        assert!(reader.try_read().is_none());
+        assert!(reader.try_read()?.is_none());
 
         cleanup_channel_files(base);
         Ok(())
@@ -1607,11 +1581,11 @@ mod tests {
         }
 
         let mut r = Reader::open(base, ReaderMode::LateJoin)?;
-        let m1 = r.try_read().expect("m1");
+        let m1 = r.try_read()?.expect("m1");
         assert_eq!(m1.header().message_type, 1);
         assert_eq!(m1.header_offset % ALIGN, 0);
 
-        let m2 = r.try_read().expect("m2");
+        let m2 = r.try_read()?.expect("m2");
         assert_eq!(m2.header().message_type, 2);
         assert_eq!(m2.header_offset % ALIGN, 0);
 
@@ -1643,7 +1617,7 @@ mod tests {
         }
 
         let mut reader = Reader::open(base, ReaderMode::LateJoin)?;
-        let batch = reader.try_read_batch(None).expect("missing batch");
+        let batch = reader.try_read_batch(None)?.expect("missing batch");
         assert_eq!(batch.len(), 2);
 
         let msg0 = batch.get(0).unwrap();
@@ -1654,7 +1628,7 @@ mod tests {
         assert_eq!(msg1.header().header_type, HeaderType::User);
         assert_eq!(msg1.payload(), &payload2[..]);
 
-        assert!(reader.try_read_batch(None).is_none());
+        assert!(reader.try_read_batch(None)?.is_none());
 
         cleanup_channel_files(base);
         Ok(())
@@ -1689,7 +1663,7 @@ mod tests {
         }
 
         let mut reader = Reader::open(base, ReaderMode::LateJoin)?;
-        let batch = reader.try_read_batch(None).expect("missing batch");
+        let batch = reader.try_read_batch(None)?.expect("missing batch");
         assert_eq!(batch.len(), 2);
         assert!(batch.maps.len() > 1);
         let file_seq = batch.maps[0].file_sequence;
@@ -1729,7 +1703,7 @@ mod tests {
         }
 
         let mut reader = Reader::open(base, ReaderMode::LateJoin)?;
-        let batch = reader.try_read_batch(None).expect("missing batch");
+        let batch = reader.try_read_batch(None)?.expect("missing batch");
         assert_eq!(batch.len(), 2);
         assert!(batch.maps.len() > 1);
         let file_seq = batch.maps[0].file_sequence;
@@ -1755,7 +1729,7 @@ mod tests {
 
         let mut reader = Reader::open(base, ReaderMode::Live)?;
         let before = reader.read_position;
-        assert!(reader.try_read_batch(None).is_none());
+        assert!(reader.try_read_batch(None)?.is_none());
         assert_eq!(reader.read_position, before);
 
         cleanup_channel_files(base);
@@ -1773,8 +1747,47 @@ mod tests {
 
         let mut reader = Reader::open(base, ReaderMode::LateJoin)?;
         let before = reader.read_position;
-        assert!(reader.try_read_batch(None).is_none());
+        assert!(reader.try_read_batch(None)?.is_none());
         assert!(reader.read_position > before);
+
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    #[test]
+    fn test_invalid_committed_flag_returns_error() -> anyhow::Result<()> {
+        let base = "test_invalid_committed_flag";
+        cleanup_channel_files(base);
+
+        let region_size = crate::page_size();
+        WriterBuilder::new(base)
+            .region_size(region_size)
+            .file_roll_size((region_size as u64) * 10)
+            .precreate()?;
+
+        let start = align_up(MESSAGE_HEADER_SIZE + CHANNEL_HEADER_SIZE);
+        let file = OpenOptions::new().read(true).write(true).open(base)?;
+        let mut region0 = RegionMapping::create_writable(&file, 0, region_size)?;
+        let header = region0
+            .get_bytes_mut(start, MESSAGE_HEADER_SIZE)
+            .expect("first user header must exist");
+        header[0] = 2;
+        drop(region0);
+        drop(file);
+
+        let mut reader = Reader::open(base, ReaderMode::LateJoin)?;
+        let err = match reader.try_read() {
+            Ok(_) => panic!("invalid committed flag should error"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+
+        let mut reader = Reader::open(base, ReaderMode::LateJoin)?;
+        let err = match reader.try_read_batch(None) {
+            Ok(_) => panic!("invalid committed flag should error"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
 
         cleanup_channel_files(base);
         Ok(())

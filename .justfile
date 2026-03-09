@@ -32,7 +32,7 @@ bench:
 
 # stress rolling for two-readers example
 stress:
-    cargo run --example two_readers --release -- --file xchan --messages 20m --region-size 1m --roll-size 8m --burst-pause-us 1 --burst-size 5
+    cargo run --example two_readers --release -- --file xchan --messages 5m --region-size 1m --roll-size 8m --burst-pause-us 1 --burst-size 5
 
 # bursty workload with batch coalescing
 burst:

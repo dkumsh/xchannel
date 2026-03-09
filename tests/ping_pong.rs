@@ -22,7 +22,7 @@ fn run_pong(in_chan: &str, out_chan: &str, region_size: usize, file_roll_size: u
 
     let mut forwarded = 0u64;
     while forwarded < count {
-        if let Some(msg) = reader.try_read() {
+        if let Some(msg) = reader.try_read().expect("pong read failed") {
             let payload = msg.payload();
             if payload.len() != 8 {
                 // Ignore malformed messages
@@ -92,7 +92,7 @@ fn run_ping(out_chan: &str, in_chan: &str, region_size: usize, file_roll_size: u
         // Read back the corresponding pong value, timing out after 1 second
         let start = Instant::now();
         loop {
-            if let Some(msg) = reader.try_read() {
+            if let Some(msg) = reader.try_read().expect("ping read failed") {
                 let payload = msg.payload();
                 assert_eq!(payload.len(), 8);
                 let mut arr = [0u8; 8];

@@ -340,7 +340,7 @@ fn spawn_reader_thread(
             let mut progressed = false;
             match run.kind {
                 ReaderKind::Batch(limit) => {
-                    if let Some(batch) = reader.try_read_batch(Some(limit)) {
+                    if let Some(batch) = reader.try_read_batch(Some(limit))? {
                         last_progress = Instant::now();
                         progressed = true;
                         if let Some(counts) = batch_counts.as_mut() {
@@ -397,7 +397,7 @@ fn spawn_reader_thread(
                     }
                 }
                 ReaderKind::Single => {
-                    if let Some(msg) = reader.try_read() {
+                    if let Some(msg) = reader.try_read()? {
                         last_progress = Instant::now();
                         progressed = true;
                         let payload = msg.payload();
