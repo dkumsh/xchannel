@@ -60,16 +60,24 @@ if let Some(msg) = r.try_read()? {
 ## Batch read example
 
 ```rust
-use xchannel::ReaderBuilder;
+use xchannel::{HeaderType, ReaderBuilder};
 
 let mut r = ReaderBuilder::new("demo.xch").late_join().build()?;
 if let Some(batch) = r.try_read_batch(None)? {
     for idx in (0..batch.len()).rev() {
         let msg = batch.get(idx).unwrap();
         let hdr = msg.header();
+        let kind = hdr.parsed_header_type()?;
         let payload = msg.payload();
         // payload is opaque bytes; parse as needed.
-        println!("type={}, len={}, first={:?}", hdr.message_type, hdr.length, payload.get(0));
+        if kind == HeaderType::User {
+            println!(
+                "type={}, len={}, first={:?}",
+                hdr.message_type,
+                hdr.length,
+                payload.get(0)
+            );
+        }
     }
 }
 ```
@@ -211,6 +219,7 @@ Each record looks like:
 Header fields include:
 
 * committed flag (`u8`: `0` = not committed, `1` = committed)
+* header type (`u8` on disk; parse with `header.parsed_header_type()?`)
 * message type
 * payload length
 * timestamp
@@ -219,6 +228,12 @@ Readers check:
 
 ```
 header.is_committed()?
+```
+
+When code needs the record kind, prefer:
+
+```rust
+let kind = msg.header().parsed_header_type()?;
 ```
 
 ---

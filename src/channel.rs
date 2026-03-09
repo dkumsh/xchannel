@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 #[derive(Debug, Copy, Clone)]
 pub struct MessageHeader {
     pub committed: u8,
-    pub header_type: HeaderType,
+    pub header_type: u8,
     pub message_type: u16,
     pub length: u32,
     pub timestamp_ns: u64,
@@ -33,6 +33,11 @@ impl MessageHeader {
     }
 
     #[inline]
+    pub fn parsed_header_type(&self) -> io::Result<HeaderType> {
+        HeaderType::from_raw(self.header_type)
+    }
+
+    #[inline]
     pub fn commit(hdr_ptr: *mut MessageHeader) {
         let cptr = unsafe { std::ptr::addr_of_mut!((*hdr_ptr).committed) as *mut AtomicU8 };
         unsafe { (*cptr).store(Self::COMMITTED, Ordering::Release) }
@@ -47,6 +52,22 @@ pub enum HeaderType {
     User = 1,
     Skip = 2,
     Roll = 3,
+}
+
+impl HeaderType {
+    #[inline]
+    pub fn from_raw(raw: u8) -> io::Result<Self> {
+        match raw {
+            0 => Ok(Self::Channel),
+            1 => Ok(Self::User),
+            2 => Ok(Self::Skip),
+            3 => Ok(Self::Roll),
+            _ => Err(io::Error::new(
+                ErrorKind::InvalidData,
+                format!("invalid header_type: {raw}"),
+            )),
+        }
+    }
 }
 
 /// The first record in region 0 is a `MessageHeader(Channel)`
