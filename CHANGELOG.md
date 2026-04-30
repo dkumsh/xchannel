@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 2.2.0 (2026-04-30)
 
 ### Added
 - `Reader::read_blocking(timeout: Option<Duration>) -> io::Result<Option<MessageRef<'_>>>`
