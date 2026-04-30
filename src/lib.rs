@@ -127,6 +127,7 @@ pub struct WriterBuilder {
     region_size: usize,
     file_roll_size: u64,
     mtu: u64,
+    keep_files: Option<u64>,
 }
 
 impl WriterBuilder {
@@ -136,6 +137,7 @@ impl WriterBuilder {
             region_size: 1024 * 1024, // default: 1M
             file_roll_size: 0,        // default: no file rolling
             mtu: 0,                   // default: no MTU limit
+            keep_files: None,         // default: keep all rolled files
         }
     }
 
@@ -155,10 +157,34 @@ impl WriterBuilder {
         self
     }
 
+    /// Cap the number of channel files retained on disk to `n` (the active
+    /// file plus `n - 1` historical rolled files). Each successful file roll
+    /// unlinks the file at sequence `current_seq − n`.
+    ///
+    /// Default: unlimited retention.
+    ///
+    /// `n` must be at least 1. Readers that are still mapped on a file when
+    /// it is unlinked will continue to read it (POSIX `unlink` keeps the
+    /// inode alive while it is open or mapped); they will only fail with
+    /// `ENOENT` if they fall further behind than `n` files and try to open
+    /// a file that has already been pruned.
+    #[inline]
+    pub fn keep_files(mut self, n: u64) -> Self {
+        assert!(n >= 1, "WriterBuilder::keep_files: n must be >= 1");
+        self.keep_files = Some(n);
+        self
+    }
+
     /// Create or open the latest sequence file and return a Writer.
     #[inline]
     pub fn build(self) -> io::Result<Writer> {
-        Writer::open_or_create(self.path, self.region_size, self.file_roll_size, self.mtu)
+        Writer::open_or_create(
+            self.path,
+            self.region_size,
+            self.file_roll_size,
+            self.mtu,
+            self.keep_files,
+        )
     }
 
     /// Convenience: just ensure the channel file exists and is initialized, then drop.
@@ -232,6 +258,7 @@ pub struct Writer {
     region_size: usize,
     file_roll_size: u64,
     mtu: u64,
+    keep_files: Option<u64>,
 
     // Pre-header pipeline state:
     next_hdr_pos: usize, // absolute file offset of the pre-installed header slot
@@ -246,6 +273,7 @@ impl Writer {
         region_size: usize,
         file_roll_size: u64,
         mtu: u64,
+        keep_files: Option<u64>,
     ) -> io::Result<Self> {
         // Validate region invariants
         let ps = region::page_size();
@@ -301,6 +329,7 @@ impl Writer {
             region_size,
             file_roll_size,
             mtu,
+            keep_files,
             next_hdr_pos,
             msgs_since_wp: 0,
         })
@@ -591,6 +620,22 @@ impl Writer {
         write_roll_header_at(&old_file, old_region_size, roll_pos, now_ns())?;
         // Bump old wp by one header
         fetch_add_wp(&old_file, old_region_size, HEADER_SLOT as u64)?;
+
+        // Retention: if `keep_files(N)` was configured, the file at sequence
+        // `next_seq - N` (if any) is now beyond the retention window. Unlink
+        // it; readers that still have it mapped keep their inode reference
+        // until they finish that file.
+        if let Some(n) = self.keep_files
+            && next_seq >= n
+        {
+            let prune_seq = next_seq - n;
+            let prune_path = make_channel_file_path(&self.base_path, prune_seq)?;
+            match std::fs::remove_file(&prune_path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
 
         Ok(())
     }
@@ -1352,19 +1397,38 @@ fn find_sequence(path: &Path, latest: bool) -> io::Result<u64> {
 }
 
 /// Remove channel base and all rolled files created by this crate.
+/// Scans the parent directory for entries matching `base` and `base.<N>`
+/// and removes them, so this works correctly even when retention has left
+/// a sparse set of rolled files (e.g. with `WriterBuilder::keep_files`).
 pub fn cleanup_channel_files<P: AsRef<std::path::Path>>(base: P) {
     use std::fs;
     let base_path = base.as_ref();
-    // remove base (sequence 0)
+
+    // Remove the base file (sequence 0).
     let _ = fs::remove_file(base_path);
-    // remove rolled files (1..)
-    for i in 1.. {
-        if let Ok(p) = make_channel_file_path(base_path, i) {
-            if fs::remove_file(&p).is_err() {
-                break;
-            }
-        } else {
-            break;
+
+    let parent = match base_path.parent() {
+        Some(p) if p.as_os_str().is_empty() => std::path::PathBuf::from("."),
+        Some(p) => p.to_path_buf(),
+        None => std::path::PathBuf::from("."),
+    };
+    let Some(file_name) = base_path.file_name().and_then(|s| s.to_str()) else {
+        return;
+    };
+    let prefix = format!("{file_name}.");
+
+    let Ok(entries) = read_dir(&parent) else {
+        return;
+    };
+    for ent in entries.flatten() {
+        let name_os = ent.file_name();
+        let Some(name) = name_os.to_str() else {
+            continue;
+        };
+        if let Some(rest) = name.strip_prefix(&prefix)
+            && rest.parse::<u64>().is_ok()
+        {
+            let _ = fs::remove_file(ent.path());
         }
     }
 }
@@ -1456,6 +1520,95 @@ mod tests {
         Ok(())
     }
 
+    /// `keep_files(N)` should retain only the active file plus N-1
+    /// historical rolled files. Each successful `roll_file` unlinks the
+    /// file at `current_seq - N` (if it exists). Files past the retention
+    /// window must no longer exist on disk.
+    #[test]
+    fn test_keep_files_retention() -> anyhow::Result<()> {
+        let base = "test_keep_files_retention";
+        cleanup_channel_files(base);
+
+        let region_size = crate::page_size();
+        let mut writer = WriterBuilder::new(base)
+            .region_size(region_size)
+            .file_roll_size((region_size as u64) * 100)
+            .keep_files(2) // keep current + 1 historical
+            .build()?;
+
+        // Write something into each file then roll to the next.
+        let commit_one = |w: &mut Writer, ts: u64| -> io::Result<()> {
+            let payload = w.try_reserve(64)?;
+            for b in payload.iter_mut() {
+                *b = 0x5A;
+            }
+            w.commit(1, 64, ts)
+        };
+
+        for ts in 0..5u64 {
+            commit_one(&mut writer, ts)?;
+            writer.roll_file()?;
+        }
+
+        // After 5 rolls, writer is on file 5. With keep_files(2) the
+        // expected on-disk files are {4, 5}. Anything below 4 must be gone.
+        for seq in 0..=3u64 {
+            let p = make_channel_file_path(std::path::Path::new(base), seq)?;
+            assert!(
+                !p.exists(),
+                "expected pruned file to be gone: {} (seq {})",
+                p.display(),
+                seq
+            );
+        }
+        for seq in 4..=5u64 {
+            let p = make_channel_file_path(std::path::Path::new(base), seq)?;
+            assert!(
+                p.exists(),
+                "expected retained file to exist: {} (seq {})",
+                p.display(),
+                seq
+            );
+        }
+
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// `keep_files` should not affect the unbounded default. Without it,
+    /// every file from the run remains on disk.
+    #[test]
+    fn test_keep_files_default_unlimited() -> anyhow::Result<()> {
+        let base = "test_keep_files_default";
+        cleanup_channel_files(base);
+
+        let region_size = crate::page_size();
+        let mut writer = WriterBuilder::new(base)
+            .region_size(region_size)
+            .file_roll_size((region_size as u64) * 100)
+            .build()?;
+
+        for _ in 0..3 {
+            let payload = writer.try_reserve(32)?;
+            payload.fill(0xC3);
+            writer.commit(1, 32, 0)?;
+            writer.roll_file()?;
+        }
+
+        for seq in 0..=3u64 {
+            let p = make_channel_file_path(std::path::Path::new(base), seq)?;
+            assert!(
+                p.exists(),
+                "default retention should keep all files; missing {} (seq {})",
+                p.display(),
+                seq
+            );
+        }
+
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
     /// Simple write/read across file rolls.
     #[test]
     fn test_write_and_read_full_payload() -> anyhow::Result<()> {
@@ -1466,7 +1619,7 @@ mod tests {
         let file_roll_size = (region_size as u64) * 100; // won't auto-roll
         let mtu = 0;
 
-        let mut writer = Writer::open_or_create(base, region_size, file_roll_size, mtu)?;
+        let mut writer = Writer::open_or_create(base, region_size, file_roll_size, mtu, None)?;
 
         let msg1: Vec<u8> = (0..100).map(|i| i as u8).collect();
         let msg2: Vec<u8> = vec![0x55; 200];
@@ -1522,7 +1675,7 @@ mod tests {
 
         let region_size = crate::page_size();
         let file_roll_size = (region_size as u64) * 10;
-        let mut writer = Writer::open_or_create(base, region_size, file_roll_size, 0)?;
+        let mut writer = Writer::open_or_create(base, region_size, file_roll_size, 0, None)?;
 
         let payload0 = vec![0x10; 16];
         {
@@ -1565,7 +1718,7 @@ mod tests {
 
         let region = crate::page_size();
         let file_roll_size = (region as u64) * 10;
-        let mut w = Writer::open_or_create(base, region, file_roll_size, 0)?;
+        let mut w = Writer::open_or_create(base, region, file_roll_size, 0, None)?;
 
         // Choose len so that after header + payload the aligned end is region - header_size.
         let record_with_padding = region - HEADER_SLOT;
@@ -1608,7 +1761,7 @@ mod tests {
 
         let region_size = crate::page_size();
         let file_roll_size = (region_size as u64) * 10;
-        let mut writer = Writer::open_or_create(base, region_size, file_roll_size, 0)?;
+        let mut writer = Writer::open_or_create(base, region_size, file_roll_size, 0, None)?;
 
         let payload1 = vec![0xA1; 32];
         let payload2 = vec![0xB2; 48];
@@ -1649,7 +1802,7 @@ mod tests {
 
         let region_size = crate::page_size();
         let file_roll_size = (region_size as u64) * 10;
-        let mut writer = Writer::open_or_create(base, region_size, file_roll_size, 0)?;
+        let mut writer = Writer::open_or_create(base, region_size, file_roll_size, 0, None)?;
 
         let start = align_up(MESSAGE_HEADER_SIZE + CHANNEL_HEADER_SIZE);
         let record_with_padding = region_size - start - HEADER_SLOT;
@@ -1693,7 +1846,7 @@ mod tests {
 
         let region_size = crate::page_size();
         let file_roll_size = (region_size as u64) * 10;
-        let mut writer = Writer::open_or_create(base, region_size, file_roll_size, 0)?;
+        let mut writer = Writer::open_or_create(base, region_size, file_roll_size, 0, None)?;
 
         let payload1 = vec![0x3A; 64];
         let payload2 = vec![0x7B; 48];
@@ -1733,7 +1886,7 @@ mod tests {
 
         let region_size = crate::page_size();
         let file_roll_size = (region_size as u64) * 10;
-        let _writer = Writer::open_or_create(base, region_size, file_roll_size, 0)?;
+        let _writer = Writer::open_or_create(base, region_size, file_roll_size, 0, None)?;
 
         let mut reader = Reader::open(base, ReaderMode::Live)?;
         let before = reader.read_position;
@@ -1751,7 +1904,7 @@ mod tests {
 
         let region_size = crate::page_size();
         let file_roll_size = (region_size as u64) * 10;
-        let _writer = Writer::open_or_create(base, region_size, file_roll_size, 0)?;
+        let _writer = Writer::open_or_create(base, region_size, file_roll_size, 0, None)?;
 
         let mut reader = Reader::open(base, ReaderMode::LateJoin)?;
         let before = reader.read_position;
