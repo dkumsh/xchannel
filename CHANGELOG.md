@@ -15,6 +15,10 @@
   design constraints (single writer, no back-pressure, no
   kernel-mediated wake-up, retention-eviction semantics) so users can
   evaluate the library's fit upfront.
+- `Reader::read_blocking` rustdoc now includes a tokio example showing
+  the async-runtime equivalent (same backoff loop with the runtime's
+  sleep). Keeps xchannel runtime-agnostic — no async deps — while
+  giving async callers a tested starting point they can adapt.
 
 ## 2.1.1 (2026-04-30)
 

@@ -1249,7 +1249,43 @@ impl Reader {
     /// This is a synchronous helper. **Do not call from an async runtime
     /// task** — it uses `std::thread::sleep` and will block the executor
     /// thread. Async callers should compose `try_read` with their
-    /// runtime's own sleep primitive.
+    /// runtime's own sleep primitive; the body is straightforward, but
+    /// the borrow-checker dance is non-obvious. Tokio example
+    /// (substitute your runtime's sleep for other ecosystems):
+    ///
+    /// ```ignore
+    /// use std::time::{Duration, Instant};
+    /// use std::io;
+    /// use xchannel::{Reader, MessageRef};
+    ///
+    /// /// Async analogue of `Reader::read_blocking` for tokio. Same
+    /// /// adaptive 1 µs → 10 ms backoff; uses `tokio::time::sleep`
+    /// /// instead of `std::thread::sleep` so it doesn't block the
+    /// /// executor thread.
+    /// async fn read_async(
+    ///     reader: &mut Reader,
+    ///     timeout: Option<Duration>,
+    /// ) -> io::Result<Option<MessageRef<'_>>> {
+    ///     let deadline = timeout.map(|d| Instant::now() + d);
+    ///     let mut backoff_us: u64 = 1;
+    ///     loop {
+    ///         // Polonius workaround: stable rustc's borrow checker
+    ///         // conflates the borrow from `try_read` across loop
+    ///         // iterations. A transient raw-pointer reborrow expresses
+    ///         // the actual lifetime correctly; the returned
+    ///         // `MessageRef`'s lifetime matches `&mut Reader`.
+    ///         let r: &mut Reader = unsafe { &mut *(reader as *mut Reader) };
+    ///         if let Some(msg) = r.try_read()? {
+    ///             return Ok(Some(msg));
+    ///         }
+    ///         if let Some(d) = deadline {
+    ///             if Instant::now() >= d { return Ok(None); }
+    ///         }
+    ///         tokio::time::sleep(Duration::from_micros(backoff_us)).await;
+    ///         backoff_us = (backoff_us * 2).min(10_000);
+    ///     }
+    /// }
+    /// ```
     ///
     /// `timeout = None` waits indefinitely. `timeout = Some(d)` returns
     /// `Ok(None)` if `d` elapses before a message is available.
