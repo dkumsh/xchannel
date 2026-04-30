@@ -377,6 +377,30 @@ just GAPS_NS="0 100000" DURATION=10 bench          # quicker, fewer gaps
 just bench-quick                                    # smoke test
 ```
 
+## Limitations
+
+A few things xchannel deliberately doesn't do. These are explicit design
+choices — they keep the algorithm small and the hot path cheap — but
+they shape what the library is and isn't suited for.
+
+- **Single writer per channel.** Concurrent writers will corrupt the
+  shared state. Fan-in from N producers requires N channels and a
+  downstream multiplexer.
+
+- **No back-pressure.** A slow reader cannot slow the writer; the
+  writer keeps producing into rolled files and the gap grows. Use
+  `WriterBuilder::keep_files(N)` to bound retention, and make sure
+  your reader can sustain the steady-state rate.
+
+- **A reader that falls more than `keep_files(N)` files behind will
+  get `ENOENT`** when it tries to follow a Roll into a file that has
+  already been pruned. There is no "skip ahead" recovery — opening a
+  fresh `Reader` is the supported path.
+
+- **`try_read` is strictly non-blocking.** No `read_timeout`, no
+  condvar / future / eventfd-style notification. Callers needing
+  wait semantics poll or spin themselves.
+
 ---
 
 

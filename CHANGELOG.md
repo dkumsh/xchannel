@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Docs
+- README gains a `Limitations` section documenting the deliberate
+  design constraints (single writer, no back-pressure, non-blocking
+  reads, retention-eviction semantics) so users can evaluate the
+  library's fit upfront.
+
 ## 2.1.1 (2026-04-30)
 
 ### Changed
