@@ -2,11 +2,19 @@
 
 ## Unreleased
 
+### Added
+- `Reader::read_blocking(timeout: Option<Duration>) -> io::Result<Option<MessageRef<'_>>>`
+  — synchronous helper that polls `try_read` with adaptive sleep-based
+  backoff (1 µs doubling up to a 10 ms cap), returning `Ok(None)` if
+  the optional `timeout` elapses first. No writer cooperation required;
+  zero impact on existing fast paths. Not safe to call from an async
+  executor task — use `try_read` plus the runtime's own sleep instead.
+
 ### Docs
 - README gains a `Limitations` section documenting the deliberate
-  design constraints (single writer, no back-pressure, non-blocking
-  reads, retention-eviction semantics) so users can evaluate the
-  library's fit upfront.
+  design constraints (single writer, no back-pressure, no
+  kernel-mediated wake-up, retention-eviction semantics) so users can
+  evaluate the library's fit upfront.
 
 ## 2.1.1 (2026-04-30)
 

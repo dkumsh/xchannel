@@ -24,7 +24,8 @@ use std::mem::{align_of, size_of};
 use std::path::{Path, PathBuf};
 use std::slice;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 // ========== Constants ==========
 const MESSAGE_HEADER_SIZE: usize = size_of::<MessageHeader>();
@@ -1236,6 +1237,65 @@ impl Reader {
         }
     }
 
+    /// Block until a user message is available, returning it; or until the
+    /// optional `timeout` elapses, returning `Ok(None)`.
+    ///
+    /// Internally polls `try_read` with adaptive sleep-based backoff
+    /// (1 µs → 2 → 4 → ... up to 10 ms cap). At high publish rates the
+    /// loop catches the next message in the spinning regime; when the
+    /// channel is idle the thread sleeps and worst-case wake-up latency
+    /// is bounded by the cap.
+    ///
+    /// This is a synchronous helper. **Do not call from an async runtime
+    /// task** — it uses `std::thread::sleep` and will block the executor
+    /// thread. Async callers should compose `try_read` with their
+    /// runtime's own sleep primitive.
+    ///
+    /// `timeout = None` waits indefinitely. `timeout = Some(d)` returns
+    /// `Ok(None)` if `d` elapses before a message is available.
+    pub fn read_blocking(
+        &mut self,
+        timeout: Option<Duration>,
+    ) -> io::Result<Option<MessageRef<'_>>> {
+        const INITIAL_BACKOFF_US: u64 = 1;
+        const MAX_BACKOFF_US: u64 = 10_000;
+
+        let deadline = timeout.map(|d| Instant::now() + d);
+        let mut backoff_us: u64 = INITIAL_BACKOFF_US;
+
+        loop {
+            // SAFETY: each iteration's `try_read` borrow is short-lived —
+            // when it returns `None` the borrow is dead before the next
+            // iteration. Stable Rust's borrow checker (without Polonius)
+            // can't see this and conflates the borrows; reborrowing through
+            // a raw pointer expresses the actual lifetime correctly. The
+            // returned `MessageRef`'s lifetime is the function's `'_`,
+            // which matches `&mut self`.
+            let this: &mut Self = unsafe { &mut *(self as *mut Self) };
+            if let Some(msg) = this.try_read()? {
+                return Ok(Some(msg));
+            }
+            if let Some(d) = deadline
+                && Instant::now() >= d
+            {
+                return Ok(None);
+            }
+            // Clamp the next sleep so we don't overshoot the deadline by
+            // up to MAX_BACKOFF_US.
+            let mut sleep_us = backoff_us;
+            if let Some(d) = deadline {
+                let remaining = d.saturating_duration_since(Instant::now());
+                let remaining_us = remaining.as_micros().min(u64::MAX as u128) as u64;
+                if remaining_us == 0 {
+                    return Ok(None);
+                }
+                sleep_us = sleep_us.min(remaining_us);
+            }
+            thread::sleep(Duration::from_micros(sleep_us));
+            backoff_us = (backoff_us * 2).min(MAX_BACKOFF_US);
+        }
+    }
+
     // The header lives in the last mapped region. We decode the fields we need into a small value
     // type so the borrow does not escape and freeze `self`: both `try_read()` and
     // `try_read_batch()` need to inspect the header first and then mutate reader state afterwards.
@@ -1605,6 +1665,81 @@ mod tests {
             );
         }
 
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// `read_blocking(Some(timeout))` should return `Ok(None)` once the
+    /// timeout elapses if no message is available.
+    #[test]
+    fn test_read_blocking_times_out() -> anyhow::Result<()> {
+        let base = "test_read_blocking_timeout";
+        cleanup_channel_files(base);
+
+        let region_size = crate::page_size();
+        WriterBuilder::new(base)
+            .region_size(region_size)
+            .precreate()?;
+
+        let mut reader = ReaderBuilder::new(base).live().build()?;
+
+        let start = std::time::Instant::now();
+        let msg = reader.read_blocking(Some(std::time::Duration::from_millis(50)))?;
+        let elapsed = start.elapsed();
+
+        assert!(msg.is_none(), "expected timeout, got message");
+        assert!(
+            elapsed >= std::time::Duration::from_millis(45),
+            "returned too early: {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(200),
+            "returned too late: {elapsed:?}"
+        );
+
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// `read_blocking` should return a message that arrives after the call
+    /// starts (here: a writer thread publishes 25 ms in).
+    #[test]
+    fn test_read_blocking_wakes_on_publish() -> anyhow::Result<()> {
+        let base = "test_read_blocking_wake";
+        cleanup_channel_files(base);
+
+        let region_size = crate::page_size();
+        WriterBuilder::new(base)
+            .region_size(region_size)
+            .precreate()?;
+
+        // Background writer publishes one message after a short delay.
+        let writer_base = base.to_string();
+        let writer_thread = std::thread::spawn(move || -> anyhow::Result<()> {
+            let mut writer = WriterBuilder::new(&writer_base)
+                .region_size(region_size)
+                .build()?;
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            let payload = writer.try_reserve(8)?;
+            payload.copy_from_slice(b"deadbeef");
+            writer.commit(42, 8, 0)?;
+            Ok(())
+        });
+
+        let mut reader = ReaderBuilder::new(base).live().build()?;
+        let start = std::time::Instant::now();
+        let msg = reader.read_blocking(Some(std::time::Duration::from_secs(2)))?;
+        let elapsed = start.elapsed();
+
+        let msg = msg.expect("expected a message before timeout");
+        assert_eq!(msg.header().message_type, 42);
+        assert_eq!(msg.payload(), b"deadbeef");
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "took too long to wake: {elapsed:?}"
+        );
+
+        writer_thread.join().expect("writer thread panicked")?;
         cleanup_channel_files(base);
         Ok(())
     }

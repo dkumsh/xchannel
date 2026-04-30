@@ -397,9 +397,13 @@ they shape what the library is and isn't suited for.
   already been pruned. There is no "skip ahead" recovery — opening a
   fresh `Reader` is the supported path.
 
-- **`try_read` is strictly non-blocking.** No `read_timeout`, no
-  condvar / future / eventfd-style notification. Callers needing
-  wait semantics poll or spin themselves.
+- **No kernel-mediated wake-up.** `try_read` is strictly non-blocking;
+  `Reader::read_blocking(timeout)` is a sleep-backoff helper
+  (1 µs → 10 ms cap, no syscall on the writer side). Sub-µs wake-up
+  would require a futex- or eventfd-based notification primitive that
+  xchannel does not currently provide. Async runtimes should compose
+  `try_read` with their own sleep — `read_blocking` uses
+  `std::thread::sleep` and will block an executor thread.
 
 ---
 
