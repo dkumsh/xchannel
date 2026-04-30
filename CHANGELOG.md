@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 2.1.1 (2026-04-30)
 
 ### Changed
 - License: dropped Apache-2.0; xchannel is now distributed under the MIT
