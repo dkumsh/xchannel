@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+- License: dropped Apache-2.0; xchannel is now distributed under the MIT
+  license only. The `LICENSE-APACHE` file has been removed and
+  `Cargo.toml` reflects `license = "MIT"`.
+
 ## 2.1.0 (2026-04-30)
 
 ### Added
