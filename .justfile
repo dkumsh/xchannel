@@ -1,3 +1,18 @@
+set export := true
+
+# Knobs for `bench` / `bench-quick`. Override on the command line, e.g.:
+#   just WRITER_CORE=10 READER_CORE=11 bench
+#   just SIZES="64 1k" DURATION=10 bench
+WRITER_CORE := "4"
+READER_CORE := "3"
+DURATION    := "30"
+WARMUP      := "3"
+SIZES       := "64 256 4k"
+KEEP_FILES  := "2"
+DISK_PATH   := "./bench/.disk"
+TMPFS_PATH  := "/dev/shm"
+OUT_DIR     := "./bench"
+
 # print options
 default:
     @just --list --unsorted
@@ -26,9 +41,17 @@ build:
 test:
    cargo test
 
-# execute benchmarks
+# run the full latency benchmark matrix; writes bench/results-<hostname>.md
 bench:
-    cargo bench
+    @bench/run.sh
+
+# quick smoke (one msg size, 5s window) — for verifying setup
+bench-quick:
+    @bench/run.sh --quick
+
+# build the bench binary in release mode without running it
+bench-build:
+    @cargo build --release --example xchan_bench
 
 # stress rolling for two-readers example
 stress:
