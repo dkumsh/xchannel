@@ -1,5 +1,32 @@
 # Changelog
 
+## 2.1.0 (2026-04-30)
+
+### Added
+- `WriterBuilder::keep_files(N)` caps the number of channel files retained
+  on disk to the active file plus N-1 historical rolled files. Each
+  successful roll unlinks the file at sequence `current - N`. Default is
+  unlimited retention (no behavior change for existing users). Readers
+  still mapped to a pruned file keep reading via the open inode; they
+  only fail with `ENOENT` if they fall further behind than N files.
+- `cleanup_channel_files` now scans the parent directory for matching
+  entries, so it correctly handles the sparse on-disk layouts that
+  `keep_files` can leave behind.
+
+### Examples / tests / docs
+- Reworked `examples/xchan_bench` for reproducible latency benchmarking:
+  Linux-only, real CPU pinning via `sched_setaffinity`, fixed-duration
+  runs with a JSON summary on stdout, configurable publish gap
+  (`--gap-ns N`), and `--keep-files` pass-through.
+- Added `bench/run.sh` matrix runner, `just bench` / `just bench-quick`
+  recipes, and reference results (`bench/results-montblanc.md`,
+  `bench/results-lse.md`).
+- README gains a Benchmarks section with multi-host tables at three
+  publish cadences and a "How to read these numbers" interpretation
+  guide.
+- Test coverage for retention behavior under `keep_files(N)` and for
+  the default unlimited-retention case.
+
 ## 2.0.0 (2026-03-09)
 
 ### Breaking changes
