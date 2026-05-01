@@ -1,6 +1,6 @@
 # xchannel
 
-**xchannel** is a tiny, zero-copy, mmap-backed IPC channel with automatic region and file rolling. It lets a single writer append messages to a persistent stream that multiple readers can replay from the beginning (**LateJoin**) or tail in real time (**Live**)—without a broker or background service.
+**xchannel** is a **single-writer**, **multi-reader** **broadcast queue** built on memory-mapped storage, designed for **ultra-low-latency** IPC where a producer appends variable-size, typed and timestamped messages and multiple independent readers can tail or replay the stream using their own cursors without copying or coordination. It prioritizes simplicity and predictability: there is no ownership transfer and no backpressure by design, ensuring complete producer isolation and deterministic latency while enabling true fan-out semantics where readers never interfere with each other. Its minimal design makes it easy to reason about, extend (e.g., via a lightweight network bridge), and reimplement in other languages. **Persistence** is not the primary goal but emerges naturally from the append-and-retain model, providing replay, **late joiners**, and recovery with minimal added complexity, making it a compact, composable primitive for high-performance data-plane systems.
 
 ## Features
 * Shared‑memory / IPC logs without a broker.
