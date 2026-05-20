@@ -1,6 +1,6 @@
 #[cfg(not(target_os = "linux"))]
 fn main() {
-    eprintln!("xchan_bench is Linux-only (uses sched_setaffinity for reproducible results).");
+    eprintln!("xch-bench is Linux-only (uses sched_setaffinity for reproducible results).");
     std::process::exit(1);
 }
 

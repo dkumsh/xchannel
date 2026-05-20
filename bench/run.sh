@@ -55,11 +55,11 @@ fi
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
 
-bin="${BENCH_BIN:-$repo_root/target/release/examples/xchan_bench}"
+bin="${BENCH_BIN:-$repo_root/target/release/examples/xch-bench}"
 if [[ ! -x "$bin" ]]; then
-  echo "[run] building xchan_bench (release)..." >&2
-  cargo build --release --example xchan_bench >&2
-  bin="$repo_root/target/release/examples/xchan_bench"
+  echo "[run] building xch-bench (release)..." >&2
+  cargo build --release --example xch-bench >&2
+  bin="$repo_root/target/release/examples/xch-bench"
 fi
 
 mkdir -p "$DISK_PATH" "$OUT_DIR"

@@ -51,7 +51,7 @@ bench-quick:
 
 # build the bench binary in release mode without running it
 bench-build:
-    @cargo build --release --example xchan_bench
+    @cargo build --release --example xch-bench
 
 # stress rolling for two-readers example
 stress:
