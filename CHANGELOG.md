@@ -30,9 +30,29 @@
   forward-compatible alternative user-meta layouts; current writers
   emit 0 and current readers refuse anything else.
 
+### Added (crash safety)
+- `WriterBuilder::build` on an existing channel file now performs
+  single-step writer-crash recovery. If the slot at
+  `ChannelHeader.write_position - HEADER_SLOT` holds a committed
+  record (the on-disk signature of a writer that crashed between
+  `commit` and `publish_wp`), the open advances past it by the
+  record's own `length`, verifies the new slot bears the pre-install
+  signature `commit()` writes one step ahead of itself, updates
+  `write_position`, and resumes. Handles both User-record and
+  Skip-record (in-region roll) crashes. Multi-record lag and any
+  non-pre-installed slot still refuse with `ErrorKind::InvalidData`;
+  the fallback is `cleanup_channel_files` and a fresh channel.
+  Recovery touches only `write_position`, never record bytes —
+  readers continue draining what was committed.
+
 ### Docs
 - README gains a `Wire format` section pointing at `FORMAT.md` and
-  explaining the `user_meta_u64` / `user_header_kind` model.
+  explaining the `user_meta_u64` model.
+- README `Limitations` gains two new entries: an explicit no-crash-
+  recovery contract for writers (matching the detection above), and a
+  note that channel files must live on a local filesystem — `mmap`
+  cross-process coherence does not hold over NFS / SMB / some FUSE
+  backends.
 
 ## 2.2.0 (2026-04-30)
 

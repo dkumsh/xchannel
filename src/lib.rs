@@ -103,6 +103,30 @@ fn validate_channel_header(ch: &ChannelHeader, expected_region_size: usize) -> i
     }
     Ok(())
 }
+
+/// A "pre-installed" header is what `commit()` writes one step ahead of itself:
+/// `{committed: 0, header_type: User, length: 0, message_type: 0, user_meta_u64: 0}`.
+/// Crashed-writer recovery advances past the orphaned record and asserts this
+/// signature on the new slot, rejecting raw fresh-extended bytes
+/// (`header_type = 0 = Channel`) or any partially-populated state.
+fn verify_preinstall_signature(hdr: &MessageHeader) -> io::Result<()> {
+    if hdr.is_committed()? {
+        return Err(err_invalid_data(
+            "crashed writer recovery: advanced slot is committed \
+             (multi-record publish_wp lag, unsupported)",
+        ));
+    }
+    if hdr.header_type != HeaderType::User as u8
+        || hdr.length != 0
+        || hdr.message_type != 0
+        || hdr.user_meta_u64 != 0
+    {
+        return Err(err_invalid_data(
+            "crashed writer recovery: advanced slot is not a pre-installed header",
+        ));
+    }
+    Ok(())
+}
 // -------- Error types: --------
 
 // -------- Small internal helpers (low-level ops) --------
@@ -497,8 +521,8 @@ impl Writer {
 
             // wp denotes the **next header slot offset**
             let wp_payload = ch.write_position.load(Ordering::Relaxed) as usize;
-            let next_hdr = wp_payload.saturating_sub(HEADER_SLOT);
-            let region_index = (next_hdr / region_size) as u64;
+            let mut next_hdr = wp_payload.saturating_sub(HEADER_SLOT);
+            let mut region_index = (next_hdr / region_size) as u64;
 
             // Ensure the file actually covers the region we’re about to map.
             let needed_end = (region_index + 1) as u64 * region_size as u64;
@@ -506,11 +530,91 @@ impl Writer {
                 file.set_len(needed_end)?;
                 file_len = needed_end;
             }
-            let current_region = RegionMapping::create_writable(
+            let mut current_region = RegionMapping::create_writable(
                 &file,
                 region_index * region_size as u64,
                 region_size,
             )?;
+
+            // INV5: a clean writer always leaves the header at `next_hdr` pre-
+            // installed with committed=0. If we observe it committed, the
+            // previous writer crashed between `MessageHeader::commit` and
+            // `publish_wp` — `publish_wp` is unconditional in every commit
+            // path today, so the lag is bounded to one record. We attempt
+            // one-step recovery: advance past the orphaned record by its
+            // own `length`, and verify the next slot bears the writer's
+            // pre-install signature. Deeper lag (multi-record) or any
+            // non-recoverable header type refuses; the supported fallback
+            // is `cleanup_channel_files` + a fresh channel.
+            let next_hdr_off = next_hdr % region_size;
+            let stale_hdr =
+                unsafe { &*(current_region.as_ptr().add(next_hdr_off) as *const MessageHeader) };
+            if stale_hdr.is_committed()? {
+                let stale_type = stale_hdr.parsed_header_type()?;
+                let stale_len = stale_hdr.length as usize;
+                let advance = HEADER_SLOT + align_up(stale_len);
+                match stale_type {
+                    HeaderType::User => {
+                        // Recover within the current region.
+                        if next_hdr_off + advance + HEADER_SLOT > region_size {
+                            return Err(err_invalid_data(
+                                "crashed writer: User-record recovery would cross region \
+                                 boundary; clean up the channel files and start fresh",
+                            ));
+                        }
+                        let advanced_off = next_hdr_off + advance;
+                        let advanced_hdr = unsafe {
+                            &*(current_region.as_ptr().add(advanced_off) as *const MessageHeader)
+                        };
+                        verify_preinstall_signature(advanced_hdr)?;
+                        next_hdr += advance;
+                        with_ch_mut(&file, region_size, |ch| {
+                            ch.write_position
+                                .store((next_hdr + HEADER_SLOT) as u64, Ordering::Release);
+                        })?;
+                    }
+                    HeaderType::Skip => {
+                        // Recover into the next region. By construction in
+                        // `roll_over_region`, the Skip's length fills the
+                        // remainder of the current region.
+                        if next_hdr_off + advance != region_size {
+                            return Err(err_invalid_data(
+                                "crashed writer: Skip length does not align to region boundary",
+                            ));
+                        }
+                        let next_region_index = region_index + 1;
+                        let needed_end = (next_region_index + 1) * region_size as u64;
+                        if needed_end > file_len {
+                            return Err(err_invalid_data(
+                                "crashed writer: Skip points past end of file",
+                            ));
+                        }
+                        let new_region = RegionMapping::create_writable(
+                            &file,
+                            next_region_index * region_size as u64,
+                            region_size,
+                        )?;
+                        let new_hdr_ref =
+                            unsafe { &*(new_region.as_ptr() as *const MessageHeader) };
+                        verify_preinstall_signature(new_hdr_ref)?;
+                        next_hdr += advance;
+                        region_index = next_region_index;
+                        current_region = new_region;
+                        with_ch_mut(&file, region_size, |ch| {
+                            ch.write_position
+                                .store((next_hdr + HEADER_SLOT) as u64, Ordering::Release);
+                        })?;
+                    }
+                    HeaderType::Roll | HeaderType::Channel => {
+                        return Err(err_invalid_data(format!(
+                            "crashed writer: unexpected header_type {:?} at write_position \
+                             slot; clean up the channel files and start fresh",
+                            stale_type
+                        )));
+                    }
+                }
+            }
+
             Ok((
                 file,
                 region0,
@@ -2341,6 +2445,209 @@ mod tests {
             .err()
             .unwrap();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
+
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// Overwrite `ChannelHeader.write_position` on disk to simulate the byte
+    /// pattern a writer would leave if it crashed before a publish_wp.
+    fn rewind_write_position_on_disk(base: &str, rewind_bytes: u64) -> anyhow::Result<()> {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let mut f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(make_channel_file_path(Path::new(base), 0)?)?;
+        // ChannelHeader sits immediately after the 16-byte system MessageHeader.
+        // Its first field is `write_position: AtomicU64` at byte offset 16.
+        const WP_OFFSET: u64 = MESSAGE_HEADER_SIZE as u64;
+        f.seek(SeekFrom::Start(WP_OFFSET))?;
+        let mut bytes = [0u8; 8];
+        f.read_exact(&mut bytes)?;
+        let wp = u64::from_le_bytes(bytes);
+        let new_wp = wp - rewind_bytes;
+        f.seek(SeekFrom::Start(WP_OFFSET))?;
+        f.write_all(&new_wp.to_le_bytes())?;
+        f.sync_all()?;
+        Ok(())
+    }
+
+    /// INV5 — single-step recovery (User-record case).
+    ///
+    /// A writer that crashes between `MessageHeader::commit` (setting the
+    /// current slot's committed=1) and `publish_wp` (advancing
+    /// `ChannelHeader.write_position` past it) leaves the file with one
+    /// committed User record at `write_position - HEADER_SLOT`. The
+    /// next slot is the pre-installed header for the *next* record
+    /// (committed=0, header_type=User, all-zero fields).
+    ///
+    /// `Writer::open_or_create` must detect this, advance past the
+    /// orphaned record, verify the pre-install signature on the next
+    /// slot, update `write_position`, and resume — without losing or
+    /// rewriting the committed record.
+    #[test]
+    fn test_writer_recovers_single_step_user_crash() -> anyhow::Result<()> {
+        let base = "test_writer_recovers_single_step_user_crash";
+        cleanup_channel_files(base);
+
+        let region_size = page_size();
+        let payload0: [u8; 8] = [0xAB; 8];
+        let payload1: [u8; 8] = [0xCD; 8];
+
+        // 1) Clean writer: write one message, drop.
+        {
+            let mut w = WriterBuilder::new(base).region_size(region_size).build()?;
+            let buf = w.try_reserve(payload0.len())?;
+            buf.copy_from_slice(&payload0);
+            w.commit(1, payload0.len() as u32, 0)?;
+        }
+
+        // 2) Inject the crash state: rewind wp by one full record.
+        let record_size = (HEADER_SLOT + payload0.len()).next_multiple_of(ALIGN) as u64;
+        rewind_write_position_on_disk(base, record_size)?;
+
+        // 3) Reopen — must succeed (single-step recovery).
+        let mut w = WriterBuilder::new(base).region_size(region_size).build()?;
+
+        // 4) The recovered writer must keep going.
+        let buf = w.try_reserve(payload1.len())?;
+        buf.copy_from_slice(&payload1);
+        w.commit(2, payload1.len() as u32, 0)?;
+        drop(w);
+
+        // 5) Reader sees both messages, in order, with original payloads.
+        let mut r = Reader::open(base, ReaderMode::LateJoin)?;
+        let m0 = r.try_read()?.expect("message 0 should be visible");
+        assert_eq!(m0.payload(), &payload0);
+        assert_eq!(m0.header().message_type, 1);
+        let m1 = r
+            .try_read()?
+            .expect("message 1 (post-recovery) should be visible");
+        assert_eq!(m1.payload(), &payload1);
+        assert_eq!(m1.header().message_type, 2);
+        assert!(r.try_read()?.is_none(), "no further messages");
+
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// INV5 — single-step recovery (Skip-record case).
+    ///
+    /// `roll_over_region` writes a Skip in the old region and pre-installs
+    /// the next region's first header *before* calling `publish_wp`. A
+    /// crash in that window leaves a committed Skip at
+    /// `write_position - HEADER_SLOT`. Recovery follows the Skip into
+    /// the next region (re-mapping it), verifies the pre-install
+    /// signature, and resumes there.
+    #[test]
+    fn test_writer_recovers_single_step_skip_crash() -> anyhow::Result<()> {
+        let base = "test_writer_recovers_single_step_skip_crash";
+        cleanup_channel_files(base);
+
+        let region_size = page_size();
+        // Big payload to wedge near the end of region 0, so the next
+        // try_reserve triggers a region roll. With region_size=4096 and
+        // 80 bytes of region-0 overhead, payload >= 3961 forces a roll
+        // on a subsequent 8-byte message. 3968 is the next aligned size.
+        let big = vec![0x77u8; 3968];
+        let small_payload: [u8; 8] = [0xEE; 8];
+
+        // 1) Write one big message, then `try_reserve` an 8-byte slot —
+        //    this triggers roll_over_region (Skip in region 0, pre-install
+        //    in region 1, wp advanced to start of region 1's payload area).
+        //    Drop the writer WITHOUT committing the second message — the
+        //    pre-installed slot in region 1 stays pristine.
+        {
+            let mut w = WriterBuilder::new(base).region_size(region_size).build()?;
+            let buf = w.try_reserve(big.len())?;
+            buf.copy_from_slice(&big);
+            w.commit(1, big.len() as u32, 0)?;
+            // This try_reserve forces the roll; the returned buffer is
+            // never filled and we never call commit.
+            let _ = w.try_reserve(small_payload.len())?;
+        }
+
+        // 2) Rewind wp from its post-roll value back to the value it
+        //    held *before* roll_over_region's publish_wp. With
+        //    region_size=4096 and big payload=3968: the Skip sits at
+        //    offset 4064 with skip_len=16 (total Skip record = 32 bytes,
+        //    filling exactly to the region boundary). Pre-roll wp was
+        //    4080 (set by the big message's publish_wp at the end of
+        //    commit). Post-roll wp is 4112 (set by roll_over_region's
+        //    publish_wp). The rewind is exactly the Skip record size,
+        //    which is also the publish_wp delta inside roll_over_region.
+        rewind_write_position_on_disk(base, 32)?;
+
+        // 3) Reopen — must succeed (recovery follows the Skip into region 1).
+        let mut w = WriterBuilder::new(base).region_size(region_size).build()?;
+
+        // 4) Recovered writer writes a new message in region 1.
+        let buf = w.try_reserve(small_payload.len())?;
+        buf.copy_from_slice(&small_payload);
+        w.commit(2, small_payload.len() as u32, 0)?;
+        drop(w);
+
+        // 5) Reader: big message, then the post-recovery small message.
+        let mut r = Reader::open(base, ReaderMode::LateJoin)?;
+        let m0 = r.try_read()?.expect("big message should be visible");
+        assert_eq!(m0.payload(), &big[..]);
+        let m1 = r.try_read()?.expect("small message should be visible");
+        assert_eq!(m1.payload(), &small_payload);
+        assert_eq!(m1.header().message_type, 2);
+        assert!(r.try_read()?.is_none());
+
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// INV5 — multi-step crash refuses.
+    ///
+    /// If publish_wp lagged by more than one record, the slot we'd advance
+    /// into would also be committed. That can't happen today (publish_wp
+    /// is unconditional in every commit path) but the recovery code
+    /// must still refuse cleanly if the assumption ever breaks.
+    #[test]
+    fn test_writer_refuses_multi_step_crash() -> anyhow::Result<()> {
+        let base = "test_writer_refuses_multi_step_crash";
+        cleanup_channel_files(base);
+
+        let region_size = page_size();
+        let payload: [u8; 8] = [0xAB; 8];
+
+        // 1) Write two messages cleanly.
+        {
+            let mut w = WriterBuilder::new(base).region_size(region_size).build()?;
+            for n in 0..2 {
+                let buf = w.try_reserve(payload.len())?;
+                buf.copy_from_slice(&payload);
+                w.commit(n as u16, payload.len() as u32, 0)?;
+            }
+        }
+
+        // 2) Rewind wp by two full records: simulates a writer that
+        //    committed two messages without ever calling publish_wp.
+        let record_size = (HEADER_SLOT + payload.len()).next_multiple_of(ALIGN) as u64;
+        rewind_write_position_on_disk(base, 2 * record_size)?;
+
+        // 3) Reopen must refuse — the advanced slot is committed=1, not
+        //    a pre-installed header.
+        let err = WriterBuilder::new(base)
+            .region_size(region_size)
+            .build()
+            .err()
+            .expect("writer must refuse multi-step crash state");
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("multi-record publish_wp lag")
+                || err.to_string().contains("not a pre-installed header"),
+            "unexpected error: {err}"
+        );
+
+        // 4) Readers can still drain both committed messages.
+        let mut r = Reader::open(base, ReaderMode::LateJoin)?;
+        assert!(r.try_read()?.is_some());
+        assert!(r.try_read()?.is_some());
+        assert!(r.try_read()?.is_none());
 
         cleanup_channel_files(base);
         Ok(())

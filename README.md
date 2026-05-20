@@ -405,6 +405,29 @@ they shape what the library is and isn't suited for.
   `try_read` with their own sleep — `read_blocking` uses
   `std::thread::sleep` and will block an executor thread.
 
+- **Single-step writer-crash recovery only.** The publish step is
+  "write payload → mark header committed → advance `write_position`".
+  A writer that crashes between the last two stores leaves a single
+  committed record at the slot `write_position` still points at.
+  `WriterBuilder::build` detects this, advances past the orphan, and
+  verifies the next slot still bears the pre-installed header
+  signature that `commit()` wrote there one step ahead of itself.
+  When both conditions hold, the new writer resumes without
+  overwriting the committed record. If the advanced slot is also
+  committed (multi-record lag), or the slot is anything other than a
+  pre-installed header, `build` returns `ErrorKind::InvalidData` and
+  the supported recovery is `cleanup_channel_files` + a fresh
+  channel. Readers can always drain whatever was already committed —
+  the recovery touches only `write_position`, never record bytes.
+
+- **Local filesystems only.** `mmap` cross-process coherence relies
+  on the OS keeping `MAP_SHARED` pages coherent across cores via the
+  CPU's cache-coherence protocol. That holds for local filesystems
+  (ext4, xfs, tmpfs, APFS) on Linux and macOS. It does **not** hold
+  for network filesystems (NFS, SMB) or some FUSE backends, and
+  xchannel will silently misbehave on them. Place channel files on
+  local storage.
+
 ## Wire format
 
 The on-disk byte layout — `MessageHeader`, `ChannelHeader`, `Skip` /
