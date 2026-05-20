@@ -405,6 +405,20 @@ they shape what the library is and isn't suited for.
   `try_read` with their own sleep — `read_blocking` uses
   `std::thread::sleep` and will block an executor thread.
 
+## Wire format
+
+The on-disk byte layout — `MessageHeader`, `ChannelHeader`, `Skip` /
+`Roll` markers, the pre-header publish protocol, the `committed`
+release/acquire contract — is specified in [`FORMAT.md`](FORMAT.md).
+That document is the contract for non-Rust readers and any future tooling
+that needs to interpret channel files directly. The 16-byte
+`MessageHeader` reserves an 8-byte `user_meta_u64` slot that xchannel
+itself never reads — applications use it as a timestamp, sequence
+number, schema tag, or packed flags. The `ChannelHeader` also carries
+a reserved `user_header_kind: u32` discriminant for forward-compatible
+alternative user-meta layouts; current writers emit 0 and current
+readers refuse anything else.
+
 ---
 
 
@@ -545,7 +559,8 @@ Header fields include:
 * header type (`u8` on disk; parse with `header.parsed_header_type()?`)
 * message type
 * payload length
-* timestamp
+* `user_meta_u64` — an opaque 8-byte slot the application owns (timestamp,
+  sequence number, schema tag, packed flags, ...)
 
 Readers check:
 
@@ -570,7 +585,7 @@ let kind = msg.header().parsed_header_type()?;
 │ committed                    │
 │ message_type                 │
 │ payload_length               │
-│ timestamp_ns                 │
+│ user_meta_u64                │
 └──────────────────────────────┘
               │
               ▼

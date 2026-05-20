@@ -15,7 +15,10 @@
 mod channel;
 mod region;
 
-use channel::{ChannelHeader, HeaderType, MessageHeader};
+use channel::{
+    ChannelHeader, ENDIANNESS_LE, FORMAT_VERSION, HeaderType, MessageHeader, SYSTEM_HEADER_SIZE,
+    USER_HEADER_KIND_DEFAULT, USER_HEADER_SIZE,
+};
 pub use region::{ReadOnly, RegionMapping, Writable, page_size};
 
 use std::fs::{File, OpenOptions, read_dir};
@@ -62,6 +65,44 @@ fn get_channel_header_ptr(region_ptr: *const u8) -> *const ChannelHeader {
 fn get_channel_header<'a>(region_ptr: *const u8) -> &'a ChannelHeader {
     unsafe { &*get_channel_header_ptr(region_ptr) }
 }
+
+/// Validate the v1 format invariants of a `ChannelHeader` (see FORMAT.md §8).
+/// `expected_region_size` is checked against the value in the header.
+/// `user_header_kind` must equal `USER_HEADER_KIND_DEFAULT`; the wire field is
+/// reserved for future user-defined layouts and has no public opt-in today.
+fn validate_channel_header(ch: &ChannelHeader, expected_region_size: usize) -> io::Result<()> {
+    if ch.format_version != FORMAT_VERSION {
+        return Err(err_invalid_data(format!(
+            "unsupported format_version {} (this build expects {})",
+            ch.format_version, FORMAT_VERSION
+        )));
+    }
+    if ch.endianness != ENDIANNESS_LE {
+        return Err(err_invalid_data(format!(
+            "unsupported endianness 0x{:02x} (this build expects 0x{:02x})",
+            ch.endianness, ENDIANNESS_LE
+        )));
+    }
+    if ch.system_header_size != SYSTEM_HEADER_SIZE || ch.user_header_size != USER_HEADER_SIZE {
+        return Err(err_invalid_data(format!(
+            "header-size mismatch: file=({}/{}) build=({}/{})",
+            ch.system_header_size, ch.user_header_size, SYSTEM_HEADER_SIZE, USER_HEADER_SIZE
+        )));
+    }
+    if ch.user_header_kind != USER_HEADER_KIND_DEFAULT {
+        return Err(err_invalid_data(format!(
+            "unsupported user_header_kind 0x{:08x} (this build only reads 0x{:08x})",
+            ch.user_header_kind, USER_HEADER_KIND_DEFAULT
+        )));
+    }
+    if ch.region_size as usize != expected_region_size {
+        return Err(err_invalid_data(format!(
+            "region_size mismatch: file={} expected={}",
+            ch.region_size, expected_region_size
+        )));
+    }
+    Ok(())
+}
 // -------- Error types: --------
 
 // -------- Small internal helpers (low-level ops) --------
@@ -97,14 +138,14 @@ fn write_roll_header_at(
     file: &File,
     region_size: usize,
     pos: usize,
-    timestamp_ns: u64,
+    user_meta_u64: u64,
 ) -> io::Result<()> {
     let hdr: MessageHeader = MessageHeader {
         committed: 0,
         length: 0,
         header_type: HeaderType::Roll as u8,
         message_type: 0,
-        timestamp_ns,
+        user_meta_u64,
     };
     let ridx = (pos / region_size) as u64;
     let off = pos % region_size;
@@ -122,6 +163,9 @@ fn write_roll_header_at(
 }
 
 // ========== Builders ==========
+/// Maximum bytes available for a channel name in `ChannelHeader`.
+pub const CHANNEL_NAME_MAX: usize = 20;
+
 #[derive(Clone, Debug)]
 pub struct WriterBuilder {
     path: PathBuf,
@@ -129,6 +173,7 @@ pub struct WriterBuilder {
     file_roll_size: u64,
     mtu: u64,
     keep_files: Option<u64>,
+    channel_name: [u8; CHANNEL_NAME_MAX],
 }
 
 impl WriterBuilder {
@@ -139,6 +184,7 @@ impl WriterBuilder {
             file_roll_size: 0,        // default: no file rolling
             mtu: 0,                   // default: no MTU limit
             keep_files: None,         // default: keep all rolled files
+            channel_name: [0; CHANNEL_NAME_MAX],
         }
     }
 
@@ -156,6 +202,27 @@ impl WriterBuilder {
     pub fn mtu(mut self, mtu: u64) -> Self {
         self.mtu = mtu;
         self
+    }
+
+    /// Set an optional channel name persisted in the `ChannelHeader`. The
+    /// name is UTF-8 bytes, up to `CHANNEL_NAME_MAX` (20) bytes; longer
+    /// names return `ErrorKind::InvalidInput`. Read back with
+    /// `Reader::channel_name`.
+    pub fn channel_name(mut self, name: &str) -> io::Result<Self> {
+        let bytes = name.as_bytes();
+        if bytes.len() > CHANNEL_NAME_MAX {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "channel_name is {} bytes; max is {}",
+                    bytes.len(),
+                    CHANNEL_NAME_MAX
+                ),
+            ));
+        }
+        self.channel_name = [0; CHANNEL_NAME_MAX];
+        self.channel_name[..bytes.len()].copy_from_slice(bytes);
+        Ok(self)
     }
 
     /// Cap the number of channel files retained on disk to `n` (the active
@@ -185,6 +252,7 @@ impl WriterBuilder {
             self.file_roll_size,
             self.mtu,
             self.keep_files,
+            self.channel_name,
         )
     }
 
@@ -260,6 +328,7 @@ pub struct Writer {
     file_roll_size: u64,
     mtu: u64,
     keep_files: Option<u64>,
+    channel_name: [u8; CHANNEL_NAME_MAX],
 
     // Pre-header pipeline state:
     next_hdr_pos: usize, // absolute file offset of the pre-installed header slot
@@ -275,6 +344,7 @@ impl Writer {
         file_roll_size: u64,
         mtu: u64,
         keep_files: Option<u64>,
+        channel_name: [u8; CHANNEL_NAME_MAX],
     ) -> io::Result<Self> {
         // Validate region invariants
         let ps = region::page_size();
@@ -317,7 +387,7 @@ impl Writer {
         let base_path = path.as_ref().to_path_buf();
         let sequence = find_latest_sequence(&base_path)?;
         let (file, channel_region, current_region, current_region_index, file_len, next_hdr_pos) =
-            Self::open_file(&base_path, sequence, region_size, mtu)?;
+            Self::open_file(&base_path, sequence, region_size, mtu, &channel_name)?;
 
         Ok(Self {
             base_path,
@@ -331,6 +401,7 @@ impl Writer {
             file_roll_size,
             mtu,
             keep_files,
+            channel_name,
             next_hdr_pos,
             msgs_since_wp: 0,
         })
@@ -343,6 +414,7 @@ impl Writer {
         sequence: u64,
         region_size: usize,
         mtu: u64,
+        channel_name: &[u8; CHANNEL_NAME_MAX],
     ) -> io::Result<(
         File,
         RegionMapping<Writable>,
@@ -372,17 +444,23 @@ impl Writer {
             mh.length = CHANNEL_HEADER_SIZE as u32;
             mh.header_type = HeaderType::Channel as u8;
             mh.message_type = 0;
-            mh.timestamp_ns = 0;
+            mh.user_meta_u64 = 0;
 
             // 2) channel header
             let ch_ptr = unsafe { mh_ptr.add(MESSAGE_HEADER_SIZE) as *mut ChannelHeader };
             unsafe {
                 (*ch_ptr).write_position = AtomicU64::new(0); // set below after pre-install
                 (*ch_ptr).message_count = AtomicU64::new(1);
+                (*ch_ptr).channel_sequence = sequence;
                 (*ch_ptr).region_size = region_size as u32;
                 (*ch_ptr).mtu = mtu as u32;
-                (*ch_ptr).channel_sequence = sequence;
-                (*ch_ptr).channel_name = [0; 32];
+                (*ch_ptr).format_version = FORMAT_VERSION;
+                (*ch_ptr).endianness = ENDIANNESS_LE;
+                (*ch_ptr).system_header_size = SYSTEM_HEADER_SIZE;
+                (*ch_ptr).user_header_size = USER_HEADER_SIZE;
+                (*ch_ptr)._reserved = [0; 3];
+                (*ch_ptr).user_header_kind = USER_HEADER_KIND_DEFAULT;
+                (*ch_ptr).channel_name = *channel_name;
             }
 
             // 3) current region and first user header pre-install
@@ -396,7 +474,7 @@ impl Writer {
                         header_type: HeaderType::User as u8,
                         message_type: 0,
                         length: 0,
-                        timestamp_ns: 0,
+                        user_meta_u64: 0,
                     };
                 }
             } else {
@@ -415,12 +493,7 @@ impl Writer {
             let mut file_len = meta.len();
             let region0 = RegionMapping::create_writable(&file, 0, region_size)?;
             let ch = get_channel_header(region0.as_ptr());
-            if ch.region_size as usize != region_size {
-                return Err(io::Error::new(
-                    ErrorKind::InvalidData,
-                    "region_size mismatch with existing file",
-                ));
-            }
+            validate_channel_header(ch, region_size)?;
 
             // wp denotes the **next header slot offset**
             let wp_payload = ch.write_position.load(Ordering::Relaxed) as usize;
@@ -506,7 +579,7 @@ impl Writer {
     /// Commit the message after filling the payload slice returned by `try_reserve`.
     /// Fills the pre-installed header at `next_hdr_pos`, sets committed=1 (Release),
     /// and **pre-installs** the next header slot (committed=0).
-    pub fn commit(&mut self, msg_type: u16, length: u32, timestamp_ns: u64) -> io::Result<()> {
+    pub fn commit(&mut self, msg_type: u16, length: u32, user_meta_u64: u64) -> io::Result<()> {
         let hdr_off = self.next_hdr_pos % self.region_size;
 
         // 1) Fill fields (committed=0)
@@ -521,7 +594,7 @@ impl Writer {
             (*hdr_ptr).length = length;
             (*hdr_ptr).header_type = HeaderType::User as u8;
             (*hdr_ptr).message_type = msg_type;
-            (*hdr_ptr).timestamp_ns = timestamp_ns;
+            (*hdr_ptr).user_meta_u64 = user_meta_u64;
         }
 
         // 2) Publish (commit flag last)
@@ -544,7 +617,7 @@ impl Writer {
                     header_type: HeaderType::User as u8,
                     message_type: 0,
                     length: 0,
-                    timestamp_ns: 0,
+                    user_meta_u64: 0,
                 };
             }
         } else {
@@ -594,7 +667,13 @@ impl Writer {
             new_index,
             new_file_len,
             new_next_hdr,
-        ) = Self::open_file(&self.base_path, next_seq, self.region_size, self.mtu)?;
+        ) = Self::open_file(
+            &self.base_path,
+            next_seq,
+            self.region_size,
+            self.mtu,
+            &self.channel_name,
+        )?;
 
         // Switch writer to NEW file
         self.file_sequence = next_seq;
@@ -670,7 +749,7 @@ impl Writer {
                         header_type: HeaderType::User as u8,
                         message_type: 0,
                         length: 0,
-                        timestamp_ns: 0,
+                        user_meta_u64: 0,
                     };
                 }
             } else {
@@ -692,7 +771,7 @@ impl Writer {
                         length: skip_len as u32,
                         header_type: HeaderType::Skip as u8,
                         message_type: 0,
-                        timestamp_ns: 0,
+                        user_meta_u64: 0,
                     };
                     MessageHeader::commit(hdr_ptr);
                 }
@@ -727,7 +806,7 @@ impl Writer {
                         header_type: HeaderType::User as u8,
                         message_type: 0,
                         length: 0,
-                        timestamp_ns: 0,
+                        user_meta_u64: 0,
                     };
                 }
             }
@@ -897,6 +976,7 @@ pub struct Reader {
     file: File,
     read_position: usize,
     region_size_cached: usize,
+    channel_name_cached: [u8; CHANNEL_NAME_MAX],
     batch_limit: Option<u16>,
     batch_segs: Vec<BatchSeg>,
     batch_pos: Vec<MsgPos>,
@@ -916,7 +996,12 @@ impl Reader {
         Self::open_sequence_file(base_path, seq, mode)
     }
 
-    fn get_current_read_position(file: &File, mode: ReaderMode) -> io::Result<(usize, usize)> {
+    /// Map region 0, validate v1 format invariants, and return
+    /// `(read_pos, region_size, channel_name)`.
+    fn read_channel_header(
+        file: &File,
+        mode: ReaderMode,
+    ) -> io::Result<(usize, usize, [u8; CHANNEL_NAME_MAX])> {
         let ps = region::page_size();
         let tmp_map = RegionMapping::create_read_only(file, 0, ps)?; // map one OS page
 
@@ -924,22 +1009,24 @@ impl Reader {
         let mh = unsafe { &*(tmp_map.as_ptr() as *const MessageHeader) };
         let header_type = mh.parsed_header_type()?;
         if header_type != HeaderType::Channel {
-            return Err(io::Error::new(
-                ErrorKind::InvalidData,
-                format!("file has first {:?}, expected Channel header", header_type),
-            ));
+            return Err(err_invalid_data(format!(
+                "file has first {:?}, expected Channel header",
+                header_type
+            )));
         }
 
         let ch = get_channel_header(tmp_map.as_ptr());
         let region_size = ch.region_size as usize;
-        let wp = ch.write_position.load(Ordering::Relaxed) as usize; // next header slot
+        validate_channel_header(ch, region_size)?;
 
+        let wp = ch.write_position.load(Ordering::Relaxed) as usize; // next header slot
         let read_pos = match mode {
             ReaderMode::LateJoin => 0,
             ReaderMode::Live => wp.saturating_sub(HEADER_SLOT), // header slot
         };
+        let channel_name = ch.channel_name;
         drop(tmp_map);
-        Ok((read_pos, region_size))
+        Ok((read_pos, region_size, channel_name))
     }
 
     fn open_sequence_file(base_path: PathBuf, sequence: u64, mode: ReaderMode) -> io::Result<Self> {
@@ -949,7 +1036,7 @@ impl Reader {
             .write(false)
             .open(&file_path)?;
 
-        let (read_pos, region_size) = Self::get_current_read_position(&file, mode)?;
+        let (read_pos, region_size, channel_name) = Self::read_channel_header(&file, mode)?;
         let region_index = (read_pos / region_size) as u64;
         let current_region =
             RegionMapping::create_read_only(&file, region_index * region_size as u64, region_size)?;
@@ -966,11 +1053,23 @@ impl Reader {
             file,
             read_position: read_pos,
             region_size_cached: region_size,
+            channel_name_cached: channel_name,
             batch_limit: None,
             batch_segs: Vec::with_capacity(DEFAULT_BATCH_SEGS_CAP),
             batch_pos: Vec::with_capacity(DEFAULT_BATCH_POS_CAP),
             maps,
         })
+    }
+
+    /// Channel name as set by `WriterBuilder::channel_name`, trimmed of trailing zero bytes.
+    /// Returns `""` if no name was set. Invalid UTF-8 yields a lossy conversion.
+    pub fn channel_name(&self) -> std::borrow::Cow<'_, str> {
+        let end = self
+            .channel_name_cached
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(self.channel_name_cached.len());
+        String::from_utf8_lossy(&self.channel_name_cached[..end])
     }
 
     #[inline(always)]
@@ -1398,9 +1497,10 @@ impl Reader {
             return Err(err_other("next file missing Channel header"));
         }
         let ch = get_channel_header(region0.as_ptr());
-        if ch.region_size as usize != region_size {
-            return Err(err_other("next file has unexpected region_size"));
-        }
+        validate_channel_header(ch, region_size)?;
+        // Refresh cached channel_name from the new file (the bytes are authoritative
+        // even though in practice the name carries across rolls).
+        self.channel_name_cached = ch.channel_name;
 
         self.file = file;
         self.read_position = 0;
@@ -1790,7 +1890,14 @@ mod tests {
         let file_roll_size = (region_size as u64) * 100; // won't auto-roll
         let mtu = 0;
 
-        let mut writer = Writer::open_or_create(base, region_size, file_roll_size, mtu, None)?;
+        let mut writer = Writer::open_or_create(
+            base,
+            region_size,
+            file_roll_size,
+            mtu,
+            None,
+            [0; CHANNEL_NAME_MAX],
+        )?;
 
         let msg1: Vec<u8> = (0..100).map(|i| i as u8).collect();
         let msg2: Vec<u8> = vec![0x55; 200];
@@ -1846,7 +1953,14 @@ mod tests {
 
         let region_size = crate::page_size();
         let file_roll_size = (region_size as u64) * 10;
-        let mut writer = Writer::open_or_create(base, region_size, file_roll_size, 0, None)?;
+        let mut writer = Writer::open_or_create(
+            base,
+            region_size,
+            file_roll_size,
+            0,
+            None,
+            [0; CHANNEL_NAME_MAX],
+        )?;
 
         let payload0 = vec![0x10; 16];
         {
@@ -1889,7 +2003,8 @@ mod tests {
 
         let region = crate::page_size();
         let file_roll_size = (region as u64) * 10;
-        let mut w = Writer::open_or_create(base, region, file_roll_size, 0, None)?;
+        let mut w =
+            Writer::open_or_create(base, region, file_roll_size, 0, None, [0; CHANNEL_NAME_MAX])?;
 
         // Choose len so that after header + payload the aligned end is region - header_size.
         let record_with_padding = region - HEADER_SLOT;
@@ -1932,7 +2047,14 @@ mod tests {
 
         let region_size = crate::page_size();
         let file_roll_size = (region_size as u64) * 10;
-        let mut writer = Writer::open_or_create(base, region_size, file_roll_size, 0, None)?;
+        let mut writer = Writer::open_or_create(
+            base,
+            region_size,
+            file_roll_size,
+            0,
+            None,
+            [0; CHANNEL_NAME_MAX],
+        )?;
 
         let payload1 = vec![0xA1; 32];
         let payload2 = vec![0xB2; 48];
@@ -1973,7 +2095,14 @@ mod tests {
 
         let region_size = crate::page_size();
         let file_roll_size = (region_size as u64) * 10;
-        let mut writer = Writer::open_or_create(base, region_size, file_roll_size, 0, None)?;
+        let mut writer = Writer::open_or_create(
+            base,
+            region_size,
+            file_roll_size,
+            0,
+            None,
+            [0; CHANNEL_NAME_MAX],
+        )?;
 
         let start = align_up(MESSAGE_HEADER_SIZE + CHANNEL_HEADER_SIZE);
         let record_with_padding = region_size - start - HEADER_SLOT;
@@ -2017,7 +2146,14 @@ mod tests {
 
         let region_size = crate::page_size();
         let file_roll_size = (region_size as u64) * 10;
-        let mut writer = Writer::open_or_create(base, region_size, file_roll_size, 0, None)?;
+        let mut writer = Writer::open_or_create(
+            base,
+            region_size,
+            file_roll_size,
+            0,
+            None,
+            [0; CHANNEL_NAME_MAX],
+        )?;
 
         let payload1 = vec![0x3A; 64];
         let payload2 = vec![0x7B; 48];
@@ -2057,7 +2193,14 @@ mod tests {
 
         let region_size = crate::page_size();
         let file_roll_size = (region_size as u64) * 10;
-        let _writer = Writer::open_or_create(base, region_size, file_roll_size, 0, None)?;
+        let _writer = Writer::open_or_create(
+            base,
+            region_size,
+            file_roll_size,
+            0,
+            None,
+            [0; CHANNEL_NAME_MAX],
+        )?;
 
         let mut reader = Reader::open(base, ReaderMode::Live)?;
         let before = reader.read_position;
@@ -2075,7 +2218,14 @@ mod tests {
 
         let region_size = crate::page_size();
         let file_roll_size = (region_size as u64) * 10;
-        let _writer = Writer::open_or_create(base, region_size, file_roll_size, 0, None)?;
+        let _writer = Writer::open_or_create(
+            base,
+            region_size,
+            file_roll_size,
+            0,
+            None,
+            [0; CHANNEL_NAME_MAX],
+        )?;
 
         let mut reader = Reader::open(base, ReaderMode::LateJoin)?;
         let before = reader.read_position;
@@ -2160,6 +2310,37 @@ mod tests {
             Err(err) => err,
         };
         assert_eq!(err.kind(), ErrorKind::InvalidData);
+
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// Round-trip `channel_name`: a value written via `WriterBuilder` is
+    /// visible via `Reader::channel_name`, and a too-long name is rejected
+    /// at the builder.
+    #[test]
+    fn test_channel_name_round_trip() -> anyhow::Result<()> {
+        let base = "test_channel_name_round_trip";
+        cleanup_channel_files(base);
+
+        const NAME: &str = "market-data-feed";
+
+        let _w = WriterBuilder::new(base)
+            .region_size(page_size())
+            .channel_name(NAME)?
+            .build()?;
+
+        let reader = ReaderBuilder::new(base).build()?;
+        assert_eq!(reader.channel_name(), NAME);
+        drop(reader);
+
+        // Channel name longer than CHANNEL_NAME_MAX is rejected by the builder.
+        let too_long = "x".repeat(CHANNEL_NAME_MAX + 1);
+        let err = WriterBuilder::new(base)
+            .channel_name(&too_long)
+            .err()
+            .unwrap();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
 
         cleanup_channel_files(base);
         Ok(())

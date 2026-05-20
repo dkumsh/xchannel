@@ -1,5 +1,39 @@
 # Changelog
 
+## 3.0.0 (2026-05-20)
+
+### Breaking
+- `MessageHeader::timestamp_ns` renamed to `user_meta_u64`. The 8-byte
+  slot is unchanged on the wire; xchannel itself never reads it.
+  Applications can use it as a timestamp, sequence number, schema tag,
+  packed flags, or any other 64-bit value. The third parameter of
+  `Writer::commit` is renamed accordingly. Positional callers are
+  unaffected; field-access and named-argument callers must rename.
+- `ChannelHeader` layout changes to add `format_version`, `endianness`,
+  `system_header_size`, `user_header_size`, and a reserved
+  `user_header_kind` field (reusing space from the previously unused
+  `channel_name`, which shrinks from 32 to 20 bytes). The struct is
+  still 64 bytes.
+- Files written by xchannel ≤ 2.2 (`format_version = 0`) are no longer
+  supported. The new writer emits `format_version = 1`; readers refuse
+  any other version or mismatched endianness. Regenerate channel files
+  on upgrade.
+
+### Added
+- `WriterBuilder::channel_name(&str)` — persist a short channel label
+  in the file's `ChannelHeader` (up to 20 UTF-8 bytes). Exposed via
+  `Reader::channel_name()`.
+- `FORMAT.md` — language-neutral byte-level specification of the wire
+  format. Intended as the contract for non-Rust implementations and as
+  documentation of the system-owned vs user-owned header invariants.
+  Documents `user_header_kind` as a reserved discriminant for
+  forward-compatible alternative user-meta layouts; current writers
+  emit 0 and current readers refuse anything else.
+
+### Docs
+- README gains a `Wire format` section pointing at `FORMAT.md` and
+  explaining the `user_meta_u64` / `user_header_kind` model.
+
 ## 2.2.0 (2026-04-30)
 
 ### Added
