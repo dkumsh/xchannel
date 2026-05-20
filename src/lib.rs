@@ -1086,13 +1086,37 @@ impl Reader {
     /// Open a Reader:
     /// - LateJoin => earliest file; read_position = 0
     /// - Live => latest file; read_position = write_position (next header slot)
+    ///
+    /// LateJoin races with a writer configured with `keep_files(N)`: the
+    /// earliest sequence returned by the directory scan can be unlinked by
+    /// the writer's next roll before this call's `open()` syscall runs,
+    /// surfacing as `ENOENT`. The next-lowest sequence is almost always
+    /// still present, so we re-scan and try again up to
+    /// `MAX_OPEN_RETRIES` times. A genuinely missing channel still fails
+    /// fast — after the retries are exhausted the `ENOENT` propagates.
+    /// Live mode does not retry: it targets the *latest* sequence, which
+    /// the writer is actively writing to and will not unlink.
     pub fn open<P: AsRef<Path>>(path: P, mode: ReaderMode) -> io::Result<Self> {
+        const MAX_OPEN_RETRIES: usize = 8;
         let base_path = path.as_ref().to_path_buf();
-        let seq = match mode {
-            ReaderMode::LateJoin => find_earliest_sequence(&base_path)?,
-            ReaderMode::Live => find_latest_sequence(&base_path)?,
-        };
-        Self::open_sequence_file(base_path, seq, mode)
+        let mut last_err: Option<io::Error> = None;
+        for _ in 0..MAX_OPEN_RETRIES {
+            let seq = match mode {
+                ReaderMode::LateJoin => find_earliest_sequence(&base_path)?,
+                ReaderMode::Live => find_latest_sequence(&base_path)?,
+            };
+            match Self::open_sequence_file(base_path.clone(), seq, mode) {
+                Ok(r) => return Ok(r),
+                Err(e)
+                    if e.kind() == ErrorKind::NotFound && matches!(mode, ReaderMode::LateJoin) =>
+                {
+                    last_err = Some(e);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| err_other("Reader::open: exhausted retries with no error")))
     }
 
     /// Map region 0, validate v1 format invariants, and return
@@ -2132,6 +2156,27 @@ mod tests {
         assert_eq!(second.payload(), &small);
 
         cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// A genuinely missing channel must still surface `ErrorKind::NotFound`
+    /// — the retry loop on Reader::open's directory-scan race must not
+    /// swallow a real "no such channel" condition.
+    #[test]
+    fn test_reader_open_missing_channel_returns_notfound() -> anyhow::Result<()> {
+        let base = "test_reader_open_missing_channel";
+        cleanup_channel_files(base);
+
+        let err = Reader::open(base, ReaderMode::LateJoin)
+            .err()
+            .expect("must fail for missing channel");
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+
+        let err = Reader::open(base, ReaderMode::Live)
+            .err()
+            .expect("must fail for missing channel");
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+
         Ok(())
     }
 

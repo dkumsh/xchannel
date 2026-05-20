@@ -23,6 +23,8 @@
   between `commit` and `publish_wp`) is advanced past, and the
   next slot is verified as a pre-installed header. Multi-record
   lag and other non-pre-installed slots still refuse.
+- `Reader::open` (`LateJoin`) retries on the `keep_files`
+  scan-then-open race; truly missing channels still fail fast.
 - `FORMAT.md` — language-neutral wire-format spec.
 
 ### Docs

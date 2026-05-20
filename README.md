@@ -395,7 +395,11 @@ they shape what the library is and isn't suited for.
 - **A reader that falls more than `keep_files(N)` files behind will
   get `ENOENT`** when it tries to follow a Roll into a file that has
   already been pruned. There is no "skip ahead" recovery — opening a
-  fresh `Reader` is the supported path.
+  fresh `Reader` is the supported path. `Reader::open` in `LateJoin`
+  mode retries internally on the narrow start-up race where the
+  earliest sequence is unlinked between the directory scan and the
+  open syscall; a truly missing channel still fails fast with
+  `ErrorKind::NotFound`.
 
 - **No kernel-mediated wake-up.** `try_read` is strictly non-blocking;
   `Reader::read_blocking(timeout)` is a sleep-backoff helper
