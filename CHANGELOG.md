@@ -25,6 +25,10 @@
   lag and other non-pre-installed slots still refuse.
 - `Reader::open` (`LateJoin`) retries on the `keep_files`
   scan-then-open race; truly missing channels still fail fast.
+- `xchannel::migrate` module: `migrate_file_v2_to_v3` and
+  `migrate_channel_v2_to_v3` convert pre-v3 archive files to v3
+  out-of-place. Only `ChannelHeader` bytes 48–79 are rewritten;
+  records are copied verbatim.
 - `FORMAT.md` — language-neutral wire-format spec.
 
 ### Docs

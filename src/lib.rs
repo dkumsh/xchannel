@@ -13,6 +13,7 @@
 //! IPC this is fine. Publishing uses `Release` and reading uses `Acquire`.
 
 mod channel;
+pub mod migrate;
 mod region;
 
 use channel::{
@@ -1732,42 +1733,48 @@ fn find_latest_sequence(base_path: &Path) -> io::Result<u64> {
 /// Find earliest or latest sequence number of a file.
 /// If file(s) do not exist, returns Ok(0).
 fn find_sequence(path: &Path, latest: bool) -> io::Result<u64> {
-    let parent_dir = match path.parent() {
+    let sequences = find_all_sequences(path)?;
+    let result = if latest {
+        sequences.into_iter().max().unwrap_or(0)
+    } else {
+        sequences.into_iter().min().unwrap_or(0)
+    };
+    Ok(result)
+}
+
+/// Scan the directory containing `base_path` for files matching `base` and
+/// `base.<N>`, returning all sequence numbers found (0 for the base file)
+/// in ascending order.
+pub(crate) fn find_all_sequences(base_path: &Path) -> io::Result<Vec<u64>> {
+    let parent_dir = match base_path.parent() {
         Some(parent) if parent.as_os_str().is_empty() => std::env::current_dir(),
         Some(parent) => Ok(parent.to_path_buf()),
         None => std::env::current_dir(),
     }?;
-    let base_name = path
+    let base_name = base_path
         .file_name()
         .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "Invalid file name in path"))?
         .to_str()
         .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "File name is not valid UTF-8"))?;
 
-    let sequences: Vec<_> = read_dir(&parent_dir)?
+    let dotted = format!("{}.", base_name);
+    let mut sequences: Vec<u64> = read_dir(&parent_dir)?
         .filter_map(|entry| {
             entry.ok().and_then(|e| {
                 let file_name = e.file_name();
                 let file_name = file_name.to_str()?;
                 if file_name == base_name {
                     Some(0)
-                } else if file_name.starts_with(&format!("{}.", base_name)) {
-                    file_name
-                        .strip_prefix(&format!("{}.", base_name))?
-                        .parse()
-                        .ok()
+                } else if let Some(suffix) = file_name.strip_prefix(&dotted) {
+                    suffix.parse().ok()
                 } else {
                     None
                 }
             })
         })
         .collect();
-
-    let result = if latest {
-        *sequences.iter().max().unwrap_or(&0)
-    } else {
-        *sequences.iter().min().unwrap_or(&0)
-    };
-    Ok(result)
+    sequences.sort_unstable();
+    Ok(sequences)
 }
 
 /// Remove channel base and all rolled files created by this crate.
