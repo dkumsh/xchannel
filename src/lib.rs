@@ -356,7 +356,6 @@ pub struct Writer {
 
     // Pre-header pipeline state:
     next_hdr_pos: usize, // absolute file offset of the pre-installed header slot
-    msgs_since_wp: u32,  // batched write_position heartbeat
 }
 
 impl Writer {
@@ -427,7 +426,6 @@ impl Writer {
             keep_files,
             channel_name,
             next_hdr_pos,
-            msgs_since_wp: 0,
         })
     }
 
@@ -787,7 +785,6 @@ impl Writer {
         self.current_region_index = new_index;
         self.file_len = new_file_len;
         self.next_hdr_pos = new_next_hdr;
-        self.msgs_since_wp = 0;
         // Publish wp for new file (Release already done in open_file new-case)
 
         // Publish Roll in OLD file
@@ -886,7 +883,6 @@ impl Writer {
             self.current_region_index = next_idx;
             self.next_hdr_pos = new_wp;
             self.publish_wp(new_wp + HEADER_SLOT);
-            self.msgs_since_wp = 0;
             Ok(())
         } else {
             // Not even space for a header: jump straight to next region start
@@ -917,7 +913,6 @@ impl Writer {
 
             self.next_hdr_pos = next_region_start;
             self.publish_wp(next_region_start + HEADER_SLOT);
-            self.msgs_since_wp = 0;
             Ok(())
         }
     }
