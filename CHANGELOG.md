@@ -3,56 +3,31 @@
 ## 3.0.0 (2026-05-20)
 
 ### Breaking
-- `MessageHeader::timestamp_ns` renamed to `user_meta_u64`. The 8-byte
-  slot is unchanged on the wire; xchannel itself never reads it.
-  Applications can use it as a timestamp, sequence number, schema tag,
-  packed flags, or any other 64-bit value. The third parameter of
-  `Writer::commit` is renamed accordingly. Positional callers are
-  unaffected; field-access and named-argument callers must rename.
-- `ChannelHeader` layout changes to add `format_version`, `endianness`,
-  `system_header_size`, `user_header_size`, and a reserved
-  `user_header_kind` field (reusing space from the previously unused
-  `channel_name`, which shrinks from 32 to 20 bytes). The struct is
-  still 64 bytes.
-- Files written by xchannel ≤ 2.2 (`format_version = 0`) are no longer
-  supported. The new writer emits `format_version = 1`; readers refuse
-  any other version or mismatched endianness. Regenerate channel files
-  on upgrade.
+- `MessageHeader::timestamp_ns` → `user_meta_u64`. Wire bytes
+  unchanged; field-access callers must rename.
+- `ChannelHeader` v1: adds `format_version`, `endianness`,
+  header-size fields, reserved `user_header_kind`. `channel_name`
+  shrinks 32 → 20 bytes. Struct still 64 bytes.
+- Pre-v1 channel files (`format_version = 0`) refused on open.
+  Regenerate on upgrade.
 
 ### Added
-- `WriterBuilder::channel_name(&str)` — persist a short channel label
-  in the file's `ChannelHeader` (up to 20 UTF-8 bytes). Exposed via
-  `Reader::channel_name()`.
-- `FORMAT.md` — language-neutral byte-level specification of the wire
-  format. Intended as the contract for non-Rust implementations and as
-  documentation of the system-owned vs user-owned header invariants.
-  Documents `user_header_kind` as a reserved discriminant for
-  forward-compatible alternative user-meta layouts; current writers
-  emit 0 and current readers refuse anything else.
-
-### Added (crash safety)
-- `WriterBuilder::build` on an existing channel file now performs
-  single-step writer-crash recovery. If the slot at
-  `ChannelHeader.write_position - HEADER_SLOT` holds a committed
-  record (the on-disk signature of a writer that crashed between
-  `commit` and `publish_wp`), the open advances past it by the
-  record's own `length`, verifies the new slot bears the pre-install
-  signature `commit()` writes one step ahead of itself, updates
-  `write_position`, and resumes. Handles both User-record and
-  Skip-record (in-region roll) crashes. Multi-record lag and any
-  non-pre-installed slot still refuse with `ErrorKind::InvalidData`;
-  the fallback is `cleanup_channel_files` and a fresh channel.
-  Recovery touches only `write_position`, never record bytes —
-  readers continue draining what was committed.
+- `WriterBuilder::channel_name(&str)` + `Reader::channel_name()`.
+- `Reader::wait_for_message(timeout) -> io::Result<bool>` cursor
+  API. Advances past Skip/Roll/Channel; doesn't consume User
+  records.
+- `Reader::read_blocking` rewritten on top of `wait_for_message`;
+  raw-pointer reborrow removed. Behavior unchanged.
+- Single-step writer-crash recovery in `WriterBuilder::build`. A
+  committed record at `wp - HEADER_SLOT` (the crash signature
+  between `commit` and `publish_wp`) is advanced past, and the
+  next slot is verified as a pre-installed header. Multi-record
+  lag and other non-pre-installed slots still refuse.
+- `FORMAT.md` — language-neutral wire-format spec.
 
 ### Docs
-- README gains a `Wire format` section pointing at `FORMAT.md` and
-  explaining the `user_meta_u64` model.
-- README `Limitations` gains two new entries: an explicit no-crash-
-  recovery contract for writers (matching the detection above), and a
-  note that channel files must live on a local filesystem — `mmap`
-  cross-process coherence does not hold over NFS / SMB / some FUSE
-  backends.
+- README: `Wire format` section; `Limitations` entries for
+  single-step crash recovery and local-filesystem-only constraint.
 
 ## 2.2.0 (2026-04-30)
 
