@@ -692,6 +692,13 @@ impl Writer {
 
     /// Reserve space for a message payload of length `msg_size` placed **after** a pre-installed header.
     /// Returns a mutable slice the caller can fill, or `None` on failure (e.g. MTU/roll).
+    ///
+    /// `msg_size` is the **upper bound** on the eventual `commit(length)`:
+    /// callers may commit any `length <= msg_size`. This supports the
+    /// worst-case-reserve / serialize-then-commit pattern — reserve enough
+    /// for the largest possible serialised form, then commit the actual
+    /// (smaller) byte count. Committing a `length` greater than the
+    /// reserved `msg_size` is a contract violation and returns `Err`.
     pub fn try_reserve(&mut self, msg_size: usize) -> io::Result<&mut [u8]> {
         if self.mtu > 0 && msg_size as u64 > self.mtu {
             return Err(err_other("MTU exceeded"));
@@ -760,22 +767,21 @@ impl Writer {
 
     /// Commit the message after filling the payload slice returned by `try_reserve`.
     /// Fills the header at `next_hdr_pos`, sets committed=1 (Release),
-    /// then publishes write_position. The next header slot was already
-    /// pre-installed by `try_reserve`, so FORMAT.md §9.6 invariant
-    /// holds across this call without any cacheline write here.
+    /// then publishes write_position. The slot-i+1 pre-install was
+    /// laid down by `try_reserve(reserved)`; when `length == reserved`
+    /// (the common case) no cacheline write happens here. When
+    /// `length < reserved` (a worst-case-reserve / serialize-then-commit
+    /// pattern), the pre-install is re-laid at the actual `next_hdr_pos`
+    /// so reader walks past slot i still land on a well-formed
+    /// pre-installed slot.
     pub fn commit(&mut self, msg_type: u16, length: u32, user_meta_u64: u64) -> io::Result<()> {
-        // `length` must match the size passed to the matching
-        // `try_reserve` — the slot-i+1 pre-install in `try_reserve`
-        // is positioned based on that size, and a different `length`
-        // here would advance `next_hdr_pos` to a slot we never
-        // pre-installed. Reader walks would then land on garbage.
         let reserved = self
             .pending_msg_size
             .take()
             .ok_or_else(|| err_other("commit without preceding try_reserve"))?;
-        if length as usize != reserved {
+        if length as usize > reserved {
             return Err(err_other(format!(
-                "commit length {length} does not match try_reserve size {reserved}",
+                "commit length {length} exceeds try_reserve size {reserved}",
             )));
         }
 
@@ -795,14 +801,35 @@ impl Writer {
             (*hdr_ptr).user_meta_u64 = user_meta_u64;
         }
 
-        // Release-store committed=1. Slot i+1's pre-install is already
-        // durable (laid down by `try_reserve`), so any reader that
-        // observes committed=1 with acquire is guaranteed to find a
-        // well-formed slot at i+1.
-        MessageHeader::commit(hdr_ptr);
-
+        // Compute the position of the next header slot from the
+        // *committed* length. If shorter than reserved, re-lay the
+        // pre-install at the new (closer) slot BEFORE flipping
+        // committed=1 — FORMAT.md §9.6 demands slot i+1 be
+        // pre-installed when a reader observes commit on slot i.
         let payload_end = self.next_hdr_pos + HEADER_SLOT + length as usize;
         let next_pos = align_up(payload_end);
+        if (length as usize) < reserved {
+            let new_next_off = next_pos % self.region_size;
+            let bytes = self
+                .current_region
+                .get_bytes_mut(new_next_off, MESSAGE_HEADER_SIZE)
+                .ok_or_else(|| err_other("Failed to re-install next header on short commit"))?;
+            unsafe {
+                *(bytes.as_mut_ptr() as *mut MessageHeader) = MessageHeader {
+                    committed: 0,
+                    header_type: HeaderType::User as u8,
+                    message_type: 0,
+                    length: 0,
+                    user_meta_u64: 0,
+                };
+            }
+        }
+
+        // Release-store committed=1. Slot i+1's pre-install is durable
+        // (either from `try_reserve` for matched-length commits, or
+        // re-laid above for short commits).
+        MessageHeader::commit(hdr_ptr);
+
         self.next_hdr_pos = next_pos;
 
         let next_payload = next_pos + HEADER_SLOT;
@@ -3416,40 +3443,30 @@ mod tests {
         Ok(())
     }
 
-    /// `commit(length)` must match the size passed to the matching
-    /// `try_reserve`. After Route C, the slot-i+1 pre-install is
-    /// positioned based on the reserved size, so a smaller `length`
-    /// at commit time would leave the reader's walk landing past
-    /// the pre-installed slot. Enforced as an `Err`.
+    /// `commit(length)` may be ≤ the size passed to `try_reserve`
+    /// (the worst-case-reserve / serialize-then-commit pattern).
+    /// `length > reserved` is rejected because the user would have
+    /// written past the buffer; bare `commit` with no preceding
+    /// reserve is also an error.
     #[test]
-    fn test_commit_length_must_match_reserved_size() -> anyhow::Result<()> {
-        let base = "test_commit_length_must_match_reserved_size";
+    fn test_commit_length_contract() -> anyhow::Result<()> {
+        let base = "test_commit_length_contract";
         cleanup_channel_files(base);
 
         let mut w = WriterBuilder::new(base).region_size(page_size()).build()?;
 
-        let _buf = w.try_reserve(128)?;
-        let err = w
-            .commit(0, 64, 0)
-            .expect_err("commit with smaller length must error");
-        assert!(
-            err.to_string()
-                .contains("commit length 64 does not match try_reserve size 128"),
-            "unexpected error: {err}",
-        );
-
-        // commit without a preceding reserve also errors (the prior
-        // failed commit consumed pending_msg_size).
+        // length > reserved: error, pending_msg_size cleared.
+        let _buf = w.try_reserve(64)?;
         let err = w
             .commit(0, 128, 0)
-            .expect_err("commit after a failed commit must require a fresh reserve");
+            .expect_err("commit length > reserved must error");
         assert!(
             err.to_string()
-                .contains("commit without preceding try_reserve"),
+                .contains("commit length 128 exceeds try_reserve size 64"),
             "unexpected error: {err}",
         );
 
-        // Bare commit with no reserve at all: same error path.
+        // commit without a preceding reserve errors.
         let err = w
             .commit(0, 0, 0)
             .expect_err("commit with no preceding reserve must error");
@@ -3459,12 +3476,28 @@ mod tests {
             "unexpected error: {err}",
         );
 
-        // Sanity: a matched reserve+commit still works after the
-        // error path leaves `pending_msg_size = None`.
+        // length < reserved: succeeds. Worst-case-reserve pattern —
+        // write into the reserved buffer, commit the smaller actual
+        // size. Pre-install is re-laid at the actual next slot.
+        let buf = w.try_reserve(128)?;
+        buf[..16].copy_from_slice(&[0xAA_u8; 16]);
+        w.commit(11, 16, 0)?;
+
+        // length == reserved: succeeds (the common case).
         let buf = w.try_reserve(8)?;
-        buf.copy_from_slice(&[0xAB_u8; 8]);
-        w.commit(7, 8, 0)?;
+        buf.copy_from_slice(&[0xBB_u8; 8]);
+        w.commit(22, 8, 0)?;
         drop(w);
+
+        // Reader sees both records with their committed lengths.
+        let mut r = Reader::open(base, ReaderMode::LateJoin)?;
+        let m = r.try_read()?.expect("first record");
+        assert_eq!(m.header().message_type, 11);
+        assert_eq!(m.header().length, 16);
+        let m = r.try_read()?.expect("second record");
+        assert_eq!(m.header().message_type, 22);
+        assert_eq!(m.header().length, 8);
+        assert!(r.try_read()?.is_none());
 
         cleanup_channel_files(base);
         Ok(())

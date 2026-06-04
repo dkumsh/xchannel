@@ -66,13 +66,15 @@
   Fixes a `ping_pong` regression where readers observed the
   Roll marker before NEW's final name existed, failing the
   reader-side `open()` with `NotFound`.
-- `commit()` enforces that its `length` argument matches the
-  size passed to the matching `try_reserve` — the slot-i+1
-  pre-install in `try_reserve` is positioned based on that
-  size, and a smaller `length` would leave the reader's walk
-  past record `i` landing on bytes that were never
-  pre-installed. Errors with `commit length N does not match
-  try_reserve size M`.
+- `commit(length)` requires `length <= try_reserve(reserved)`.
+  `length == reserved` is the common case and goes through the
+  fast path (no extra cacheline write). `length < reserved`
+  (the "worst-case reserve + commit actual size" pattern) is
+  supported: `commit` re-lays the slot-i+1 pre-install at the
+  smaller offset before flipping `committed=1`, so the reader's
+  walk past record `i` still lands on a well-formed slot.
+  `length > reserved` is rejected (the caller would have written
+  past the buffer).
 - `roll_file()`'s rare grow-to-end branch is `set_len`
   shrink-safe: extends only when `needed_end > self.file_len`,
   so a future code path can't truncate the preallocated OLD
