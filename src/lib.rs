@@ -414,7 +414,9 @@ impl Writer {
     /// pre-install. The file is **not** renamed to its final name —
     /// callers do that themselves to control the publish-visibility
     /// window. `Writer::open_file` renames immediately; `roll_file`
-    /// renames only after the OLD segment's Roll marker is durable.
+    /// renames after the OLD Roll header is staged (committed=0) but
+    /// before it's release-stored to `committed=1`, so readers
+    /// observing Roll can immediately resolve NEW.
     #[allow(clippy::type_complexity)]
     fn prepare_segment_at(
         partial_path: &Path,
@@ -859,8 +861,11 @@ impl Writer {
 
         // Prepare NEW segment at its `.partial` path. The file is fully
         // initialised (set_len + channel header + first user header
-        // pre-installed) but invisible to readers because the rename
-        // is deferred until *after* OLD's Roll marker is published.
+        // pre-installed) but invisible to readers. The rename to NEW's
+        // final name happens between OLD's Roll-header staging
+        // (committed=0) and the release-store of `committed=1`, so a
+        // reader that observes Roll resolves NEW on the very next
+        // path lookup.
         let next_seq = old_seq + 1;
         let new_partial_path = make_partial_channel_file_path(&self.base_path, next_seq)?;
         let new_final_path = make_channel_file_path(&self.base_path, next_seq)?;
@@ -959,19 +964,21 @@ impl Writer {
         self.file_len = new_file_len;
         self.next_hdr_pos = new_next_hdr;
 
-        // Retention: if `keep_files(N)` was configured, the file at sequence
-        // `next_seq - N` (if any) is now beyond the retention window. Unlink
-        // it; readers that still have it mapped keep their inode reference
-        // until they finish that file.
+        // Retention: best-effort. The roll itself has already
+        // committed (Roll marker is released, NEW is on disk, `self`
+        // is swapped); a failure to unlink an old segment must not
+        // be returned as `Err` here because callers would interpret
+        // it as "roll failed" and retry, double-rolling. Readers
+        // that still have the pruned file mapped continue via the
+        // inode reference until they finish it; lagging readers
+        // get ENOENT on path-based open, which is the documented
+        // contract for `keep_files`.
         if let Some(n) = self.keep_files
             && next_seq >= n
         {
             let prune_seq = next_seq - n;
-            let prune_path = make_channel_file_path(&self.base_path, prune_seq)?;
-            match std::fs::remove_file(&prune_path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == ErrorKind::NotFound => {}
-                Err(e) => return Err(e),
+            if let Ok(prune_path) = make_channel_file_path(&self.base_path, prune_seq) {
+                let _ = std::fs::remove_file(&prune_path);
             }
         }
 
