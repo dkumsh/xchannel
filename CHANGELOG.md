@@ -79,8 +79,10 @@
   segment back down to a region boundary.
 - Internal refactor: extracted `Writer::prepare_segment_at(partial_path, ...)`
   from `open_file`. Both call sites (initial open and roll) use it;
-  open_file renames immediately, roll_file defers the rename
-  until after the OLD Roll publish.
+  `open_file` renames immediately, `roll_file` renames between the
+  OLD Roll header's staged write (`committed=0`) and the
+  release-store of `committed=1`, so a reader that observes Roll
+  always finds NEW under its final name.
 - No wire-format change. The `<base>.<N>` final names and the
   bytes inside them are unchanged from 3.0.0.
 

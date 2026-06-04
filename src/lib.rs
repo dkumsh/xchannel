@@ -3416,16 +3416,6 @@ mod tests {
         Ok(())
     }
 
-    /// Hammer test: a writer rolling segments aggressively (tiny
-    /// `file_roll_size`, `keep_files=2`) plus a late-joining
-    /// reader walking the channel from segment 0 forward. The
-    /// pre-rename design means the reader's scan never surfaces
-    /// a partially-initialised file, so no SIGBUS and no spurious
-    /// `unsupported format_version` / size-mismatch errors.
-    ///
-    /// The test would still pass against the old pre-rename code on
-    /// many runs (the race window is narrow), so the assertion
-    /// floor is: many rolls happen, the reader sees a strict prefix
     /// `commit(length)` must match the size passed to the matching
     /// `try_reserve`. After Route C, the slot-i+1 pre-install is
     /// positioned based on the reserved size, so a smaller `length`
@@ -3567,6 +3557,14 @@ mod tests {
         Ok(())
     }
 
+    /// Hammer test: a writer rolling segments aggressively (tiny
+    /// `file_roll_size`, `keep_files=2`) plus a late-joining reader
+    /// walking the channel from segment 0 forward. The `.partial` +
+    /// rename design means the reader's directory scan never
+    /// surfaces a partially-initialised file. The assertion floor
+    /// is operational: many rolls happen, the reader sees a strict
+    /// prefix of writes, no `try_read` returns an `Err`, and the
+    /// test process does not abort (i.e. no SIGBUS).
     #[test]
     fn test_concurrent_rolls_and_latejoin_reader() -> anyhow::Result<()> {
         use std::thread;
