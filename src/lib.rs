@@ -149,67 +149,6 @@ where
     Ok(())
 }
 
-#[inline]
-fn store_wp(file: &File, region_size: usize, val: u64) -> io::Result<()> {
-    with_ch_mut(file, region_size, |ch| {
-        ch.write_position.store(val, Ordering::Relaxed);
-    })
-}
-
-#[inline]
-fn fetch_add_wp(file: &File, region_size: usize, delta: u64) -> io::Result<u64> {
-    let mut out = 0u64;
-    with_ch_mut(file, region_size, |ch| {
-        out = ch.write_position.fetch_add(delta, Ordering::Relaxed);
-    })?;
-    Ok(out)
-}
-
-/// Lay down the Roll header at `pos` with `committed=0`. The
-/// release-store of `committed=1` is deferred so callers can stage
-/// other publish-visibility steps (e.g. `rename`) between header
-/// preparation and reader-observable commit.
-#[inline]
-fn prepare_roll_header_at(
-    file: &File,
-    region_size: usize,
-    pos: usize,
-    user_meta_u64: u64,
-) -> io::Result<()> {
-    let hdr: MessageHeader = MessageHeader {
-        committed: 0,
-        length: 0,
-        header_type: HeaderType::Roll as u8,
-        message_type: 0,
-        user_meta_u64,
-    };
-    let ridx = (pos / region_size) as u64;
-    let off = pos % region_size;
-    let mut rm = RegionMapping::create_writable(file, ridx * region_size as u64, region_size)?;
-    let bytes = rm
-        .get_bytes_mut(off, MESSAGE_HEADER_SIZE)
-        .ok_or_else(|| err_other("prepare_roll_header_at: failed to get bytes"))?;
-    unsafe {
-        *(bytes.as_mut_ptr() as *mut MessageHeader) = hdr;
-    }
-    Ok(())
-}
-
-/// Release-store `committed=1` on the previously-prepared header at
-/// `pos`. After this returns, readers can observe the marker.
-#[inline]
-fn release_commit_header_at(file: &File, region_size: usize, pos: usize) -> io::Result<()> {
-    let ridx = (pos / region_size) as u64;
-    let off = pos % region_size;
-    let mut rm = RegionMapping::create_writable(file, ridx * region_size as u64, region_size)?;
-    let bytes = rm
-        .get_bytes_mut(off, MESSAGE_HEADER_SIZE)
-        .ok_or_else(|| err_other("release_commit_header_at: failed to get bytes"))?;
-    let hdr_ptr = bytes.as_mut_ptr() as *mut MessageHeader;
-    MessageHeader::commit(hdr_ptr);
-    Ok(())
-}
-
 // ========== Builders ==========
 /// Maximum bytes available for a channel name in `ChannelHeader`.
 pub const CHANNEL_NAME_MAX: usize = 20;
@@ -544,10 +483,16 @@ impl Writer {
             };
         }
 
-        with_ch_mut(&file, region_size, |ch| {
-            ch.write_position
+        // Publish wp through the already-held `region0` mapping —
+        // avoids a third map of region 0 (one was used above for the
+        // channel header init, and `current_region` is the second
+        // when the first slot lives in region 0).
+        let ch_ptr = unsafe { region0.as_mut_ptr().add(MESSAGE_HEADER_SIZE) as *mut ChannelHeader };
+        unsafe {
+            (*ch_ptr)
+                .write_position
                 .store((start + HEADER_SLOT) as u64, Ordering::Release);
-        })?;
+        }
 
         Ok((file, region0, current_region, 0, initial_len, start))
     }
@@ -722,6 +667,25 @@ impl Writer {
         let ch = self.channel_header();
         ch.message_count.fetch_add(1, Ordering::Relaxed);
         ch.write_position.store(pos as u64, Ordering::Relaxed);
+    }
+
+    /// Store `val` to the channel header's `write_position` through
+    /// the writer's already-mapped `channel_region`. Infallible —
+    /// no extra mmap, no syscall. Used during roll publish to keep
+    /// the entire path past the rename non-fallible.
+    #[inline]
+    fn store_wp_local(&self, val: u64) {
+        let ch = self.channel_header();
+        ch.write_position.store(val, Ordering::Relaxed);
+    }
+
+    /// Add `delta` to the channel header's `write_position` through
+    /// the writer's already-mapped `channel_region`. Infallible —
+    /// same rationale as `store_wp_local`.
+    #[inline]
+    fn fetch_add_wp_local(&self, delta: u64) -> u64 {
+        let ch = self.channel_header();
+        ch.write_position.fetch_add(delta, Ordering::Relaxed)
     }
 
     /// Reserve space for a message payload of length `msg_size` placed **after** a pre-installed header.
@@ -917,8 +881,17 @@ impl Writer {
         )?;
 
         // Publish Roll in OLD file BEFORE swapping `self` to NEW. If
-        // any step here errors, `self` is still consistent on OLD —
-        // a retry can clean up `new_partial_path` and try again.
+        // any step here errors, `self` is still consistent on OLD.
+        //
+        // Once the Roll marker becomes reader-visible (the
+        // release-store on `committed=1`), every remaining step must
+        // be infallible — otherwise external state would say
+        // "rolled" while `self` is still on OLD. We achieve that by:
+        //   * Mapping OLD's Roll region exactly once and reusing it
+        //     for both the staged write and the release-store.
+        //   * Updating OLD's `write_position` through the writer's
+        //     already-mapped `channel_region` (no fresh mmap, no
+        //     syscall).
         if let Some(needed_end) = grow_to_end {
             // Grow-only: never let `set_len` shrink a preallocated
             // OLD segment back down to a region boundary.
@@ -927,21 +900,56 @@ impl Writer {
             }
         }
 
-        if leftover < HEADER_SLOT {
-            store_wp(&old_file, old_region_size, roll_pos as u64)?;
+        // Map the OLD Roll region once and stage the Roll header
+        // with `committed = 0`. Invisible to readers until the
+        // release-store below.
+        let old_roll_region_idx = (roll_pos / old_region_size) as u64;
+        let mut old_roll_region = RegionMapping::<Writable>::create_writable(
+            &old_file,
+            old_roll_region_idx * old_region_size as u64,
+            old_region_size,
+        )?;
+        let roll_off_in_region = roll_pos % old_region_size;
+        let roll_hdr_ptr = {
+            let bytes = old_roll_region
+                .get_bytes_mut(roll_off_in_region, MESSAGE_HEADER_SIZE)
+                .ok_or_else(|| err_other("roll header outside region"))?;
+            bytes.as_mut_ptr() as *mut MessageHeader
+        };
+        unsafe {
+            *roll_hdr_ptr = MessageHeader {
+                committed: 0,
+                length: 0,
+                header_type: HeaderType::Roll as u8,
+                message_type: 0,
+                user_meta_u64: now_ns(),
+            };
         }
-        // Roll publish is a two-phase commit:
-        //   1. Write the Roll header with `committed=0` (invisible).
-        //   2. Atomically publish NEW under its final name.
-        //   3. Release-store `committed=1` on the Roll marker.
-        // Readers wake on (3) and immediately resolve NEW via the
-        // path that became visible in (2). Without this ordering the
-        // reader could see the Roll marker before NEW exists on disk
-        // and fail its `open()` (ping_pong regression).
-        prepare_roll_header_at(&old_file, old_region_size, roll_pos, now_ns())?;
+
+        // If we jumped past leftover bytes, jump `wp` to roll_pos.
+        // Infallible: goes through self.channel_region.
+        if leftover < HEADER_SLOT {
+            self.store_wp_local(roll_pos as u64);
+        }
+
+        // Publish NEW under its final name. Last fallible step.
+        // If this fails, OLD's Roll is still committed=0, no reader
+        // observes anything; cleanup unlinks the orphan partial on
+        // the next `WriterBuilder::build` or via `cleanup_channel_files`.
         std::fs::rename(&new_partial_path, &new_final_path)?;
-        release_commit_header_at(&old_file, old_region_size, roll_pos)?;
-        fetch_add_wp(&old_file, old_region_size, HEADER_SLOT as u64)?;
+
+        // Release-commit the Roll marker through the already-held
+        // mapping. Infallible — readers wake here.
+        MessageHeader::commit(roll_hdr_ptr);
+
+        // Advance OLD's `wp` past the Roll slot. Infallible.
+        self.fetch_add_wp_local(HEADER_SLOT as u64);
+
+        // The OLD Roll mapping is no longer needed; let it drop
+        // before we overwrite `self` fields so there's no aliasing
+        // with the newly-installed `current_region` if they happen
+        // to be the same region 0.
+        drop(old_roll_region);
 
         self.file_sequence = next_seq;
         self.file = new_file;

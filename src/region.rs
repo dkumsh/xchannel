@@ -74,15 +74,15 @@ impl RegionMapping<Writable> {
             file.set_len(required_len)?;
         }
 
+        // No MAP_POPULATE: it would front-load page-fault cost into
+        // every `mmap` (including remaps and short-lived helper maps
+        // on the roll path) without affecting correctness. Callers
+        // who want pre-faulting should do it explicitly in warmup,
+        // not pay the cost on every map.
         let mmap = unsafe {
             let mut opts = MmapOptions::new();
             opts.offset(base_offset).len(region_size);
-            // Prefer MAP_POPULATE on Linux to avoid first-touch stalls
-            #[cfg(target_os = "linux")]
-            let mmap = opts.populate().map_mut(file)?;
-            #[cfg(not(target_os = "linux"))]
-            let mmap = opts.map_mut(file)?;
-            mmap
+            opts.map_mut(file)?
         };
 
         Ok(Self {
@@ -113,14 +113,11 @@ impl RegionMapping<Writable> {
 impl RegionMapping<ReadOnly> {
     pub fn create_read_only(file: &File, base_offset: u64, region_size: usize) -> io::Result<Self> {
         check_alignment(base_offset, region_size)?;
+        // No MAP_POPULATE — see `create_writable` for the rationale.
         let mmap = unsafe {
             let mut opts = MmapOptions::new();
             opts.offset(base_offset).len(region_size);
-            #[cfg(target_os = "linux")]
-            let mmap = opts.populate().map(file)?;
-            #[cfg(not(target_os = "linux"))]
-            let mmap = opts.map(file)?;
-            mmap
+            opts.map(file)?
         };
         Ok(Self {
             mmap,
