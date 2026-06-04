@@ -39,13 +39,14 @@
   `file_roll_size` is within `region_size` of `u64::MAX` (i.e.
   rounding up to a region boundary would overflow). Previously
   this would panic in debug or silently wrap in release.
-- `commit()` no longer pre-installs slot i+1 — the pre-install
-  has moved to `try_reserve()`, which now lays down the slot-i+1
-  signature before returning the buffer for slot i. Closes the
-  FORMAT.md §9.6 invariant violation (committed=1 was being
-  published before slot i+1's signature was in place) and at the
-  same time removes one cacheline write from `commit()`'s
-  producer→consumer critical path. Crash recovery sees the
+- The slot-i+1 pre-install primarily moves from `commit()` into
+  `try_reserve()`, laid down at the reserved-size offset before
+  the buffer is returned. The fast path (`length == reserved`)
+  needs no cacheline write in `commit`; the short-commit path
+  (`length < reserved`) re-lays the pre-install at the actual
+  offset inside `commit` before flipping `committed = 1`. Either
+  way, FORMAT.md §9.6 holds (slot i+1 is pre-installed before
+  commit i is observable) and crash recovery sees the
   pre-installed slot whether the crash falls between reserve and
   commit, between commit and publish_wp, or after publish_wp.
 - `roll_file()` publishes the rolled segment in two phases so a

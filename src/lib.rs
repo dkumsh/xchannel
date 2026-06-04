@@ -707,19 +707,38 @@ impl Writer {
             return Err(err_other("MTU exceeded"));
         }
 
+        // Capacity pre-check: the record (header + payload + padding +
+        // next-header slot) must fit in a single region — readers and
+        // writers always mmap whole regions, and a record straddling a
+        // region boundary cannot be expressed in the wire format. It
+        // must also fit in a fresh segment when `file_roll_size > 0`,
+        // otherwise no roll can ever satisfy the reservation and the
+        // loop below would roll forever, creating unbounded segment
+        // files.
+        let record_size = HEADER_SLOT + msg_size;
+        let record_with_padding = align_up(record_size);
+        let needed_total = record_with_padding + HEADER_SLOT;
+        if needed_total > self.region_size {
+            return Err(err_other(format!(
+                "reservation size {msg_size} cannot fit in region_size {} \
+                 (needs {needed_total} bytes including header + padding + next-header slot)",
+                self.region_size,
+            )));
+        }
+        if self.file_roll_size > 0 && needed_total as u64 > self.file_roll_size {
+            return Err(err_other(format!(
+                "reservation size {msg_size} cannot fit in file_roll_size {} \
+                 (needs {needed_total} bytes)",
+                self.file_roll_size,
+            )));
+        }
+
         loop {
             let wp = self.next_hdr_pos; // header slot for this record
             debug_assert_eq!(wp % ALIGN, 0, "next header must be 8-byte aligned");
 
             // Region-local offsets
             let off = wp % self.region_size;
-
-            // Layout now:
-            //   [HeaderSlot (16B)] [payload(msg_size)] [padding(to ALIGN)]
-            // We also require room for the **next** header slot immediately after this record.
-            let record_size = HEADER_SLOT + msg_size;
-            let record_with_padding = align_up(record_size);
-            let needed_total = record_with_padding + HEADER_SLOT; // +next header slot
 
             // file roll check includes next-header requirement
             if self.file_roll_size > 0 && wp + needed_total > self.file_roll_size as usize {
@@ -755,9 +774,10 @@ impl Writer {
                 };
             }
 
-            // Record what was reserved — `commit` will enforce that
-            // its `length` argument matches, so the reader's walk
-            // lands exactly where the pre-install signature lives.
+            // Record what was reserved. `commit(length)` enforces
+            // `length <= msg_size`; on a shorter commit it re-lays
+            // the pre-install at the actual offset so the reader's
+            // walk past slot i still finds the signature.
             self.pending_msg_size = Some(msg_size);
 
             let payload_off = off + HEADER_SLOT;
@@ -3443,6 +3463,52 @@ mod tests {
         );
 
         cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// `try_reserve` rejects a `msg_size` that cannot ever fit:
+    /// record + header + padding + next-header must be at most
+    /// `region_size`, and at most `file_roll_size` when rolling is
+    /// configured. Without the upfront check, the writer would roll
+    /// regions or files indefinitely, creating unbounded segment
+    /// files.
+    #[test]
+    fn test_try_reserve_rejects_oversized_payload() -> anyhow::Result<()> {
+        let base = "test_try_reserve_rejects_oversized_payload";
+        cleanup_channel_files(base);
+
+        // Region case: msg_size larger than region_size.
+        let region_size = page_size();
+        let mut w = WriterBuilder::new(base).region_size(region_size).build()?;
+        let err = w
+            .try_reserve(region_size * 2)
+            .expect_err("oversized reservation must error");
+        assert!(
+            err.to_string().contains("cannot fit in region_size"),
+            "unexpected error: {err}",
+        );
+        drop(w);
+        cleanup_channel_files(base);
+
+        // File-roll case: msg_size fits in a region but not in
+        // file_roll_size (which is smaller than a region's worth of
+        // payload here).
+        let small_roll = region_size as u64;
+        let mut w = WriterBuilder::new(base)
+            .region_size(region_size)
+            .file_roll_size(small_roll)
+            .build()?;
+        let too_big_for_roll = (small_roll as usize) - HEADER_SLOT; // leaves no room for next-hdr
+        let err = w
+            .try_reserve(too_big_for_roll)
+            .expect_err("reservation too large for file_roll_size must error");
+        assert!(
+            err.to_string().contains("cannot fit in"),
+            "unexpected error: {err}",
+        );
+        drop(w);
+        cleanup_channel_files(base);
+
         Ok(())
     }
 
