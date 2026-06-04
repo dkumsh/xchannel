@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 3.0.1 (2026-06-04)
 
 ### Changed
 - Fresh segment files are prepared in `<base>.<N>.partial` (or
@@ -86,6 +86,14 @@
   OLD Roll header's staged write (`committed=0`) and the
   release-store of `committed=1`, so a reader that observes Roll
   always finds NEW under its final name.
+- **Default-behaviour change:** `MAP_POPULATE` is no longer set on
+  any `mmap` (writer or reader). 3.0.0 pre-faulted every mapping at
+  map time, trading a first-touch stall for higher map-time cost;
+  with the duplicate region-0 mappings on the roll path now
+  collapsed, the front-loaded fault cost was no longer paying for
+  itself. Callers that relied on the implicit pre-fault for
+  tail-latency SLOs should issue an explicit warmup touch after
+  open / after a roll.
 - No wire-format change. The `<base>.<N>` final names and the
   bytes inside them are unchanged from 3.0.0.
 
