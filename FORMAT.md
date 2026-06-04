@@ -137,12 +137,26 @@ For each user record `i`:
    remains `0`.
 4. Writer computes the position of header slot `i+1` =
    `align_up(off(i) + 16 + length, 8)`.
-5. (Already done inside `try_reserve(i)` before step 2: header slot
-   `i+1` is pre-installed with `committed = 0` and
-   `header_type = User`. The invariant readers rely on is that this
-   pre-install is durable on disk before step 6 stores `committed = 1`
-   on slot `i`, which is guaranteed by the program order plus the
-   release-store in step 6.)
+5. Header slot `i+1` must be pre-installed with `committed = 0`,
+   `header_type = User`, `length = 0`, `message_type = 0`,
+   `user_meta_u64 = 0` — at the position computed in step 4 —
+   before step 6 stores `committed = 1` on slot `i`. The reference
+   implementation realises this as two sub-cases:
+
+   - `length == reserved` (the common case): the pre-install at
+     the matching offset was laid down by the earlier
+     `try_reserve(reserved)` call. No additional write is needed
+     here.
+   - `length <  reserved` (worst-case-reserve / serialize-then-
+     commit): the earlier `try_reserve` pre-install sits at the
+     *reserved* offset, not the actual-length offset. The writer
+     therefore re-lays the pre-install at
+     `align_up(off(i) + 16 + length, 8)` before step 6.
+
+   In either case, the invariant readers depend on is that slot
+   `i+1`'s pre-install signature is durable on disk before step 6
+   releases `committed = 1`, which is guaranteed by program order
+   plus the release-store in step 6.
 6. Writer publishes record `i` by storing `committed = 1` to header `i`
    with release semantics.
 7. Writer updates `ChannelHeader.write_position` and

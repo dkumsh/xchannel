@@ -321,11 +321,14 @@ pub struct Writer {
     // Pre-header pipeline state:
     next_hdr_pos: usize, // absolute file offset of the pre-installed header slot
     /// Size passed to the last `try_reserve` call. `commit`'s `length`
-    /// argument must equal this — the slot-i+1 pre-install in
-    /// `try_reserve` is positioned based on this size, and a smaller
-    /// `length` at commit time would leave the reader's walk landing
-    /// on bytes that weren't pre-installed. `None` means no pending
-    /// reservation.
+    /// argument must be `<= pending_msg_size`. When `length ==
+    /// pending_msg_size`, the slot-i+1 pre-install laid down by
+    /// `try_reserve` at the matching offset is reused as-is (fast
+    /// path). When `length < pending_msg_size`, `commit` re-lays the
+    /// pre-install at the *actual* `next_hdr_pos` so the reader's
+    /// walk past slot i still lands on a well-formed slot.
+    /// `length > pending_msg_size` is rejected. `None` means no
+    /// pending reservation.
     pending_msg_size: Option<usize>,
 }
 
