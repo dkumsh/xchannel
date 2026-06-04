@@ -128,8 +128,8 @@ Other values are invalid and must cause readers to fail.
 For each user record `i`:
 
 1. Header slot `i` already exists in the file with `committed = 0`
-   (pre-installed by the writer when record `i-1` was committed, or when
-   the file/region was created).
+   (pre-installed by the writer's `try_reserve(i-1)` call, or when the
+   file/region was created for the very first slot).
 2. Writer obtains a `length`-byte payload buffer immediately after header
    slot `i`, writes the payload.
 3. Writer fills the user-owned fields of header `i` (`message_type`,
@@ -137,8 +137,12 @@ For each user record `i`:
    remains `0`.
 4. Writer computes the position of header slot `i+1` =
    `align_up(off(i) + 16 + length, 8)`.
-5. Writer pre-installs header slot `i+1` with `committed = 0` and
-   `header_type = User`.
+5. (Already done inside `try_reserve(i)` before step 2: header slot
+   `i+1` is pre-installed with `committed = 0` and
+   `header_type = User`. The invariant readers rely on is that this
+   pre-install is durable on disk before step 6 stores `committed = 1`
+   on slot `i`, which is guaranteed by the program order plus the
+   release-store in step 6.)
 6. Writer publishes record `i` by storing `committed = 1` to header `i`
    with release semantics.
 7. Writer updates `ChannelHeader.write_position` and

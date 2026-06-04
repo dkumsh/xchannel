@@ -3,8 +3,14 @@
 //! # Overview
 //! - Regionized file layout; region 0 starts with a `MessageHeader(Channel)` followed by `ChannelHeader`.
 //! - **Pre-header pipeline** for user records:
-//!   For record *i*: header(i) is pre-installed (committed=0), writer copies payload(i) after it,
-//!   then fills header(i) and sets committed=1 (Release), and finally pre-installs header(i+1).
+//!   For record *i*: header(i) is pre-installed (committed=0) at the
+//!   end of `try_reserve(i-1)` (and the very first one at file
+//!   create time). `try_reserve(i)` then pre-installs header(i+1)
+//!   before returning the buffer for slot i. The caller fills the
+//!   payload and calls `commit`, which fills header(i) and
+//!   release-stores `committed=1`. At any point a reader observes
+//!   `committed[i] = 1` with acquire semantics, slot i+1 is
+//!   guaranteed to bear the pre-install signature.
 //! - Special markers: `Skip` (pad to next region), `Roll` (file rolled).
 //!
 //! # Safety
@@ -105,7 +111,8 @@ fn validate_channel_header(ch: &ChannelHeader, expected_region_size: usize) -> i
     Ok(())
 }
 
-/// A "pre-installed" header is what `commit()` writes one step ahead of itself:
+/// A "pre-installed" header is what `try_reserve()` lays down one
+/// slot ahead of itself before returning the buffer:
 /// `{committed: 0, header_type: User, length: 0, message_type: 0, user_meta_u64: 0}`.
 /// Crashed-writer recovery advances past the orphaned record and asserts this
 /// signature on the new slot, rejecting raw fresh-extended bytes
@@ -158,8 +165,12 @@ fn fetch_add_wp(file: &File, region_size: usize, delta: u64) -> io::Result<u64> 
     Ok(out)
 }
 
+/// Lay down the Roll header at `pos` with `committed=0`. The
+/// release-store of `committed=1` is deferred so callers can stage
+/// other publish-visibility steps (e.g. `rename`) between header
+/// preparation and reader-observable commit.
 #[inline]
-fn write_roll_header_at(
+fn prepare_roll_header_at(
     file: &File,
     region_size: usize,
     pos: usize,
@@ -175,16 +186,28 @@ fn write_roll_header_at(
     let ridx = (pos / region_size) as u64;
     let off = pos % region_size;
     let mut rm = RegionMapping::create_writable(file, ridx * region_size as u64, region_size)?;
-    if let Some(bytes) = rm.get_bytes_mut(off, MESSAGE_HEADER_SIZE) {
-        unsafe {
-            let hdr_ptr = bytes.as_mut_ptr() as *mut MessageHeader;
-            *hdr_ptr = hdr;
-            MessageHeader::commit(hdr_ptr);
-        }
-        Ok(())
-    } else {
-        Err(err_other("write_roll_header_at: failed to get bytes"))
+    let bytes = rm
+        .get_bytes_mut(off, MESSAGE_HEADER_SIZE)
+        .ok_or_else(|| err_other("prepare_roll_header_at: failed to get bytes"))?;
+    unsafe {
+        *(bytes.as_mut_ptr() as *mut MessageHeader) = hdr;
     }
+    Ok(())
+}
+
+/// Release-store `committed=1` on the previously-prepared header at
+/// `pos`. After this returns, readers can observe the marker.
+#[inline]
+fn release_commit_header_at(file: &File, region_size: usize, pos: usize) -> io::Result<()> {
+    let ridx = (pos / region_size) as u64;
+    let off = pos % region_size;
+    let mut rm = RegionMapping::create_writable(file, ridx * region_size as u64, region_size)?;
+    let bytes = rm
+        .get_bytes_mut(off, MESSAGE_HEADER_SIZE)
+        .ok_or_else(|| err_other("release_commit_header_at: failed to get bytes"))?;
+    let hdr_ptr = bytes.as_mut_ptr() as *mut MessageHeader;
+    MessageHeader::commit(hdr_ptr);
+    Ok(())
 }
 
 // ========== Builders ==========
@@ -271,6 +294,7 @@ impl WriterBuilder {
     /// Create or open the latest sequence file and return a Writer.
     #[inline]
     pub fn build(self) -> io::Result<Writer> {
+        sweep_stale_partial_files(&self.path);
         Writer::open_or_create(
             self.path,
             self.region_size,
@@ -357,6 +381,13 @@ pub struct Writer {
 
     // Pre-header pipeline state:
     next_hdr_pos: usize, // absolute file offset of the pre-installed header slot
+    /// Size passed to the last `try_reserve` call. `commit`'s `length`
+    /// argument must equal this — the slot-i+1 pre-install in
+    /// `try_reserve` is positioned based on this size, and a smaller
+    /// `length` at commit time would leave the reader's walk landing
+    /// on bytes that weren't pre-installed. `None` means no pending
+    /// reservation.
+    pending_msg_size: Option<usize>,
 }
 
 impl Writer {
@@ -411,7 +442,14 @@ impl Writer {
         let base_path = path.as_ref().to_path_buf();
         let sequence = find_latest_sequence(&base_path)?;
         let (file, channel_region, current_region, current_region_index, file_len, next_hdr_pos) =
-            Self::open_file(&base_path, sequence, region_size, mtu, &channel_name)?;
+            Self::open_file(
+                &base_path,
+                sequence,
+                region_size,
+                file_roll_size,
+                mtu,
+                &channel_name,
+            )?;
 
         Ok(Self {
             base_path,
@@ -427,15 +465,99 @@ impl Writer {
             keep_files,
             channel_name,
             next_hdr_pos,
+            pending_msg_size: None,
         })
     }
 
     /// Open a specific sequence file. If new => init region0's ChannelHeader and **pre-install first user header**.
+    /// Fresh-segment preparation at an explicit (partial) path. Does
+    /// `set_len`, channel header init, and first user-header
+    /// pre-install. The file is **not** renamed to its final name —
+    /// callers do that themselves to control the publish-visibility
+    /// window. `Writer::open_file` renames immediately; `roll_file`
+    /// renames only after the OLD segment's Roll marker is durable.
+    #[allow(clippy::type_complexity)]
+    fn prepare_segment_at(
+        partial_path: &Path,
+        sequence: u64,
+        region_size: usize,
+        file_roll_size: u64,
+        mtu: u64,
+        channel_name: &[u8; CHANNEL_NAME_MAX],
+    ) -> io::Result<(
+        File,
+        RegionMapping<Writable>,
+        RegionMapping<Writable>,
+        u64,
+        u64,
+        usize,
+    )> {
+        let initial_len = preallocation_len(region_size, file_roll_size)?;
+        let _ = std::fs::remove_file(partial_path); // tolerate prior crash
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(partial_path)?;
+        file.set_len(initial_len)?;
+        let mut region0 = RegionMapping::create_writable(&file, 0, region_size)?;
+
+        // 1) message header (Channel)
+        let mh_ptr = region0.as_mut_ptr();
+        let mh = unsafe { &mut *(mh_ptr as *mut MessageHeader) };
+        mh.committed = 1;
+        mh.length = CHANNEL_HEADER_SIZE as u32;
+        mh.header_type = HeaderType::Channel as u8;
+        mh.message_type = 0;
+        mh.user_meta_u64 = 0;
+
+        // 2) channel header
+        let ch_ptr = unsafe { mh_ptr.add(MESSAGE_HEADER_SIZE) as *mut ChannelHeader };
+        unsafe {
+            (*ch_ptr).write_position = AtomicU64::new(0);
+            (*ch_ptr).message_count = AtomicU64::new(1);
+            (*ch_ptr).channel_sequence = sequence;
+            (*ch_ptr).region_size = region_size as u32;
+            (*ch_ptr).mtu = mtu as u32;
+            (*ch_ptr).format_version = FORMAT_VERSION;
+            (*ch_ptr).endianness = ENDIANNESS_LE;
+            (*ch_ptr).system_header_size = SYSTEM_HEADER_SIZE;
+            (*ch_ptr).user_header_size = USER_HEADER_SIZE;
+            (*ch_ptr)._reserved = [0; 3];
+            (*ch_ptr).user_header_kind = USER_HEADER_KIND_DEFAULT;
+            (*ch_ptr).channel_name = *channel_name;
+        }
+
+        // 3) current region + first user header pre-install
+        let mut current_region = RegionMapping::create_writable(&file, 0, region_size)?;
+        let start = align_up(MESSAGE_HEADER_SIZE + CHANNEL_HEADER_SIZE);
+        let first_user_hdr = current_region
+            .get_bytes_mut(start, MESSAGE_HEADER_SIZE)
+            .ok_or_else(|| err_other("prepare_segment_at: cannot pre-install first header"))?;
+        unsafe {
+            *(first_user_hdr.as_mut_ptr() as *mut MessageHeader) = MessageHeader {
+                committed: 0,
+                header_type: HeaderType::User as u8,
+                message_type: 0,
+                length: 0,
+                user_meta_u64: 0,
+            };
+        }
+
+        with_ch_mut(&file, region_size, |ch| {
+            ch.write_position
+                .store((start + HEADER_SLOT) as u64, Ordering::Release);
+        })?;
+
+        Ok((file, region0, current_region, 0, initial_len, start))
+    }
+
     #[allow(clippy::type_complexity)]
     fn open_file(
         base_path: &Path,
         sequence: u64,
         region_size: usize,
+        file_roll_size: u64,
         mtu: u64,
         channel_name: &[u8; CHANNEL_NAME_MAX],
     ) -> io::Result<(
@@ -447,73 +569,37 @@ impl Writer {
         usize,
     )> {
         let file_path = make_channel_file_path(base_path, sequence)?;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&file_path)?;
 
-        let meta = file.metadata()?;
-        if meta.len() == 0 {
-            // New file => initialize region 0
-            file.set_len(region_size as u64)?;
-            let mut region0 = RegionMapping::create_writable(&file, 0, region_size)?;
+        let existing_meta = std::fs::metadata(&file_path).ok();
+        let recover_existing = match &existing_meta {
+            Some(m) => m.len() > 0,
+            None => false,
+        };
 
-            // 1) message header (Channel)
-            let mh_ptr = region0.as_mut_ptr();
-            let mh = unsafe { &mut *(mh_ptr as *mut MessageHeader) };
-            mh.committed = 1; // committed system record
-            mh.length = CHANNEL_HEADER_SIZE as u32;
-            mh.header_type = HeaderType::Channel as u8;
-            mh.message_type = 0;
-            mh.user_meta_u64 = 0;
-
-            // 2) channel header
-            let ch_ptr = unsafe { mh_ptr.add(MESSAGE_HEADER_SIZE) as *mut ChannelHeader };
-            unsafe {
-                (*ch_ptr).write_position = AtomicU64::new(0); // set below after pre-install
-                (*ch_ptr).message_count = AtomicU64::new(1);
-                (*ch_ptr).channel_sequence = sequence;
-                (*ch_ptr).region_size = region_size as u32;
-                (*ch_ptr).mtu = mtu as u32;
-                (*ch_ptr).format_version = FORMAT_VERSION;
-                (*ch_ptr).endianness = ENDIANNESS_LE;
-                (*ch_ptr).system_header_size = SYSTEM_HEADER_SIZE;
-                (*ch_ptr).user_header_size = USER_HEADER_SIZE;
-                (*ch_ptr)._reserved = [0; 3];
-                (*ch_ptr).user_header_kind = USER_HEADER_KIND_DEFAULT;
-                (*ch_ptr).channel_name = *channel_name;
+        if !recover_existing {
+            if existing_meta.is_some() {
+                // 0-byte stub at the final path would block create_new.
+                let _ = std::fs::remove_file(&file_path);
             }
-
-            // 3) current region and first user header pre-install
-            let mut current_region = RegionMapping::create_writable(&file, 0, region_size)?;
-            let start = align_up(MESSAGE_HEADER_SIZE + CHANNEL_HEADER_SIZE);
-            // pre-install first user header (committed=0)
-            if let Some(h) = current_region.get_bytes_mut(start, MESSAGE_HEADER_SIZE) {
-                unsafe {
-                    *(h.as_mut_ptr() as *mut MessageHeader) = MessageHeader {
-                        committed: 0,
-                        header_type: HeaderType::User as u8,
-                        message_type: 0,
-                        length: 0,
-                        user_meta_u64: 0,
-                    };
-                }
-            } else {
-                return Err(err_other("open_file: cannot pre-install first header"));
-            }
-
-            // Publish write_position to the **next header slot** (start)
-            with_ch_mut(&file, region_size, |ch| {
-                ch.write_position
-                    .store((start + HEADER_SLOT) as u64, Ordering::Release);
-            })?;
-
-            Ok((file, region0, current_region, 0, region_size as u64, start))
+            let partial_path = make_partial_channel_file_path(base_path, sequence)?;
+            let prepared = Self::prepare_segment_at(
+                &partial_path,
+                sequence,
+                region_size,
+                file_roll_size,
+                mtu,
+                channel_name,
+            )?;
+            std::fs::rename(&partial_path, &file_path)?;
+            Ok(prepared)
         } else {
-            // Existing file: adopt next header slot from write_position
-            let mut file_len = meta.len();
+            let file = OpenOptions::new().read(true).write(true).open(&file_path)?;
+            let initial_len = preallocation_len(region_size, file_roll_size)?;
+            // Existing file: adopt next header slot from write_position.
+            // Migration step: v3.0.0 writers left files at
+            // region-by-region growth; promote to the preallocated
+            // layout so future `roll_over_region` calls don't grow
+            // the file under a reader's mmap.
             let region0 = RegionMapping::create_writable(&file, 0, region_size)?;
             let ch = get_channel_header(region0.as_ptr());
             validate_channel_header(ch, region_size)?;
@@ -523,11 +609,12 @@ impl Writer {
             let mut next_hdr = wp_payload.saturating_sub(HEADER_SLOT);
             let mut region_index = (next_hdr / region_size) as u64;
 
-            // Ensure the file actually covers the region we’re about to map.
-            let needed_end = (region_index + 1) as u64 * region_size as u64;
-            if needed_end > file_len {
-                file.set_len(needed_end)?;
-                file_len = needed_end;
+            let needed_end = (region_index + 1) * region_size as u64;
+            let target_len = needed_end.max(initial_len);
+            let mut file_len = file.metadata()?.len();
+            if target_len > file_len {
+                file.set_len(target_len)?;
+                file_len = target_len;
             }
             let mut current_region = RegionMapping::create_writable(
                 &file,
@@ -670,7 +757,33 @@ impl Writer {
                 continue;
             }
 
-            // There is enough room. Return the payload slice after the header slot.
+            // Pre-install slot i+1 BEFORE returning slot i's buffer. This
+            // keeps FORMAT.md §9.6 strict (next slot pre-installed before
+            // commit i) while removing the pre-install cacheline write
+            // from `commit()`'s producer→consumer path. Recovery's
+            // `verify_preinstall_signature` finds the expected signature
+            // whether the crash is between reserve and commit, between
+            // commit and publish_wp, or after publish_wp.
+            let next_hdr_off = off + record_with_padding;
+            let next_hdr_bytes = self
+                .current_region
+                .get_bytes_mut(next_hdr_off, MESSAGE_HEADER_SIZE)
+                .ok_or_else(|| err_other("Failed to pre-install next header"))?;
+            unsafe {
+                *(next_hdr_bytes.as_mut_ptr() as *mut MessageHeader) = MessageHeader {
+                    committed: 0,
+                    header_type: HeaderType::User as u8,
+                    message_type: 0,
+                    length: 0,
+                    user_meta_u64: 0,
+                };
+            }
+
+            // Record what was reserved — `commit` will enforce that
+            // its `length` argument matches, so the reader's walk
+            // lands exactly where the pre-install signature lives.
+            self.pending_msg_size = Some(msg_size);
+
             let payload_off = off + HEADER_SLOT;
             return self
                 .current_region
@@ -680,12 +793,28 @@ impl Writer {
     }
 
     /// Commit the message after filling the payload slice returned by `try_reserve`.
-    /// Fills the pre-installed header at `next_hdr_pos`, sets committed=1 (Release),
-    /// and **pre-installs** the next header slot (committed=0).
+    /// Fills the header at `next_hdr_pos`, sets committed=1 (Release),
+    /// then publishes write_position. The next header slot was already
+    /// pre-installed by `try_reserve`, so FORMAT.md §9.6 invariant
+    /// holds across this call without any cacheline write here.
     pub fn commit(&mut self, msg_type: u16, length: u32, user_meta_u64: u64) -> io::Result<()> {
+        // `length` must match the size passed to the matching
+        // `try_reserve` — the slot-i+1 pre-install in `try_reserve`
+        // is positioned based on that size, and a different `length`
+        // here would advance `next_hdr_pos` to a slot we never
+        // pre-installed. Reader walks would then land on garbage.
+        let reserved = self
+            .pending_msg_size
+            .take()
+            .ok_or_else(|| err_other("commit without preceding try_reserve"))?;
+        if length as usize != reserved {
+            return Err(err_other(format!(
+                "commit length {length} does not match try_reserve size {reserved}",
+            )));
+        }
+
         let hdr_off = self.next_hdr_pos % self.region_size;
 
-        // 1) Fill fields (committed=0)
         let hdr_slice = self
             .current_region
             .get_bytes_mut(hdr_off, MESSAGE_HEADER_SIZE)
@@ -700,47 +829,50 @@ impl Writer {
             (*hdr_ptr).user_meta_u64 = user_meta_u64;
         }
 
-        // 2) Publish (commit flag last)
+        // Release-store committed=1. Slot i+1's pre-install is already
+        // durable (laid down by `try_reserve`), so any reader that
+        // observes committed=1 with acquire is guaranteed to find a
+        // well-formed slot at i+1.
         MessageHeader::commit(hdr_ptr);
 
-        // 3) Advance to next header slot after payload+pad
         let payload_end = self.next_hdr_pos + HEADER_SLOT + length as usize;
         let next_pos = align_up(payload_end);
         self.next_hdr_pos = next_pos;
 
-        // 4) Pre-install next header slot (committed=0)
-        let next_off = next_pos % self.region_size;
-        if let Some(bytes) = self
-            .current_region
-            .get_bytes_mut(next_off, MESSAGE_HEADER_SIZE)
-        {
-            unsafe {
-                *(bytes.as_mut_ptr() as *mut MessageHeader) = MessageHeader {
-                    committed: 0,
-                    header_type: HeaderType::User as u8,
-                    message_type: 0,
-                    length: 0,
-                    user_meta_u64: 0,
-                };
-            }
-        } else {
-            return Err(err_other("Failed to pre-install next header"));
-        }
-
-        // 5) Publish write_position = *payload start* of the next record
         let next_payload = next_pos + HEADER_SLOT;
         self.publish_wp(next_payload);
 
         Ok(())
     }
 
-    /// Explicitly roll to the next file (writes a `Roll` marker first in the OLD file).
+    /// Roll to the next file. The publish order is the load-bearing
+    /// part — readers that observe the Roll marker on the OLD file
+    /// will immediately try to `open()` the NEW file's final path, so
+    /// the NEW file must exist on disk under that path *before* the
+    /// Roll marker becomes visible.
+    ///
     /// Steps:
-    /// 1) compute where to put the Roll header in OLD file (current header slot or next region start),
-    /// 2) create & initialize the NEW file and pre-install its first header,
-    /// 3) switch Writer to the new file,
-    /// 4) publish Roll header into the OLD file and bump its write_position.
+    /// 1) Compute the Roll header position in OLD (current header slot or next region start).
+    /// 2) Prepare NEW segment at `<base>.<N+1>.partial` (fully initialised: set_len, channel header, first user header). Not yet visible to readers.
+    /// 3) Grow OLD if needed; jump OLD's `wp` to the next region if `leftover < HEADER_SLOT`.
+    /// 4) Stage OLD's Roll header with `committed = 0` (invisible to readers).
+    /// 5) Atomically `rename` NEW's `.partial` to its final name — NEW is now discoverable.
+    /// 6) Release-store `committed = 1` on OLD's Roll header — readers wake here.
+    /// 7) Bump OLD's `write_position` past the Roll marker.
+    /// 8) Swap `self` to NEW.
+    /// 9) Retention sweep: unlink the file at sequence `next_seq - keep_files`, if configured.
+    ///
+    /// If any step before (8) fails, `self` is unchanged and a retry
+    /// can clean up the orphan `.partial` (or `WriterBuilder::build`
+    /// will sweep it on next startup).
     pub fn roll_file(&mut self) -> io::Result<()> {
+        // Any pending reservation refers to a slot in OLD that's about
+        // to be replaced by a Roll marker (or live elsewhere in OLD
+        // that we won't return to). Invalidate it so a follow-up
+        // `commit` doesn't write into the NEW segment's slot 0 with
+        // stale length state.
+        self.pending_msg_size = None;
+
         // OLD context
         let old_region_size = self.region_size;
         let old_seq = self.file_sequence;
@@ -761,8 +893,13 @@ impl Writer {
             (wp, None)
         };
 
-        // NEW file: open and pre-install its first header
+        // Prepare NEW segment at its `.partial` path. The file is fully
+        // initialised (set_len + channel header + first user header
+        // pre-installed) but invisible to readers because the rename
+        // is deferred until *after* OLD's Roll marker is published.
         let next_seq = old_seq + 1;
+        let new_partial_path = make_partial_channel_file_path(&self.base_path, next_seq)?;
+        let new_final_path = make_channel_file_path(&self.base_path, next_seq)?;
         let (
             new_file,
             new_channel_region,
@@ -770,15 +907,42 @@ impl Writer {
             new_index,
             new_file_len,
             new_next_hdr,
-        ) = Self::open_file(
-            &self.base_path,
+        ) = Self::prepare_segment_at(
+            &new_partial_path,
             next_seq,
             self.region_size,
+            self.file_roll_size,
             self.mtu,
             &self.channel_name,
         )?;
 
-        // Switch writer to NEW file
+        // Publish Roll in OLD file BEFORE swapping `self` to NEW. If
+        // any step here errors, `self` is still consistent on OLD —
+        // a retry can clean up `new_partial_path` and try again.
+        if let Some(needed_end) = grow_to_end {
+            // Grow-only: never let `set_len` shrink a preallocated
+            // OLD segment back down to a region boundary.
+            if needed_end > self.file_len {
+                old_file.set_len(needed_end)?;
+            }
+        }
+
+        if leftover < HEADER_SLOT {
+            store_wp(&old_file, old_region_size, roll_pos as u64)?;
+        }
+        // Roll publish is a two-phase commit:
+        //   1. Write the Roll header with `committed=0` (invisible).
+        //   2. Atomically publish NEW under its final name.
+        //   3. Release-store `committed=1` on the Roll marker.
+        // Readers wake on (3) and immediately resolve NEW via the
+        // path that became visible in (2). Without this ordering the
+        // reader could see the Roll marker before NEW exists on disk
+        // and fail its `open()` (ping_pong regression).
+        prepare_roll_header_at(&old_file, old_region_size, roll_pos, now_ns())?;
+        std::fs::rename(&new_partial_path, &new_final_path)?;
+        release_commit_header_at(&old_file, old_region_size, roll_pos)?;
+        fetch_add_wp(&old_file, old_region_size, HEADER_SLOT as u64)?;
+
         self.file_sequence = next_seq;
         self.file = new_file;
         self.channel_region = new_channel_region;
@@ -786,22 +950,6 @@ impl Writer {
         self.current_region_index = new_index;
         self.file_len = new_file_len;
         self.next_hdr_pos = new_next_hdr;
-        // Publish wp for new file (Release already done in open_file new-case)
-
-        // Publish Roll in OLD file
-        if let Some(needed_end) = grow_to_end {
-            old_file.set_len(needed_end)?; // ensure next region exists
-        }
-
-        // If we jumped to next region earlier in OLD file, put wp there first
-        if leftover < HEADER_SLOT {
-            store_wp(&old_file, old_region_size, roll_pos as u64)?;
-        }
-
-        // Now map & write the Roll header
-        write_roll_header_at(&old_file, old_region_size, roll_pos, now_ns())?;
-        // Bump old wp by one header
-        fetch_add_wp(&old_file, old_region_size, HEADER_SLOT as u64)?;
 
         // Retention: if `keep_files(N)` was configured, the file at sequence
         // `next_seq - N` (if any) is now beyond the retention window. Unlink
@@ -823,6 +971,11 @@ impl Writer {
     }
 
     fn roll_over_region(&mut self) -> io::Result<()> {
+        // Same rationale as `roll_file`: any pending reservation is
+        // about to be superseded by a Skip in the OLD region. Clear
+        // so a follow-up `commit` doesn't act on stale length.
+        self.pending_msg_size = None;
+
         let wp = self.next_hdr_pos;
         debug_assert_eq!(wp % ALIGN, 0, "roll_over_region: wp must be aligned");
 
@@ -1723,6 +1876,96 @@ fn make_channel_file_path(base_path: &Path, sequence: u64) -> io::Result<PathBuf
     })
 }
 
+/// Suffix appended to a segment file while it is being prepared by
+/// the writer; renamed away atomically once initialised. Files with
+/// this suffix are invisible to `find_all_sequences` (its u64
+/// suffix parse rejects anything non-numeric).
+const PARTIAL_SUFFIX: &str = "partial";
+
+/// `<base>.partial` (seq 0) or `<base>.<N>.partial` (seq N > 0).
+fn make_partial_channel_file_path(base_path: &Path, sequence: u64) -> io::Result<PathBuf> {
+    let final_path = make_channel_file_path(base_path, sequence)?;
+    let file_name = final_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| err_other(format!("Cannot get file name from path {:?}", final_path)))?;
+    let mut pb = final_path.clone();
+    pb.set_file_name(format!("{}.{}", file_name, PARTIAL_SUFFIX));
+    Ok(pb)
+}
+
+/// Size a freshly-created segment should be born at. Rounded up to
+/// the next `region_size` boundary so readers' whole-region mmaps
+/// never extend past EOF. `file_roll_size = 0` (unbounded) falls
+/// back to one region; `ensure_len` then grows on demand and the
+/// intra-file race is exposed in that mode only.
+///
+/// Returns `InvalidInput` if `file_roll_size` cannot be rounded up
+/// without overflowing `u64` (i.e. within `region_size` of
+/// `u64::MAX`).
+fn preallocation_len(region_size: usize, file_roll_size: u64) -> io::Result<u64> {
+    if file_roll_size == 0 {
+        return Ok(region_size as u64);
+    }
+    let r = region_size as u64;
+    let rem = file_roll_size % r;
+    if rem == 0 {
+        return Ok(file_roll_size);
+    }
+    file_roll_size.checked_add(r - rem).ok_or_else(|| {
+        io::Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "file_roll_size {file_roll_size} cannot be rounded up to a \
+                 region_size {region_size} multiple without overflowing u64",
+            ),
+        )
+    })
+}
+
+/// Unlink any `<base>.partial` / `<base>.<N>.partial` siblings.
+/// Called by [`WriterBuilder::build`] so a previous crashed prep
+/// leaves nothing for `create_new` to trip over. Errors are
+/// swallowed — stale partials are inert.
+fn sweep_stale_partial_files(base_path: &Path) {
+    let parent = match base_path.parent() {
+        Some(p) if p.as_os_str().is_empty() => std::path::PathBuf::from("."),
+        Some(p) => p.to_path_buf(),
+        None => std::path::PathBuf::from("."),
+    };
+    let Some(file_name) = base_path.file_name().and_then(|s| s.to_str()) else {
+        return;
+    };
+    let Ok(entries) = read_dir(&parent) else {
+        return;
+    };
+    for ent in entries.flatten() {
+        let name_os = ent.file_name();
+        let Some(name) = name_os.to_str() else {
+            continue;
+        };
+        if is_partial_segment_name(name, file_name) {
+            let _ = std::fs::remove_file(ent.path());
+        }
+    }
+}
+
+/// Match `<base>.partial` or `<base>.<N>.partial`. The numeric
+/// parse on `<N>` keeps unrelated siblings (e.g.
+/// `<base>.notes.partial`) out of the sweep.
+fn is_partial_segment_name(name: &str, base_name: &str) -> bool {
+    let base_partial = format!("{}.{}", base_name, PARTIAL_SUFFIX);
+    if name == base_partial {
+        return true;
+    }
+    let dotted = format!("{}.", base_name);
+    let suffix = format!(".{}", PARTIAL_SUFFIX);
+    name.strip_prefix(&dotted)
+        .and_then(|m| m.strip_suffix(&suffix))
+        .and_then(|n| n.parse::<u64>().ok())
+        .is_some()
+}
+
 fn find_earliest_sequence(base_path: &Path) -> io::Result<u64> {
     find_sequence(base_path, false)
 }
@@ -1785,8 +2028,13 @@ pub fn cleanup_channel_files<P: AsRef<std::path::Path>>(base: P) {
     use std::fs;
     let base_path = base.as_ref();
 
-    // Remove the base file (sequence 0).
+    // Remove the base file (sequence 0) and the seq-0 partial sibling.
     let _ = fs::remove_file(base_path);
+    if let Some(name) = base_path.file_name().and_then(|s| s.to_str()) {
+        let mut partial0 = base_path.to_path_buf();
+        partial0.set_file_name(format!("{}.{}", name, PARTIAL_SUFFIX));
+        let _ = fs::remove_file(partial0);
+    }
 
     let parent = match base_path.parent() {
         Some(p) if p.as_os_str().is_empty() => std::path::PathBuf::from("."),
@@ -1806,9 +2054,11 @@ pub fn cleanup_channel_files<P: AsRef<std::path::Path>>(base: P) {
         let Some(name) = name_os.to_str() else {
             continue;
         };
-        if let Some(rest) = name.strip_prefix(&prefix)
-            && rest.parse::<u64>().is_ok()
-        {
+        let is_rolled = name
+            .strip_prefix(&prefix)
+            .and_then(|rest| rest.parse::<u64>().ok())
+            .is_some();
+        if is_rolled || is_partial_segment_name(name, file_name) {
             let _ = fs::remove_file(ent.path());
         }
     }
@@ -2852,6 +3102,518 @@ mod tests {
         assert!(r.try_read()?.is_some());
         assert!(r.try_read()?.is_none());
 
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// Fresh segment creation goes through a `<base>.partial` (seq 0)
+    /// or `<base>.<N>.partial` (seq N>0) temp file. The temp file
+    /// exists only between `OpenOptions::create_new` and the final
+    /// `rename` — we exercise both pieces here:
+    ///
+    /// 1. A leftover `.partial` from a previous "crashed" run is
+    ///    swept by `WriterBuilder::build` and doesn't block a fresh
+    ///    create.
+    /// 2. The reader's directory scan never sees a `.partial` file,
+    ///    even if one is left lying around, so its sequence list
+    ///    stays clean.
+    #[test]
+    fn test_partial_sweep_and_invisibility() -> anyhow::Result<()> {
+        let base = "test_partial_sweep_and_invisibility";
+        cleanup_channel_files(base);
+        // Also clear the partial-named siblings explicitly so test
+        // reruns from a previous failed run don't poison the state.
+        let _ = std::fs::remove_file(format!("{base}.{}", PARTIAL_SUFFIX));
+        let _ = std::fs::remove_file(format!("{base}.1.{}", PARTIAL_SUFFIX));
+
+        // Synthesise crashed-mid-prep state: an orphan `.partial`
+        // file at sequence 0 *and* one at sequence 1.
+        std::fs::write(format!("{base}.{}", PARTIAL_SUFFIX), b"stale-bytes")?;
+        std::fs::write(format!("{base}.1.{}", PARTIAL_SUFFIX), b"stale-bytes")?;
+
+        // The reader's scan must already be tolerant of these even
+        // before the writer runs — `.partial` shouldn't match
+        // either the bare `<base>` (seq 0) name or `<base>.<N>`.
+        let sequences = find_all_sequences(Path::new(base))?;
+        assert!(
+            sequences.is_empty(),
+            "find_all_sequences leaked partial sibling: {sequences:?}"
+        );
+
+        // Build the writer — its startup sweep must unlink both
+        // stale `.partial` files before `open_file`'s `create_new`
+        // tries to take their place.
+        let region_size = page_size();
+        let mut w = WriterBuilder::new(base).region_size(region_size).build()?;
+        assert!(
+            !Path::new(&format!("{base}.{}", PARTIAL_SUFFIX)).exists(),
+            "sweep_stale_partial_files did not unlink seq-0 orphan"
+        );
+        assert!(
+            !Path::new(&format!("{base}.1.{}", PARTIAL_SUFFIX)).exists(),
+            "sweep_stale_partial_files did not unlink seq-1 orphan"
+        );
+
+        // Sanity: writer is functional after the sweep.
+        let payload = [0xCD_u8; 8];
+        let buf = w.try_reserve(payload.len())?;
+        buf.copy_from_slice(&payload);
+        w.commit(7, payload.len() as u32, 0)?;
+        drop(w);
+
+        // And a reader can drain it.
+        let mut r = Reader::open(base, ReaderMode::LateJoin)?;
+        let msg = r.try_read()?.expect("first message visible");
+        assert_eq!(msg.header().message_type, 7);
+        assert!(r.try_read()?.is_none());
+
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// `file_roll_size` within `region_size` of `u64::MAX` cannot
+    /// be rounded up to a region boundary without overflowing.
+    /// `WriterBuilder::build` must reject with `InvalidInput`
+    /// rather than panicking (debug) or wrapping (release), AND
+    /// must not leave a `.partial` orphan on disk — validation has
+    /// to happen before `create_new` runs.
+    #[test]
+    fn test_preallocation_rejects_overflowing_roll_size() {
+        let base = "test_preallocation_rejects_overflowing_roll_size";
+        cleanup_channel_files(base);
+        let err = WriterBuilder::new(base)
+            .region_size(page_size())
+            .file_roll_size(u64::MAX)
+            .build()
+            .err()
+            .expect("must refuse u64::MAX roll size");
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("overflowing u64"),
+            "unexpected error: {err}",
+        );
+        let partial = format!("{base}.{}", PARTIAL_SUFFIX);
+        assert!(
+            !Path::new(&partial).exists(),
+            "validation failure leaked a .partial orphan at {partial}",
+        );
+        cleanup_channel_files(base);
+    }
+
+    /// `file_roll_size` not a multiple of `region_size` (e.g. the
+    /// README's 10_000_000) must round up to a whole region, since
+    /// readers' mmaps always cover whole regions and would
+    /// otherwise extend past EOF.
+    #[test]
+    fn test_preallocation_rounds_up_to_region_boundary() -> anyhow::Result<()> {
+        let base = "test_preallocation_rounds_up_to_region_boundary";
+        cleanup_channel_files(base);
+
+        let region_size = page_size();
+        let file_roll_size: u64 = 10_000_000;
+        let expected = file_roll_size.div_ceil(region_size as u64) * region_size as u64;
+        assert_ne!(
+            expected, file_roll_size,
+            "test premise: roll size unaligned"
+        );
+
+        let _w = WriterBuilder::new(base)
+            .region_size(region_size)
+            .file_roll_size(file_roll_size)
+            .build()?;
+        assert_eq!(std::fs::metadata(base)?.len(), expected);
+
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// `Writer.file_len` must reflect the preallocation. Otherwise
+    /// `ensure_len(want)` (called from `roll_over_region`) compares
+    /// `want` against a stale `region_size` and `set_len` *shrinks*
+    /// the preallocated file. We cross a region boundary by hand
+    /// and assert the file size is unchanged.
+    #[test]
+    fn test_writer_does_not_shrink_preallocation_on_region_roll() -> anyhow::Result<()> {
+        let base = "test_writer_does_not_shrink_preallocation_on_region_roll";
+        cleanup_channel_files(base);
+
+        let region_size = page_size();
+        let file_roll_size = (region_size as u64) * 4;
+        let initial_size = std::fs::metadata({
+            let _w = WriterBuilder::new(base)
+                .region_size(region_size)
+                .file_roll_size(file_roll_size)
+                .build()?;
+            base
+        })?
+        .len();
+        assert_eq!(initial_size, file_roll_size);
+
+        // Reopen and write until at least one intra-file region roll
+        // happens. Payload sized to need a fresh region per write
+        // (>= half a region).
+        let mut w = WriterBuilder::new(base)
+            .region_size(region_size)
+            .file_roll_size(file_roll_size)
+            .build()?;
+        let payload_size = region_size / 2 + 64;
+        let payload = vec![0xAB_u8; payload_size];
+        // 4 regions in this file → 3 region-rolls before a file roll.
+        for n in 0..3 {
+            let buf = w.try_reserve(payload.len())?;
+            buf.copy_from_slice(&payload);
+            w.commit(n as u16, payload.len() as u32, 0)?;
+        }
+        drop(w);
+
+        let after_size = std::fs::metadata(base)?.len();
+        assert_eq!(
+            after_size, file_roll_size,
+            "preallocation was undone: file shrank from {file_roll_size} to {after_size}",
+        );
+
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// A v3.0.0-format file (created at `region_size`, not
+    /// preallocated) reopened by a 3.0.1+ writer must be promoted
+    /// to the full preallocated layout. Otherwise the migrated
+    /// channel keeps growing region-by-region under live readers.
+    #[test]
+    fn test_existing_file_reopen_promotes_to_preallocation() -> anyhow::Result<()> {
+        let base = "test_existing_file_reopen_promotes_to_preallocation";
+        cleanup_channel_files(base);
+
+        let region_size = page_size();
+        let file_roll_size = (region_size as u64) * 4;
+
+        // Simulate a v3.0.0-created file: drop a writer with
+        // file_roll_size = 0 so it preallocates only one region.
+        {
+            let _w = WriterBuilder::new(base).region_size(region_size).build()?;
+        }
+        assert_eq!(std::fs::metadata(base)?.len(), region_size as u64);
+
+        // Reopen with full preallocation configured.
+        let _w = WriterBuilder::new(base)
+            .region_size(region_size)
+            .file_roll_size(file_roll_size)
+            .build()?;
+        assert_eq!(std::fs::metadata(base)?.len(), file_roll_size);
+
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// The partial sweep must parse the middle component as `u64`
+    /// — unrelated siblings like `<base>.notes.partial` must
+    /// survive a `WriterBuilder::build`.
+    #[test]
+    fn test_partial_sweep_does_not_match_non_numeric() -> anyhow::Result<()> {
+        let base = "test_partial_sweep_does_not_match_non_numeric";
+        cleanup_channel_files(base);
+        let unrelated = format!("{base}.notes.partial");
+        let _ = std::fs::remove_file(&unrelated);
+
+        std::fs::write(&unrelated, b"user notes - keep me")?;
+        let _w = WriterBuilder::new(base)
+            .region_size(page_size())
+            .file_roll_size((page_size() as u64) * 2)
+            .build()?;
+        assert!(
+            Path::new(&unrelated).exists(),
+            "sweep destroyed a non-segment sibling",
+        );
+
+        std::fs::remove_file(&unrelated)?;
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// `cleanup_channel_files` must also remove crate-created
+    /// `.partial` siblings, otherwise the public "fresh start"
+    /// recipe leaks artifacts.
+    #[test]
+    fn test_cleanup_removes_partial_siblings() -> anyhow::Result<()> {
+        let base = "test_cleanup_removes_partial_siblings";
+        cleanup_channel_files(base);
+
+        std::fs::write(format!("{base}.{}", PARTIAL_SUFFIX), b"seq0")?;
+        std::fs::write(format!("{base}.1.{}", PARTIAL_SUFFIX), b"seq1")?;
+        std::fs::write(format!("{base}.2.{}", PARTIAL_SUFFIX), b"seq2")?;
+        std::fs::write(format!("{base}.keep.partial"), b"unrelated")?;
+
+        cleanup_channel_files(base);
+
+        assert!(!Path::new(&format!("{base}.{}", PARTIAL_SUFFIX)).exists());
+        assert!(!Path::new(&format!("{base}.1.{}", PARTIAL_SUFFIX)).exists());
+        assert!(!Path::new(&format!("{base}.2.{}", PARTIAL_SUFFIX)).exists());
+        assert!(
+            Path::new(&format!("{base}.keep.partial")).exists(),
+            "cleanup destroyed an unrelated sibling",
+        );
+
+        std::fs::remove_file(format!("{base}.keep.partial"))?;
+        Ok(())
+    }
+
+    /// `WriterBuilder::build` with a non-zero `file_roll_size`
+    /// preallocates the first segment to that full size (rather
+    /// than just one region). Eliminates the intra-file mmap-vs-
+    /// `set_len` race in `roll_over_region` — by the time the
+    /// writer crosses a region boundary, the file already has all
+    /// the backing pages it'll ever need within this segment.
+    ///
+    /// With `file_roll_size = 0` (unbounded growth), preallocation
+    /// has no upper bound to target, so the file is born at one
+    /// region size and grown on demand via `ensure_len`.
+    #[test]
+    fn test_fresh_file_preallocates_to_file_roll_size() -> anyhow::Result<()> {
+        let base = "test_fresh_file_preallocates_to_file_roll_size";
+        cleanup_channel_files(base);
+
+        let region_size = page_size();
+        let file_roll_size = (region_size as u64) * 8;
+
+        let _w = WriterBuilder::new(base)
+            .region_size(region_size)
+            .file_roll_size(file_roll_size)
+            .build()?;
+        let actual = std::fs::metadata(base)?.len();
+        assert_eq!(
+            actual, file_roll_size,
+            "preallocation: fresh file size mismatch"
+        );
+
+        cleanup_channel_files(base);
+
+        // `file_roll_size = 0` ⇒ no upper bound to preallocate to;
+        // fall back to one region.
+        let _w = WriterBuilder::new(base).region_size(region_size).build()?;
+        let actual = std::fs::metadata(base)?.len();
+        assert_eq!(
+            actual, region_size as u64,
+            "no-roll case should fall back to one region"
+        );
+
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// Hammer test: a writer rolling segments aggressively (tiny
+    /// `file_roll_size`, `keep_files=2`) plus a late-joining
+    /// reader walking the channel from segment 0 forward. The
+    /// pre-rename design means the reader's scan never surfaces
+    /// a partially-initialised file, so no SIGBUS and no spurious
+    /// `unsupported format_version` / size-mismatch errors.
+    ///
+    /// The test would still pass against the old pre-rename code on
+    /// many runs (the race window is narrow), so the assertion
+    /// floor is: many rolls happen, the reader sees a strict prefix
+    /// `commit(length)` must match the size passed to the matching
+    /// `try_reserve`. After Route C, the slot-i+1 pre-install is
+    /// positioned based on the reserved size, so a smaller `length`
+    /// at commit time would leave the reader's walk landing past
+    /// the pre-installed slot. Enforced as an `Err`.
+    #[test]
+    fn test_commit_length_must_match_reserved_size() -> anyhow::Result<()> {
+        let base = "test_commit_length_must_match_reserved_size";
+        cleanup_channel_files(base);
+
+        let mut w = WriterBuilder::new(base).region_size(page_size()).build()?;
+
+        let _buf = w.try_reserve(128)?;
+        let err = w
+            .commit(0, 64, 0)
+            .expect_err("commit with smaller length must error");
+        assert!(
+            err.to_string()
+                .contains("commit length 64 does not match try_reserve size 128"),
+            "unexpected error: {err}",
+        );
+
+        // commit without a preceding reserve also errors (the prior
+        // failed commit consumed pending_msg_size).
+        let err = w
+            .commit(0, 128, 0)
+            .expect_err("commit after a failed commit must require a fresh reserve");
+        assert!(
+            err.to_string()
+                .contains("commit without preceding try_reserve"),
+            "unexpected error: {err}",
+        );
+
+        // Bare commit with no reserve at all: same error path.
+        let err = w
+            .commit(0, 0, 0)
+            .expect_err("commit with no preceding reserve must error");
+        assert!(
+            err.to_string()
+                .contains("commit without preceding try_reserve"),
+            "unexpected error: {err}",
+        );
+
+        // Sanity: a matched reserve+commit still works after the
+        // error path leaves `pending_msg_size = None`.
+        let buf = w.try_reserve(8)?;
+        buf.copy_from_slice(&[0xAB_u8; 8]);
+        w.commit(7, 8, 0)?;
+        drop(w);
+
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// An abandoned reservation (try_reserve without commit) must
+    /// not survive an explicit `roll_file()` — otherwise a follow-up
+    /// `commit` would publish a zero-payload record at slot 0 of the
+    /// NEW segment. Same hazard applies to internal region rolls.
+    #[test]
+    fn test_abandoned_reservation_does_not_survive_roll() -> anyhow::Result<()> {
+        let base = "test_abandoned_reservation_does_not_survive_roll";
+        cleanup_channel_files(base);
+
+        let mut w = WriterBuilder::new(base)
+            .region_size(page_size())
+            .file_roll_size((page_size() as u64) * 4)
+            .build()?;
+
+        // Abandoned reservation in OLD segment.
+        let _abandoned = w.try_reserve(8)?;
+
+        // Explicit roll. Pending reservation refers to a slot in the
+        // file we're leaving.
+        w.roll_file()?;
+
+        // commit with the same length the abandoned reserve used —
+        // would have erroneously published a zero-payload record at
+        // NEW segment's slot 0 without the invalidation fix.
+        let err = w
+            .commit(0, 8, 0)
+            .expect_err("commit must require a fresh reserve after roll_file");
+        assert!(
+            err.to_string()
+                .contains("commit without preceding try_reserve"),
+            "unexpected error: {err}",
+        );
+
+        // Sanity: a fresh reserve+commit on NEW segment still works.
+        let buf = w.try_reserve(8)?;
+        buf.copy_from_slice(&[0xCD_u8; 8]);
+        w.commit(9, 8, 0)?;
+        drop(w);
+
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// Crash-recovery invariant after the Route-C refactor:
+    /// `try_reserve` pre-installs slot i+1 *before* `commit` flips
+    /// committed=1, so a crash between `commit(i)` and the publish_wp
+    /// that follows still leaves the channel reopenable. Simulate by
+    /// dropping a writer mid-stream — the next `WriterBuilder::build`
+    /// must succeed.
+    #[test]
+    fn test_writer_reopens_after_commit_without_publish_wp() -> anyhow::Result<()> {
+        let base = "test_writer_reopens_after_commit_without_publish_wp";
+        cleanup_channel_files(base);
+
+        let region_size = page_size();
+        let payload: [u8; 16] = [0xCD; 16];
+
+        // Write a couple of records cleanly so there's prior state.
+        {
+            let mut w = WriterBuilder::new(base).region_size(region_size).build()?;
+            for n in 0..2 {
+                let buf = w.try_reserve(payload.len())?;
+                buf.copy_from_slice(&payload);
+                w.commit(n as u16, payload.len() as u32, 0)?;
+            }
+        }
+
+        // Synthesise the post-commit-pre-publish_wp state: rewind the
+        // on-disk wp by one record. With the Route-C pre-install in
+        // `try_reserve`, the slot the recovery code lands on must
+        // already bear the pre-install signature.
+        let record_size = (HEADER_SLOT + payload.len()).next_multiple_of(ALIGN) as u64;
+        rewind_write_position_on_disk(base, record_size)?;
+
+        // Reopen must succeed and recover by advancing one record.
+        let _w = WriterBuilder::new(base).region_size(region_size).build()?;
+
+        // Two records still readable.
+        let mut r = Reader::open(base, ReaderMode::LateJoin)?;
+        assert!(r.try_read()?.is_some());
+        assert!(r.try_read()?.is_some());
+        assert!(r.try_read()?.is_none());
+
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    #[test]
+    fn test_concurrent_rolls_and_latejoin_reader() -> anyhow::Result<()> {
+        use std::thread;
+        use std::time::Duration;
+
+        let base = "test_concurrent_rolls_and_latejoin_reader";
+        cleanup_channel_files(base);
+
+        let region_size = page_size();
+        // Force many rolls: one segment per a few messages.
+        let file_roll_size = region_size as u64;
+        let n_writes: u16 = 200;
+
+        let writer_base = base.to_string();
+        let writer_thread = thread::spawn(move || -> anyhow::Result<()> {
+            let mut w = WriterBuilder::new(&writer_base)
+                .region_size(region_size)
+                .file_roll_size(file_roll_size)
+                .keep_files(2)
+                .build()?;
+            for n in 0..n_writes {
+                let buf = w.try_reserve(16)?;
+                buf.copy_from_slice(&[n as u8; 16]);
+                w.commit(n, 16, 0)?;
+                if n.is_multiple_of(7) {
+                    thread::sleep(Duration::from_micros(50));
+                }
+            }
+            Ok(())
+        });
+
+        // Reader joins late-ish and is allowed to lag.
+        thread::sleep(Duration::from_millis(20));
+        let mut r = Reader::open(base, ReaderMode::LateJoin)?;
+        let mut seen: u32 = 0;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            match r.try_read() {
+                Ok(Some(_msg)) => {
+                    seen += 1;
+                }
+                Ok(None) => {
+                    if writer_thread.is_finished() {
+                        // Drain any remaining buffered messages once
+                        // more before declaring done.
+                        while let Ok(Some(_)) = r.try_read() {
+                            seen += 1;
+                        }
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(e) => {
+                    panic!("reader try_read returned an error: {e:?}");
+                }
+            }
+        }
+        writer_thread.join().expect("writer thread")?;
+        assert!(
+            seen > 0,
+            "reader should observe at least some of the writes (saw {seen})"
+        );
         cleanup_channel_files(base);
         Ok(())
     }

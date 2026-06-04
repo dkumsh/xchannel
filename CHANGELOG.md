@@ -1,5 +1,89 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+- Fresh segment files are prepared in `<base>.<N>.partial` (or
+  `<base>.partial` for sequence 0), `set_len` to the
+  region-rounded `file_roll_size`, channel header + first user
+  header pre-installed, then atomically renamed. Closes two
+  reader-side SIGBUS races:
+
+  1. **Fresh-file race.** A concurrent reader could open a
+     newly-created segment before the writer's `set_len` landed
+     and fault on phantom pages. The temp file is invisible to
+     `find_all_sequences` until renamed.
+  2. **Intra-file region-extension race.** `roll_over_region`
+     used to grow the file by one region when crossing a region
+     boundary inside a segment. Fresh files now ship preallocated
+     to the full `file_roll_size` (rounded up to a region
+     boundary), so the `ensure_len` call in `roll_over_region`
+     is a no-op for any `file_roll_size > 0`.
+
+  Effect for `file_roll_size = 0` (unbounded single file): the
+  intra-file race survives in that one configuration only —
+  there is no upper bound to preallocate against.
+
+- Existing files reopened by a 3.0.1+ writer with
+  `file_roll_size > 0` are promoted to the preallocated layout
+  on first open (migration of channels created by 3.0.0).
+- `WriterBuilder::build` sweeps stale `<base>.partial` /
+  `<base>.<N>.partial` siblings. The middle component is parsed
+  as `u64` so unrelated siblings (`<base>.notes.partial`)
+  survive.
+- `cleanup_channel_files` also removes `<base>.partial` /
+  `<base>.<N>.partial` siblings — partials are crate-created
+  artifacts and the public cleanup helper is the canonical
+  "fresh start" entry point.
+- `WriterBuilder::build` returns `InvalidInput` if
+  `file_roll_size` is within `region_size` of `u64::MAX` (i.e.
+  rounding up to a region boundary would overflow). Previously
+  this would panic in debug or silently wrap in release.
+- `commit()` no longer pre-installs slot i+1 — the pre-install
+  has moved to `try_reserve()`, which now lays down the slot-i+1
+  signature before returning the buffer for slot i. Closes the
+  FORMAT.md §9.6 invariant violation (committed=1 was being
+  published before slot i+1's signature was in place) and at the
+  same time removes one cacheline write from `commit()`'s
+  producer→consumer critical path. Crash recovery sees the
+  pre-installed slot whether the crash falls between reserve and
+  commit, between commit and publish_wp, or after publish_wp.
+- `roll_file()` publishes the rolled segment in two phases so a
+  reader following the Roll marker always finds the next file
+  on disk:
+
+  1. Prepare NEW as `<base>.<N+1>.partial`.
+  2. Stage OLD's Roll header with `committed=0` (invisible to
+     readers).
+  3. `rename` NEW's `.partial` to its final name — NEW is now on
+     disk under the path readers will open.
+  4. Release-store `committed=1` on OLD's Roll header — readers
+     wake here, immediately resolve NEW via the path that became
+     visible in step 3.
+  5. Bump OLD's `write_position` past the Roll marker, then swap
+     `self` to NEW.
+
+  Fixes a `ping_pong` regression where readers observed the
+  Roll marker before NEW's final name existed, failing the
+  reader-side `open()` with `NotFound`.
+- `commit()` enforces that its `length` argument matches the
+  size passed to the matching `try_reserve` — the slot-i+1
+  pre-install in `try_reserve` is positioned based on that
+  size, and a smaller `length` would leave the reader's walk
+  past record `i` landing on bytes that were never
+  pre-installed. Errors with `commit length N does not match
+  try_reserve size M`.
+- `roll_file()`'s rare grow-to-end branch is `set_len`
+  shrink-safe: extends only when `needed_end > self.file_len`,
+  so a future code path can't truncate the preallocated OLD
+  segment back down to a region boundary.
+- Internal refactor: extracted `Writer::prepare_segment_at(partial_path, ...)`
+  from `open_file`. Both call sites (initial open and roll) use it;
+  open_file renames immediately, roll_file defers the rename
+  until after the OLD Roll publish.
+- No wire-format change. The `<base>.<N>` final names and the
+  bytes inside them are unchanged from 3.0.0.
+
 ## 3.0.0 (2026-05-20)
 
 ### Breaking
