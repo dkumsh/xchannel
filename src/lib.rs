@@ -180,6 +180,12 @@ impl WriterBuilder {
         self.region_size = region_size;
         self
     }
+    /// Max bytes per segment file before rolling to the next. `0`
+    /// (default) disables rolling: a single file grown region-by-region.
+    /// A non-zero size is eagerly preallocated (sparse) on segment
+    /// creation, rounded up to a `region_size` multiple, must be at least
+    /// `2 * region_size`, and must not exceed `i64::MAX` (the OS
+    /// file-offset limit).
     #[inline]
     pub fn file_roll_size(mut self, file_roll_size: u64) -> Self {
         self.file_roll_size = file_roll_size;
@@ -233,6 +239,21 @@ impl WriterBuilder {
     /// Create or open the latest sequence file and return a Writer.
     #[inline]
     pub fn build(self) -> io::Result<Writer> {
+        // Nonzero roll size needs >= 2 regions: region 0's head holds the
+        // channel header, so one region can't fit a full-size record.
+        if self.file_roll_size != 0
+            && self.file_roll_size < (self.region_size as u64).saturating_mul(2)
+        {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "file_roll_size {} must be 0 or span at least two regions \
+                     (2 * region_size = {})",
+                    self.file_roll_size,
+                    (self.region_size as u64).saturating_mul(2),
+                ),
+            ));
+        }
         sweep_stale_partial_files(&self.path);
         Writer::open_or_create(
             self.path,
@@ -443,7 +464,15 @@ impl Writer {
             .write(true)
             .create_new(true)
             .open(partial_path)?;
-        file.set_len(initial_len)?;
+        file.set_len(initial_len).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!(
+                    "set_len({initial_len}) failed preallocating segment \
+                     (file_roll_size {file_roll_size}, region_size {region_size}): {e}"
+                ),
+            )
+        })?;
         let mut region0 = RegionMapping::create_writable(&file, 0, region_size)?;
 
         // 1) message header (Channel)
@@ -1974,18 +2003,31 @@ fn preallocation_len(region_size: usize, file_roll_size: u64) -> io::Result<u64>
     }
     let r = region_size as u64;
     let rem = file_roll_size % r;
-    if rem == 0 {
-        return Ok(file_roll_size);
-    }
-    file_roll_size.checked_add(r - rem).ok_or_else(|| {
-        io::Error::new(
+    let len = if rem == 0 {
+        file_roll_size
+    } else {
+        file_roll_size.checked_add(r - rem).ok_or_else(|| {
+            io::Error::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "file_roll_size {file_roll_size} cannot be rounded up to a \
+                     region_size {region_size} multiple without overflowing u64",
+                ),
+            )
+        })?
+    };
+    // `set_len`/`ftruncate` use an i64 `off_t`; a length past i64::MAX is
+    // unrepresentable and otherwise fails deep in the OS with an opaque error.
+    if len > i64::MAX as u64 {
+        return Err(io::Error::new(
             ErrorKind::InvalidInput,
             format!(
-                "file_roll_size {file_roll_size} cannot be rounded up to a \
-                 region_size {region_size} multiple without overflowing u64",
+                "file_roll_size {file_roll_size} (region-aligned to {len}) exceeds \
+                 the max file offset i64::MAX; use 0 to disable rolling",
             ),
-        )
-    })
+        ));
+    }
+    Ok(len)
 }
 
 /// Unlink any `<base>.partial` / `<base>.<N>.partial` siblings.
@@ -3265,6 +3307,54 @@ mod tests {
         cleanup_channel_files(base);
     }
 
+    /// A roll size that rounds up past `i64::MAX` (the `off_t` ceiling
+    /// `set_len` accepts) must be rejected up front with a clear error,
+    /// not fail deep in the OS. `i64::MAX` is not region-aligned, so it
+    /// rounds up to `2^63`, one past the limit.
+    #[test]
+    fn test_preallocation_rejects_roll_size_past_i64_max() {
+        let base = "test_preallocation_rejects_roll_size_past_i64_max";
+        cleanup_channel_files(base);
+        let err = WriterBuilder::new(base)
+            .region_size(page_size())
+            .file_roll_size(i64::MAX as u64)
+            .build()
+            .err()
+            .expect("must refuse a roll size past i64::MAX");
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("i64::MAX"),
+            "unexpected error: {err}",
+        );
+        let partial = format!("{base}.{}", PARTIAL_SUFFIX);
+        assert!(!Path::new(&partial).exists());
+        cleanup_channel_files(base);
+    }
+
+    /// A nonzero roll size below two regions is non-viable: region 0's
+    /// head holds the channel header, so one region can't fit a
+    /// full-size record. `build` must reject it up front.
+    #[test]
+    fn test_build_rejects_roll_size_below_two_regions() {
+        let base = "test_build_rejects_roll_size_below_two_regions";
+        cleanup_channel_files(base);
+        let r = page_size();
+        let err = WriterBuilder::new(base)
+            .region_size(r)
+            .file_roll_size(r as u64) // exactly one region — needs >= 2
+            .build()
+            .err()
+            .expect("must refuse a sub-two-region roll size");
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("two regions"),
+            "unexpected error: {err}",
+        );
+        let partial = format!("{base}.{}", PARTIAL_SUFFIX);
+        assert!(!Path::new(&partial).exists());
+        cleanup_channel_files(base);
+    }
+
     /// `file_roll_size` not a multiple of `region_size` (e.g. the
     /// README's 10_000_000) must round up to a whole region, since
     /// readers' mmaps always cover whole regions and would
@@ -3490,24 +3580,11 @@ mod tests {
         drop(w);
         cleanup_channel_files(base);
 
-        // File-roll case: msg_size fits in a region but not in
-        // file_roll_size (which is smaller than a region's worth of
-        // payload here).
-        let small_roll = region_size as u64;
-        let mut w = WriterBuilder::new(base)
-            .region_size(region_size)
-            .file_roll_size(small_roll)
-            .build()?;
-        let too_big_for_roll = (small_roll as usize) - HEADER_SLOT; // leaves no room for next-hdr
-        let err = w
-            .try_reserve(too_big_for_roll)
-            .expect_err("reservation too large for file_roll_size must error");
-        assert!(
-            err.to_string().contains("cannot fit in"),
-            "unexpected error: {err}",
-        );
-        drop(w);
-        cleanup_channel_files(base);
+        // The file-roll capacity path (needed_total > file_roll_size) is
+        // unreachable for valid configs: file_roll_size >= 2 * region_size,
+        // so the region-size cap above always fires first. Sub-two-region
+        // roll sizes are rejected at build (see
+        // test_build_rejects_roll_size_below_two_regions).
 
         Ok(())
     }
@@ -3676,8 +3753,8 @@ mod tests {
         cleanup_channel_files(base);
 
         let region_size = page_size();
-        // Force many rolls: one segment per a few messages.
-        let file_roll_size = region_size as u64;
+        // Force many rolls: smallest valid roll size (two regions).
+        let file_roll_size = region_size as u64 * 2;
         let n_writes: u16 = 200;
 
         let writer_base = base.to_string();

@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+- `WriterBuilder::build` now rejects a nonzero `file_roll_size` smaller
+  than `2 * region_size`. Region 0's head holds the channel header and
+  pre-installed first user header, so a single-region file cannot host a
+  full-region record — it would roll on the first large message. (Breaking
+  for sub-two-region roll sizes, which were never viable.)
+
+### Fixed
+- `WriterBuilder::build` now rejects a `file_roll_size` that rounds up
+  past `i64::MAX` (e.g. `i64::MAX` itself) with a clear `InvalidInput`
+  error naming the limit, instead of failing deep inside `set_len` with
+  an opaque "out of range integral type conversion". The prior guard
+  only checked `u64` overflow, but `set_len`'s offset is an i64 `off_t`.
+- `set_len` failures during segment preallocation (e.g. `EFBIG` when the
+  rounded `file_roll_size` exceeds the filesystem's max file size) are
+  wrapped with context naming `file_roll_size` / `region_size`.
+
+### Docs
+- `WriterBuilder::file_roll_size` documents the `0` = no-rolling
+  sentinel, eager (sparse) preallocation, region rounding, and the
+  `i64::MAX` cap.
+
 ## 3.0.1 (2026-06-04)
 
 ### Changed
