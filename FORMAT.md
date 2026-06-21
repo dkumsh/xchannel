@@ -5,7 +5,7 @@ non-Rust implementations (readers, validators, archival tools) can interoperate
 with files produced by the Rust crate. The Rust source in `src/channel.rs`
 and `src/lib.rs` is the executable reference; this document is the contract.
 
-Status: **draft, format_version = 1.**
+Status: **draft, format_version = 2.**
 
 ---
 
@@ -61,29 +61,31 @@ sequence number.
 
 ---
 
-## 3. ChannelHeader (format_version = 1)
+## 3. ChannelHeader (format_version = 2)
 
 Located at byte offset `16` of file region 0 (immediately after the
-`MessageHeader(Channel)` that opens region 0). Total size: 64 bytes.
+`MessageHeader(Channel)` that opens region 0). Total size: 128 bytes.
 
 | Offset | Size | Field                 | Type   | Description |
 |-------:|-----:|-----------------------|--------|-------------|
 |      0 |    8 | `write_position`      | u64    | Advisory: byte offset (from file start) of the next header slot to be written. Used only by `Live` reader join and writer reopen; not on the read steady-state path. |
-|      8 |    8 | `message_count`       | u64    | Advisory: monotonic count of records published in this file. |
-|     16 |    8 | `channel_sequence`    | u64    | `0` for `<base>`, `1` for `<base>.1`, etc. |
-|     24 |    4 | `region_size`         | u32    | Region size in bytes. Multiple of OS page size. |
-|     28 |    4 | `mtu`                 | u32    | Max user payload bytes; `0` = unlimited. |
-|     32 |    2 | `format_version`      | u16    | This document describes version `1`. Version `0` denotes a pre-spec file (see §8). |
-|     34 |    1 | `endianness`          | u8     | `0x01` = little-endian. Other values reserved. |
-|     35 |    1 | `system_header_size`  | u8     | Size of the system-owned bytes inside `MessageHeader` (`8` for version 1). |
-|     36 |    1 | `user_header_size`    | u8     | Size of the user-metadata bytes inside `MessageHeader` (`8` for version 1). |
-|     37 |    3 | `_reserved`           | u8[3]  | Must be zero. |
-|     40 |    4 | `user_header_kind`    | u32    | Reserved discriminant identifying the layout of the user-metadata bytes. Current writers emit `0` (the default `{message_type:u16, user_meta_u64:u64}` layout described in §4) and current readers refuse anything else. Non-zero values are reserved for future user-defined layouts; a Rust opt-in API for those layouts is intentionally not exposed today. |
-|     44 |   20 | `channel_name`        | u8[20] | Optional channel name; unused bytes are zero. |
+|      8 |    8 | `message_count`       | u64    | Advisory: count of **user** records published in *this file*. Starts at `0`; incremented once per `commit`. Does **not** count the `Channel` header or `Skip` markers. |
+|     16 |    8 | `base_record_index`   | u64    | Absolute index of this file's first user record, counted from channel genesis across all rolls. `0` for a genesis channel; immutable once the file is created. `base_record_index + message_count` is the absolute index of the next user record (the channel head). |
+|     24 |    8 | `channel_sequence`    | u64    | Rolling file ordinal: `0` for `<base>`, `1` for `<base>.1`, etc. On open, readers and writers verify this equals the sequence parsed from the file's path and refuse a mismatch (catches a renamed/misplaced/swapped segment). |
+|     32 |    4 | `region_size`         | u32    | Region size in bytes. Multiple of OS page size. |
+|     36 |    4 | `mtu`                 | u32    | Max user payload bytes; `0` = unlimited. |
+|     40 |    2 | `format_version`      | u16    | This document describes version `2`. Versions `0`/`1` are earlier formats this build does not read (see §8). |
+|     42 |    1 | `endianness`          | u8     | `0x01` = little-endian. Other values reserved. |
+|     43 |    1 | `system_header_size`  | u8     | Size of the system-owned bytes inside `MessageHeader` (`8`). |
+|     44 |    4 | `user_header_kind`    | u32    | Reserved discriminant identifying the layout of the user-metadata bytes. Current writers emit `0` (the default `{message_type:u16, user_meta_u64:u64}` layout described in §4) and current readers refuse anything else. Non-zero values are reserved for future user-defined layouts; a Rust opt-in API for those layouts is intentionally not exposed today. Placed at this 4-aligned offset so the surrounding byte fields need no padding. |
+|     48 |    1 | `user_header_size`    | u8     | Size of the user-metadata bytes inside `MessageHeader` (`8`). |
+|     49 |   20 | `channel_name`        | u8[20] | Optional channel name; unused bytes are zero. |
+|     69 |   59 | `_reserved2`          | u8[59] | Reserved for future additive fields. Zero-filled; readers must ignore. Additive, optional, zero-default fields may consume this space **without** a `format_version` bump; any field that changes existing semantics must bump the version. |
 
-The `MessageHeader(Channel)` at offset `0` covers the bytes `[16, 80)`; its
-`length` field is `64` (size of `ChannelHeader`). Its `committed` byte is
-`1`.
+The `MessageHeader(Channel)` at offset `0` covers the bytes `[16, 144)`; its
+`length` field is `128` (size of `ChannelHeader`). Its `committed` byte is
+`1`. The first user record therefore begins at file offset `align_up(16 +
+128)` = `144` (versus `80` in format_version 1).
 
 ---
 
@@ -114,7 +116,7 @@ user-owned bytes but must preserve the system fields at their fixed offsets.
 
 | Value | Name      | Meaning |
 |------:|-----------|---------|
-|     0 | `Channel` | First record in region 0. Followed by a `ChannelHeader`. Length = 64. |
+|     0 | `Channel` | First record in region 0. Followed by a `ChannelHeader`. Length = 128. |
 |     1 | `User`    | User payload record. Length = payload bytes. |
 |     2 | `Skip`    | Padding to the end of the current region. Length = bytes of padding (excluding the 16-byte header itself). Readers skip past `16 + length` bytes. |
 |     3 | `Roll`    | Last record in this file. Length = 0. Readers open the next file (`<base>.<n+1>`) and continue from offset 0. |
@@ -159,8 +161,9 @@ For each user record `i`:
    plus the release-store in step 6.
 6. Writer publishes record `i` by storing `committed = 1` to header `i`
    with release semantics.
-7. Writer updates `ChannelHeader.write_position` and
-   `ChannelHeader.message_count` (relaxed; advisory).
+7. Writer updates `ChannelHeader.write_position` and increments
+   `ChannelHeader.message_count` (relaxed; advisory). `message_count` counts
+   **user** records only — see §6.1 for why `Skip` does not increment it.
 
 Readers observe `committed = 1` with acquire semantics and then read the
 header fields and payload. The pre-installed header at slot `i+1`
@@ -172,7 +175,9 @@ well-formed (though not necessarily committed) header.
 If a record plus a pre-installed next-header slot does not fit in the
 remaining region, the writer publishes a `Skip` record at the current
 position covering the remaining bytes of the region, then begins record
-`i` at offset 0 of the next region.
+`i` at offset 0 of the next region. A `Skip` is not a user record: the
+writer advances `write_position` but does **not** increment
+`message_count`, so `message_count` remains a count of user records only.
 
 ### 6.2 File boundary
 
@@ -201,11 +206,15 @@ transitions to `1`.
 
 ## 8. Versioning and forward compatibility
 
-xchannel 3.0 introduces this format with `format_version = 1`. Files
-produced by xchannel ≤ 2.2 are not supported; open them with the older
-crate version or regenerate.
+xchannel 4.0 introduces `format_version = 2`, which widens `ChannelHeader`
+to 128 bytes (adding `base_record_index` and reserved space) and redefines
+`message_count` as a per-file user-record count. Because the header grew,
+the records area shifts (first user record at offset 144 instead of 80), so
+v2 is **greenfield**: there is no in-place migration, and files at
+`format_version` `0` or `1` are not read by this build — regenerate them
+with a 4.0 writer, or keep using an older crate version to read them.
 
-- A reader that sees `format_version != 1` must refuse the file.
+- A reader that sees `format_version != 2` must refuse the file.
 - A reader that sees `endianness != 0x01` must refuse the file. (Only
   little-endian is defined today; values are reserved for future use.)
 - A reader that sees `user_header_kind != 0` must refuse the file unless

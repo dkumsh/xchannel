@@ -1,8 +1,36 @@
 # Changelog
 
-## Unreleased
+## 4.0.0 (2026-06-21)
+
+### Added
+- **`format_version = 2`**: `ChannelHeader` widened from 64 to 128 bytes.
+  New field `base_record_index` records the absolute index of a file's first
+  user record, counted from channel genesis across all rolls, so the absolute
+  record index is monotonic and survives rolls, retention, and writer restart.
+  59 bytes are reserved for future additive fields.
+- `WriterBuilder::base_record_index(u64)` seeds the first record's absolute
+  index when *creating* a channel (default 0; ignored when reopening). Intended
+  for replicas of a remote channel whose genesis was retention-truncated.
+- `Writer::next_record_index() -> u64` (the channel head, `base_record_index +
+  message_count`) and `Reader::base_record_index() -> u64` (the current file's
+  base, refreshed as the reader follows rolls).
+- On open, writers and readers now verify a segment's `channel_sequence` matches
+  the sequence parsed from its file path, refusing a renamed/misplaced/swapped
+  segment with an `InvalidData` error.
+
+### Removed
+- The v2→v3 migration (`migrate` module and the `xch-migrate` example). With
+  the `format_version = 2` change the format is greenfield; cross-version
+  migration is no longer provided.
 
 ### Changed
+- **Breaking / greenfield:** `message_count` is now a per-file count of **user**
+  records only — it starts at 0 and is no longer bumped by the `Channel` header
+  or `Skip` markers. Combined with the header growth, the records area shifts
+  (first user record at offset 144 instead of 80), so v2 does not read v0/v1
+  files in place. There is no in-place migration; regenerate channels with a v2
+  writer, or keep an older crate version to read old files. A reader that sees
+  `format_version != 2` refuses the file.
 - `WriterBuilder::build` now rejects a nonzero `file_roll_size` smaller
   than `2 * region_size`. Region 0's head holds the channel header and
   pre-installed first user header, so a single-region file cannot host a

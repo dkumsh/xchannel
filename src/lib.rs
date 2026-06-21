@@ -19,7 +19,6 @@
 //! IPC this is fine. Publishing uses `Release` and reading uses `Acquire`.
 
 mod channel;
-pub mod migrate;
 mod region;
 
 use channel::{
@@ -75,9 +74,16 @@ fn get_channel_header<'a>(region_ptr: *const u8) -> &'a ChannelHeader {
 
 /// Validate the v1 format invariants of a `ChannelHeader` (see FORMAT.md §8).
 /// `expected_region_size` is checked against the value in the header.
+/// `expected_sequence` is checked against `channel_sequence`: the header's
+/// self-described file ordinal must match the sequence parsed from the file's
+/// path, catching a renamed, misplaced, or swapped segment file.
 /// `user_header_kind` must equal `USER_HEADER_KIND_DEFAULT`; the wire field is
 /// reserved for future user-defined layouts and has no public opt-in today.
-fn validate_channel_header(ch: &ChannelHeader, expected_region_size: usize) -> io::Result<()> {
+fn validate_channel_header(
+    ch: &ChannelHeader,
+    expected_region_size: usize,
+    expected_sequence: u64,
+) -> io::Result<()> {
     if ch.format_version != FORMAT_VERSION {
         return Err(err_invalid_data(format!(
             "unsupported format_version {} (this build expects {})",
@@ -106,6 +112,13 @@ fn validate_channel_header(ch: &ChannelHeader, expected_region_size: usize) -> i
         return Err(err_invalid_data(format!(
             "region_size mismatch: file={} expected={}",
             ch.region_size, expected_region_size
+        )));
+    }
+    if ch.channel_sequence != expected_sequence {
+        return Err(err_invalid_data(format!(
+            "channel_sequence mismatch: header={} but file is at sequence {} \
+             (renamed, misplaced, or swapped segment file?)",
+            ch.channel_sequence, expected_sequence
         )));
     }
     Ok(())
@@ -161,6 +174,7 @@ pub struct WriterBuilder {
     mtu: u64,
     keep_files: Option<u64>,
     channel_name: [u8; CHANNEL_NAME_MAX],
+    base_record_index: u64,
 }
 
 impl WriterBuilder {
@@ -172,7 +186,23 @@ impl WriterBuilder {
             mtu: 0,                   // default: no MTU limit
             keep_files: None,         // default: keep all rolled files
             channel_name: [0; CHANNEL_NAME_MAX],
+            base_record_index: 0, // default: genesis channel starts at index 0
         }
+    }
+
+    /// Set the absolute record index of the **first** record this channel will
+    /// hold, used only when *creating* a new channel (ignored when reopening an
+    /// existing one — the on-disk value wins). Defaults to 0 (genesis).
+    ///
+    /// The intended use is replicas: a node rebuilding a remote channel whose
+    /// genesis has been retention-truncated seeds the replica with the absolute
+    /// index of its first received record, so the replica's headers report
+    /// absolute (not replica-local) indices. `base_record_index + message_count`
+    /// remains the absolute index of the next record.
+    #[inline]
+    pub fn base_record_index(mut self, base: u64) -> Self {
+        self.base_record_index = base;
+        self
     }
 
     #[inline]
@@ -262,6 +292,7 @@ impl WriterBuilder {
             self.mtu,
             self.keep_files,
             self.channel_name,
+            self.base_record_index,
         )
     }
 
@@ -363,6 +394,7 @@ impl Writer {
         mtu: u64,
         keep_files: Option<u64>,
         channel_name: [u8; CHANNEL_NAME_MAX],
+        base_record_index: u64,
     ) -> io::Result<Self> {
         // Validate region invariants
         let ps = region::page_size();
@@ -412,6 +444,7 @@ impl Writer {
                 file_roll_size,
                 mtu,
                 &channel_name,
+                base_record_index,
             )?;
 
         Ok(Self {
@@ -449,6 +482,7 @@ impl Writer {
         file_roll_size: u64,
         mtu: u64,
         channel_name: &[u8; CHANNEL_NAME_MAX],
+        base_record_index: u64,
     ) -> io::Result<(
         File,
         RegionMapping<Writable>,
@@ -488,17 +522,20 @@ impl Writer {
         let ch_ptr = unsafe { mh_ptr.add(MESSAGE_HEADER_SIZE) as *mut ChannelHeader };
         unsafe {
             (*ch_ptr).write_position = AtomicU64::new(0);
-            (*ch_ptr).message_count = AtomicU64::new(1);
+            // Per-file user-record count, starting at 0. The Channel header and
+            // Skip markers are not counted; only `commit` (via `publish_wp`) bumps it.
+            (*ch_ptr).message_count = AtomicU64::new(0);
+            (*ch_ptr).base_record_index = base_record_index;
             (*ch_ptr).channel_sequence = sequence;
             (*ch_ptr).region_size = region_size as u32;
             (*ch_ptr).mtu = mtu as u32;
             (*ch_ptr).format_version = FORMAT_VERSION;
             (*ch_ptr).endianness = ENDIANNESS_LE;
             (*ch_ptr).system_header_size = SYSTEM_HEADER_SIZE;
-            (*ch_ptr).user_header_size = USER_HEADER_SIZE;
-            (*ch_ptr)._reserved = [0; 3];
             (*ch_ptr).user_header_kind = USER_HEADER_KIND_DEFAULT;
+            (*ch_ptr).user_header_size = USER_HEADER_SIZE;
             (*ch_ptr).channel_name = *channel_name;
+            (*ch_ptr)._reserved2 = [0; 59];
         }
 
         // 3) current region + first user header pre-install
@@ -539,6 +576,7 @@ impl Writer {
         file_roll_size: u64,
         mtu: u64,
         channel_name: &[u8; CHANNEL_NAME_MAX],
+        base_record_index: u64,
     ) -> io::Result<(
         File,
         RegionMapping<Writable>,
@@ -561,6 +599,9 @@ impl Writer {
                 let _ = std::fs::remove_file(&file_path);
             }
             let partial_path = make_partial_channel_file_path(base_path, sequence)?;
+            // Fresh genesis segment: the builder-supplied base (0 for a brand-new
+            // channel; the absolute start for a replica). When recovering an
+            // existing file below, the on-disk `base_record_index` wins instead.
             let prepared = Self::prepare_segment_at(
                 &partial_path,
                 sequence,
@@ -568,6 +609,7 @@ impl Writer {
                 file_roll_size,
                 mtu,
                 channel_name,
+                base_record_index,
             )?;
             std::fs::rename(&partial_path, &file_path)?;
             Ok(prepared)
@@ -581,7 +623,7 @@ impl Writer {
             // the file under a reader's mmap.
             let region0 = RegionMapping::create_writable(&file, 0, region_size)?;
             let ch = get_channel_header(region0.as_ptr());
-            validate_channel_header(ch, region_size)?;
+            validate_channel_header(ch, region_size, sequence)?;
 
             // wp denotes the **next header slot offset**
             let wp_payload = ch.write_position.load(Ordering::Relaxed) as usize;
@@ -694,6 +736,15 @@ impl Writer {
     #[inline]
     fn channel_header(&self) -> &ChannelHeader {
         unsafe { &*(self.channel_region.as_ptr().add(MESSAGE_HEADER_SIZE) as *const ChannelHeader) }
+    }
+
+    /// Absolute index (from channel genesis, across all rolls) of the **next**
+    /// user record this writer will commit — i.e. the current channel head.
+    /// Equals `base_record_index + message_count` of the active file.
+    #[inline]
+    pub fn next_record_index(&self) -> u64 {
+        let ch = self.channel_header();
+        ch.base_record_index + ch.message_count.load(Ordering::Relaxed)
     }
 
     #[inline]
@@ -946,6 +997,14 @@ impl Writer {
         // reader that observes Roll resolves NEW on the very next
         // path lookup.
         let next_seq = old_seq + 1;
+        // The new segment's first record continues the absolute numbering: it is
+        // OLD's base plus the count of user records written to OLD. `self` is still
+        // on OLD here, so its channel header carries both. (Skip markers never
+        // bumped `message_count`, so this is a pure user-record count.)
+        let new_base_record_index = {
+            let ch = self.channel_header();
+            ch.base_record_index + ch.message_count.load(Ordering::Relaxed)
+        };
         let new_partial_path = make_partial_channel_file_path(&self.base_path, next_seq)?;
         let new_final_path = make_channel_file_path(&self.base_path, next_seq)?;
         let (
@@ -962,6 +1021,7 @@ impl Writer {
             self.file_roll_size,
             self.mtu,
             &self.channel_name,
+            new_base_record_index,
         )?;
 
         // Publish Roll in OLD file BEFORE swapping `self` to NEW. If
@@ -1130,7 +1190,9 @@ impl Writer {
             self.current_region = new_region;
             self.current_region_index = next_idx;
             self.next_hdr_pos = new_wp;
-            self.publish_wp(new_wp + HEADER_SLOT);
+            // A Skip is not a user record: advance the advisory write_position but
+            // do not bump `message_count` (which counts user records only).
+            self.store_wp_local((new_wp + HEADER_SLOT) as u64);
             Ok(())
         } else {
             // Not even space for a header: jump straight to next region start
@@ -1160,7 +1222,8 @@ impl Writer {
             }
 
             self.next_hdr_pos = next_region_start;
-            self.publish_wp(next_region_start + HEADER_SLOT);
+            // Skip (no header fit either): advisory wp only, no user-record count bump.
+            self.store_wp_local((next_region_start + HEADER_SLOT) as u64);
             Ok(())
         }
     }
@@ -1324,6 +1387,8 @@ pub struct Reader {
     read_position: usize,
     region_size_cached: usize,
     channel_name_cached: [u8; CHANNEL_NAME_MAX],
+    /// `base_record_index` of the file currently open (updated on each roll).
+    base_record_index_cached: u64,
     batch_limit: Option<u16>,
     batch_segs: Vec<BatchSeg>,
     batch_pos: Vec<MsgPos>,
@@ -1367,12 +1432,14 @@ impl Reader {
         Err(last_err.unwrap_or_else(|| err_other("Reader::open: exhausted retries with no error")))
     }
 
-    /// Map region 0, validate v1 format invariants, and return
-    /// `(read_pos, region_size, channel_name)`.
+    /// Map region 0, validate format invariants (including that `channel_sequence`
+    /// matches `expected_sequence`), and return
+    /// `(read_pos, region_size, channel_name, base_record_index)`.
     fn read_channel_header(
         file: &File,
         mode: ReaderMode,
-    ) -> io::Result<(usize, usize, [u8; CHANNEL_NAME_MAX])> {
+        expected_sequence: u64,
+    ) -> io::Result<(usize, usize, [u8; CHANNEL_NAME_MAX], u64)> {
         let ps = region::page_size();
         let tmp_map = RegionMapping::create_read_only(file, 0, ps)?; // map one OS page
 
@@ -1388,7 +1455,7 @@ impl Reader {
 
         let ch = get_channel_header(tmp_map.as_ptr());
         let region_size = ch.region_size as usize;
-        validate_channel_header(ch, region_size)?;
+        validate_channel_header(ch, region_size, expected_sequence)?;
 
         let wp = ch.write_position.load(Ordering::Relaxed) as usize; // next header slot
         let read_pos = match mode {
@@ -1396,8 +1463,9 @@ impl Reader {
             ReaderMode::Live => wp.saturating_sub(HEADER_SLOT), // header slot
         };
         let channel_name = ch.channel_name;
+        let base_record_index = ch.base_record_index;
         drop(tmp_map);
-        Ok((read_pos, region_size, channel_name))
+        Ok((read_pos, region_size, channel_name, base_record_index))
     }
 
     fn open_sequence_file(base_path: PathBuf, sequence: u64, mode: ReaderMode) -> io::Result<Self> {
@@ -1407,7 +1475,8 @@ impl Reader {
             .write(false)
             .open(&file_path)?;
 
-        let (read_pos, region_size, channel_name) = Self::read_channel_header(&file, mode)?;
+        let (read_pos, region_size, channel_name, base_record_index) =
+            Self::read_channel_header(&file, mode, sequence)?;
         let region_index = (read_pos / region_size) as u64;
         let current_region =
             RegionMapping::create_read_only(&file, region_index * region_size as u64, region_size)?;
@@ -1425,6 +1494,7 @@ impl Reader {
             read_position: read_pos,
             region_size_cached: region_size,
             channel_name_cached: channel_name,
+            base_record_index_cached: base_record_index,
             batch_limit: None,
             batch_segs: Vec::with_capacity(DEFAULT_BATCH_SEGS_CAP),
             batch_pos: Vec::with_capacity(DEFAULT_BATCH_POS_CAP),
@@ -1441,6 +1511,15 @@ impl Reader {
             .position(|&b| b == 0)
             .unwrap_or(self.channel_name_cached.len());
         String::from_utf8_lossy(&self.channel_name_cached[..end])
+    }
+
+    /// Absolute index (from channel genesis) of the first user record in the file
+    /// the reader currently has open. Updated as the reader follows rolls. Combine
+    /// with the number of user records read so far in this file to get the absolute
+    /// index of any record. Genesis files report 0.
+    #[inline]
+    pub fn base_record_index(&self) -> u64 {
+        self.base_record_index_cached
     }
 
     #[inline(always)]
@@ -1923,10 +2002,13 @@ impl Reader {
             return Err(err_other("next file missing Channel header"));
         }
         let ch = get_channel_header(region0.as_ptr());
-        validate_channel_header(ch, region_size)?;
+        // `self.file_sequence` was incremented above to the new file's ordinal.
+        validate_channel_header(ch, region_size, self.file_sequence)?;
         // Refresh cached channel_name from the new file (the bytes are authoritative
         // even though in practice the name carries across rolls).
         self.channel_name_cached = ch.channel_name;
+        // Each rolled file has its own base; refresh so `base_record_index()` tracks it.
+        self.base_record_index_cached = ch.base_record_index;
 
         self.file = file;
         self.read_position = 0;
@@ -2561,6 +2643,7 @@ mod tests {
             mtu,
             None,
             [0; CHANNEL_NAME_MAX],
+            0, // base_record_index: genesis
         )?;
 
         let msg1: Vec<u8> = (0..100).map(|i| i as u8).collect();
@@ -2624,6 +2707,7 @@ mod tests {
             0,
             None,
             [0; CHANNEL_NAME_MAX],
+            0, // base_record_index: genesis
         )?;
 
         let payload0 = vec![0x10; 16];
@@ -2667,8 +2751,15 @@ mod tests {
 
         let region = crate::page_size();
         let file_roll_size = (region as u64) * 10;
-        let mut w =
-            Writer::open_or_create(base, region, file_roll_size, 0, None, [0; CHANNEL_NAME_MAX])?;
+        let mut w = Writer::open_or_create(
+            base,
+            region,
+            file_roll_size,
+            0,
+            None,
+            [0; CHANNEL_NAME_MAX],
+            0,
+        )?;
 
         // Choose len so that after header + payload the aligned end is region - header_size.
         let record_with_padding = region - HEADER_SLOT;
@@ -2718,6 +2809,7 @@ mod tests {
             0,
             None,
             [0; CHANNEL_NAME_MAX],
+            0, // base_record_index: genesis
         )?;
 
         let payload1 = vec![0xA1; 32];
@@ -2766,6 +2858,7 @@ mod tests {
             0,
             None,
             [0; CHANNEL_NAME_MAX],
+            0, // base_record_index: genesis
         )?;
 
         let start = align_up(MESSAGE_HEADER_SIZE + CHANNEL_HEADER_SIZE);
@@ -2817,6 +2910,7 @@ mod tests {
             0,
             None,
             [0; CHANNEL_NAME_MAX],
+            0, // base_record_index: genesis
         )?;
 
         let payload1 = vec![0x3A; 64];
@@ -2864,6 +2958,7 @@ mod tests {
             0,
             None,
             [0; CHANNEL_NAME_MAX],
+            0, // base_record_index: genesis
         )?;
 
         let mut reader = Reader::open(base, ReaderMode::Live)?;
@@ -2889,6 +2984,7 @@ mod tests {
             0,
             None,
             [0; CHANNEL_NAME_MAX],
+            0, // base_record_index: genesis
         )?;
 
         let mut reader = Reader::open(base, ReaderMode::LateJoin)?;
@@ -3107,9 +3203,12 @@ mod tests {
         let region_size = page_size();
         // Big payload to wedge near the end of region 0, so the next
         // try_reserve triggers a region roll. With region_size=4096 and
-        // 80 bytes of region-0 overhead, payload >= 3961 forces a roll
-        // on a subsequent 8-byte message. 3968 is the next aligned size.
-        let big = vec![0x77u8; 3968];
+        // 144 bytes of region-0 overhead (16-byte Channel MessageHeader +
+        // 128-byte ChannelHeader), payload >= 3897 forces a roll on a
+        // subsequent 8-byte message. 3904 is the next aligned size, chosen
+        // so the post-big next-header slot lands at 4064 (identical roll
+        // geometry to the pre-128-byte-header layout).
+        let big = vec![0x77u8; 3904];
         let small_payload: [u8; 8] = [0xEE; 8];
 
         // 1) Write one big message, then `try_reserve` an 8-byte slot —
@@ -3129,7 +3228,7 @@ mod tests {
 
         // 2) Rewind wp from its post-roll value back to the value it
         //    held *before* roll_over_region's publish_wp. With
-        //    region_size=4096 and big payload=3968: the Skip sits at
+        //    region_size=4096 and big payload=3904: the Skip sits at
         //    offset 4064 with skip_len=16 (total Skip record = 32 bytes,
         //    filling exactly to the region boundary). Pre-roll wp was
         //    4080 (set by the big message's publish_wp at the end of
@@ -3155,6 +3254,118 @@ mod tests {
         assert_eq!(m1.payload(), &small_payload);
         assert_eq!(m1.header().message_type, 2);
         assert!(r.try_read()?.is_none());
+
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// `base_record_index` accumulates across rolls so the absolute record
+    /// index is monotonic and restart-stable, and Skip markers do not inflate
+    /// it (only user records count).
+    #[test]
+    fn test_base_record_index_accumulates_across_rolls() -> anyhow::Result<()> {
+        let base = "test_base_record_index_accumulates";
+        cleanup_channel_files(base);
+
+        let region_size = page_size();
+        let file_roll_size = (region_size as u64) * 2; // small => many file rolls
+        let payload = [0x5Au8; 64]; // small => many region rolls (Skips) per file
+        let n = 200u64;
+
+        {
+            let mut w = WriterBuilder::new(base)
+                .region_size(region_size)
+                .file_roll_size(file_roll_size)
+                .build()?;
+            for i in 0..n {
+                // Head == count of user records committed so far, regardless of
+                // how many region/file rolls have happened in between.
+                assert_eq!(w.next_record_index(), i, "head before commit #{i}");
+                let buf = w.try_reserve(payload.len())?;
+                buf.copy_from_slice(&payload);
+                w.commit(0, payload.len() as u32, i)?;
+            }
+            // Exactly n — if Skip markers were counted, this would be larger.
+            assert_eq!(w.next_record_index(), n);
+        }
+
+        // Head is cumulative and survives reopen (read from the latest file header).
+        {
+            let w = WriterBuilder::new(base)
+                .region_size(region_size)
+                .file_roll_size(file_roll_size)
+                .build()?;
+            assert_eq!(
+                w.next_record_index(),
+                n,
+                "head survives reopen across rolls"
+            );
+        }
+
+        // Reader: every record's payload index is contiguous from 0..n, and the
+        // current file's base advances past 0 once we cross into a rolled file.
+        let mut r = ReaderBuilder::new(base).build()?; // LateJoin from earliest
+        assert_eq!(
+            r.base_record_index(),
+            0,
+            "earliest (genesis) file base is 0"
+        );
+        let mut count = 0u64;
+        let mut max_base = 0u64;
+        while let Some(m) = r.try_read()? {
+            assert_eq!(m.header().user_meta_u64, count, "records contiguous");
+            max_base = max_base.max(r.base_record_index());
+            count += 1;
+        }
+        assert_eq!(count, n);
+        assert!(
+            max_base > 0,
+            "expected a roll so a later file reports base > 0"
+        );
+
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// A segment file whose `channel_sequence` disagrees with the sequence in its
+    /// path (renamed/misplaced/swapped) is refused on open, by both Writer and Reader.
+    #[test]
+    fn test_rejects_segment_with_wrong_sequence() -> anyhow::Result<()> {
+        let base = "test_rejects_wrong_sequence";
+        cleanup_channel_files(base);
+        let region_size = page_size();
+
+        // One segment at sequence 0 (its header records channel_sequence = 0).
+        {
+            let mut w = WriterBuilder::new(base).region_size(region_size).build()?;
+            let buf = w.try_reserve(8)?;
+            buf.copy_from_slice(&[1u8; 8]);
+            w.commit(0, 8, 0)?;
+        }
+
+        // Move that file to the sequence-1 path: now the only segment sits at
+        // sequence 1 but its header still claims channel_sequence = 0.
+        let p0 = make_channel_file_path(Path::new(base), 0)?;
+        let p1 = make_channel_file_path(Path::new(base), 1)?;
+        std::fs::copy(&p0, &p1)?;
+        std::fs::remove_file(&p0)?;
+
+        // Writer reopen (latest sequence = 1) rejects the mismatch.
+        let werr = WriterBuilder::new(base)
+            .region_size(region_size)
+            .build()
+            .err()
+            .expect("writer must reject sequence-mismatched segment");
+        assert_eq!(werr.kind(), ErrorKind::InvalidData);
+        assert!(werr.to_string().contains("channel_sequence"));
+
+        // Reader (earliest = latest = 1) rejects it too.
+        let rerr = ReaderBuilder::new(base)
+            .build()
+            .err()
+            .expect("reader must reject sequence-mismatched segment");
+        assert_eq!(rerr.kind(), ErrorKind::InvalidData);
+        assert!(rerr.to_string().contains("channel_sequence"));
 
         cleanup_channel_files(base);
         Ok(())

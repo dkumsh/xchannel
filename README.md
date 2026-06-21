@@ -446,31 +446,16 @@ a reserved `user_header_kind: u32` discriminant for forward-compatible
 alternative user-meta layouts; current writers emit 0 and current
 readers refuse anything else.
 
-## Migrating v2 archives to v3
+## Format versioning
 
-Channel files produced by xchannel ≤ 2.2 are not readable by v3 (the
-`ChannelHeader` gained a `format_version` field and others, in bytes
-that v2 left zero-initialized). For archives you want to keep —
-e.g. recorded streams used for simulation replay — use the
-`xchannel::migrate` module:
+The on-disk format is identified by `ChannelHeader.format_version`; a reader
+refuses any file whose version it does not implement. The current version is
+**2** (128-byte `ChannelHeader` with `base_record_index`; see `FORMAT.md`).
 
-```rust
-use xchannel::migrate::migrate_channel_v2_to_v3;
-migrate_channel_v2_to_v3("/data/feed.xch", "/data/feed.v3.xch")?;
-```
-
-This walks every rolled file in the channel set and writes a v3 copy.
-The original archive is left untouched; the destination must not
-already exist. Only the second half of each file's `ChannelHeader`
-(bytes 48–79) is rewritten; records are copied verbatim.
-
-For a one-off conversion from a checkout, the same logic is exposed
-as a thin CLI under `examples/`:
-
-```sh
-cargo run --release --example xch-migrate -- \
-    --src /data/feed.xch --dst /data/archive/
-```
+Format **2 is greenfield**: because the header grew, the records area shifts,
+so files written at earlier versions are not read in place and there is no
+in-place migration. Regenerate channels with a current writer, or read old
+archives with the crate version that produced them.
 
 ---
 
