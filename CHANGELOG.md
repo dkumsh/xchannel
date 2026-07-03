@@ -1,5 +1,14 @@
 # Changelog
 
+## 4.1.0 (2026-07-04)
+
+### Added
+- `Reader::head_record_index() -> io::Result<u64>`: the channel's current head /
+  high-water mark (equal to the writer's `next_record_index()`), computed from the
+  newest segment on disk so a `LateJoin` reader still catching up — or one parked on
+  an older rolled file — reports the true channel frontier rather than the end of the
+  file it currently reads. Purely additive; no format change (`format_version` stays 2).
+
 ## 4.0.0 (2026-06-21)
 
 ### Added

@@ -1522,6 +1522,32 @@ impl Reader {
         self.base_record_index_cached
     }
 
+    /// Absolute index (from channel genesis) of the **next** user record the channel
+    /// will hold — its current head / high-water mark, equal to the writer's
+    /// [`Writer::next_record_index`] at the moment of the call. Independent of where this
+    /// reader's cursor sits: it consults the newest file on disk, so a `LateJoin` reader
+    /// still catching up (or one parked on an older rolled file) reports the true channel
+    /// head, not the end of the file it currently reads. Reads one page of the latest
+    /// segment's header; not a hot-path accessor.
+    pub fn head_record_index(&self) -> io::Result<u64> {
+        let latest = find_latest_sequence(&self.base_path)?;
+        let file_path = make_channel_file_path(&self.base_path, latest)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .write(false)
+            .open(&file_path)?;
+        let ps = region::page_size();
+        let map = RegionMapping::create_read_only(&file, 0, ps)?;
+        let mh = unsafe { &*(map.as_ptr() as *const MessageHeader) };
+        if mh.parsed_header_type()? != HeaderType::Channel {
+            return Err(err_invalid_data(
+                "head_record_index: latest segment does not begin with a Channel header",
+            ));
+        }
+        let ch = get_channel_header(map.as_ptr());
+        Ok(ch.base_record_index + ch.message_count.load(Ordering::Relaxed))
+    }
+
     #[inline(always)]
     fn region_size(&self) -> usize {
         self.region_size_cached
@@ -2335,6 +2361,53 @@ mod tests {
             let mut reader = Reader::open(base, ReaderMode::Live)?;
             assert!(reader.try_read()?.is_none());
         }
+
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// `head_record_index` reports the true channel head even when the reader is parked on
+    /// an older rolled file — the case a naive `base_record_index + message_count` of the
+    /// reader's *current* file would get wrong.
+    #[test]
+    fn test_head_record_index_across_rolls() -> anyhow::Result<()> {
+        let base = "test_head_record_index";
+        cleanup_channel_files(base);
+
+        let region_size = crate::page_size();
+        let file_roll_size = (region_size as u64) * 2; // small => frequent rolls
+
+        let mut writer = WriterBuilder::new(base)
+            .region_size(region_size)
+            .file_roll_size(file_roll_size)
+            .mtu(0)
+            .build()?;
+
+        // Enough records to roll across several files (genesis retained, no keep_files).
+        let n = 200u64;
+        for i in 0..n {
+            let buf = writer.try_reserve(500)?;
+            for b in buf.iter_mut() {
+                *b = 0xAB;
+            }
+            writer.commit((i % 7) as u16, 500, i)?;
+        }
+        assert_eq!(writer.next_record_index(), n);
+
+        // A LateJoin reader is parked at the earliest (genesis) file: base far below head.
+        let reader = ReaderBuilder::new(base)
+            .mode(ReaderMode::LateJoin)
+            .build()?;
+        assert_eq!(
+            reader.base_record_index(),
+            0,
+            "reader parked at genesis file"
+        );
+        assert_eq!(
+            reader.head_record_index()?,
+            n,
+            "head must reflect the channel frontier (latest file), not the reader's file"
+        );
 
         cleanup_channel_files(base);
         Ok(())
