@@ -1,5 +1,13 @@
 # Changelog
 
+## 4.2.0 (2026-07-04)
+
+### Added
+- `Reader::region_size() -> usize` and `Reader::mtu() -> u32`: read a channel's geometry
+  (region size, and max user payload / MTU) from its header. Lets a consumer recover the
+  geometry needed to re-register or replicate a channel without re-deriving it. Purely
+  additive; no format change (`format_version` stays 2).
+
 ## 4.1.0 (2026-07-04)
 
 ### Added

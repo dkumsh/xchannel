@@ -1386,6 +1386,7 @@ pub struct Reader {
     file: File,
     read_position: usize,
     region_size_cached: usize,
+    mtu_cached: u32,
     channel_name_cached: [u8; CHANNEL_NAME_MAX],
     /// `base_record_index` of the file currently open (updated on each roll).
     base_record_index_cached: u64,
@@ -1439,7 +1440,7 @@ impl Reader {
         file: &File,
         mode: ReaderMode,
         expected_sequence: u64,
-    ) -> io::Result<(usize, usize, [u8; CHANNEL_NAME_MAX], u64)> {
+    ) -> io::Result<(usize, usize, [u8; CHANNEL_NAME_MAX], u64, u32)> {
         let ps = region::page_size();
         let tmp_map = RegionMapping::create_read_only(file, 0, ps)?; // map one OS page
 
@@ -1464,8 +1465,9 @@ impl Reader {
         };
         let channel_name = ch.channel_name;
         let base_record_index = ch.base_record_index;
+        let mtu = ch.mtu;
         drop(tmp_map);
-        Ok((read_pos, region_size, channel_name, base_record_index))
+        Ok((read_pos, region_size, channel_name, base_record_index, mtu))
     }
 
     fn open_sequence_file(base_path: PathBuf, sequence: u64, mode: ReaderMode) -> io::Result<Self> {
@@ -1475,7 +1477,7 @@ impl Reader {
             .write(false)
             .open(&file_path)?;
 
-        let (read_pos, region_size, channel_name, base_record_index) =
+        let (read_pos, region_size, channel_name, base_record_index, mtu) =
             Self::read_channel_header(&file, mode, sequence)?;
         let region_index = (read_pos / region_size) as u64;
         let current_region =
@@ -1493,6 +1495,7 @@ impl Reader {
             file,
             read_position: read_pos,
             region_size_cached: region_size,
+            mtu_cached: mtu,
             channel_name_cached: channel_name,
             base_record_index_cached: base_record_index,
             batch_limit: None,
@@ -1522,6 +1525,14 @@ impl Reader {
         self.base_record_index_cached
     }
 
+    /// The channel's MTU — max user payload bytes; `0` = unlimited (from its header). Constant
+    /// for a channel's life. Together with [`region_size`](Self::region_size) this is the
+    /// geometry needed to re-register or replicate a channel without re-deriving it.
+    #[inline]
+    pub fn mtu(&self) -> u32 {
+        self.mtu_cached
+    }
+
     /// Absolute index (from channel genesis) of the **next** user record the channel
     /// will hold — its current head / high-water mark, equal to the writer's
     /// [`Writer::next_record_index`] at the moment of the call. Independent of where this
@@ -1548,8 +1559,9 @@ impl Reader {
         Ok(ch.base_record_index + ch.message_count.load(Ordering::Relaxed))
     }
 
+    /// The channel's region size in bytes (from its header). Constant for a channel's life.
     #[inline(always)]
-    fn region_size(&self) -> usize {
+    pub fn region_size(&self) -> usize {
         self.region_size_cached
     }
 
@@ -2369,6 +2381,27 @@ mod tests {
     /// `head_record_index` reports the true channel head even when the reader is parked on
     /// an older rolled file — the case a naive `base_record_index + message_count` of the
     /// reader's *current* file would get wrong.
+    #[test]
+    fn test_reader_exposes_region_size_and_mtu() -> anyhow::Result<()> {
+        let base = "test_geometry_accessors";
+        cleanup_channel_files(base);
+        let region_size = crate::page_size();
+        {
+            let mut w = WriterBuilder::new(base)
+                .region_size(region_size)
+                .mtu(4096)
+                .build()?;
+            let buf = w.try_reserve(8)?;
+            buf.copy_from_slice(&[0u8; 8]);
+            w.commit(1, 8, 0)?;
+        }
+        let r = Reader::open(base, ReaderMode::LateJoin)?;
+        assert_eq!(r.region_size(), region_size);
+        assert_eq!(r.mtu(), 4096);
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
     #[test]
     fn test_head_record_index_across_rolls() -> anyhow::Result<()> {
         let base = "test_head_record_index";

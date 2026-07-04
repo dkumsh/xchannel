@@ -1,6 +1,6 @@
 [package]
 name = "xchannel"
-version = "4.1.0"
+version = "4.2.0"
 edition = "2024"
 description = "mmap-backed IPC channels with regionized layout, alignment-safe headers, and file rolling."
 license = "MIT"
