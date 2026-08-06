@@ -1525,6 +1525,33 @@ impl Reader {
         self.base_record_index_cached
     }
 
+    /// Ordinal of the segment file the reader currently has open, matching the `.NNN`
+    /// suffix on disk. Monotonically increasing as the reader follows rolls.
+    ///
+    /// Rolls are otherwise invisible to a reader — `Roll` markers are consumed
+    /// transparently by [`try_read`](Self::try_read), [`read_blocking`](Self::read_blocking)
+    /// and [`wait_for_message`](Self::wait_for_message) — so this accessor is how a
+    /// consumer *locates* a roll: sample it around a single-record read, and a change means
+    /// the record just returned is the first user record of a new segment. That makes the
+    /// writer's segmentation observable downstream, so a replicator can reproduce the
+    /// origin's file boundaries (and therefore its `keep_files` retention) rather than
+    /// inventing its own:
+    ///
+    /// ```ignore
+    /// let before = reader.file_sequence();
+    /// if let Some(msg) = reader.try_read()? {
+    ///     let rolled = reader.file_sequence() != before; // `msg` starts a new segment
+    /// }
+    /// ```
+    ///
+    /// [`try_read_batch`](Self::try_read_batch) may span a roll, after which this reports
+    /// the last segment the batch touched; the boundary's position *within* that batch is
+    /// not recoverable. Use the single-record path where boundaries matter.
+    #[inline]
+    pub fn file_sequence(&self) -> u64 {
+        self.file_sequence
+    }
+
     /// The channel's MTU — max user payload bytes; `0` = unlimited (from its header). Constant
     /// for a channel's life. Together with [`region_size`](Self::region_size) this is the
     /// geometry needed to re-register or replicate a channel without re-deriving it.
@@ -2441,6 +2468,62 @@ mod tests {
             n,
             "head must reflect the channel frontier (latest file), not the reader's file"
         );
+
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// `file_sequence` makes the writer's segmentation observable to a reader: sampled
+    /// around a single-record read, a change identifies the record that begins a new
+    /// segment. Written the way a replicator uses it — explicit `roll_file()` with no
+    /// `file_roll_size`, so every boundary is one the application chose.
+    #[test]
+    fn test_file_sequence_locates_roll_boundaries() -> anyhow::Result<()> {
+        let base = "test_file_sequence";
+        cleanup_channel_files(base);
+
+        let region_size = crate::page_size();
+        let mut writer = WriterBuilder::new(base).region_size(region_size).build()?;
+
+        // Three segments of two records each; the roll boundaries fall at records 2 and 4.
+        for i in 0..6u64 {
+            if i > 0 && i.is_multiple_of(2) {
+                writer.roll_file()?;
+            }
+            let buf = writer.try_reserve(32)?;
+            buf.fill(0xC3);
+            writer.commit(1, 32, i)?;
+        }
+        assert_eq!(writer.file_sequence, 2, "two rolls ⇒ writer on segment 2");
+
+        let mut reader = Reader::open(base, ReaderMode::LateJoin)?;
+        assert_eq!(reader.file_sequence(), 0, "LateJoin starts at the earliest");
+
+        // Replay, recording which record indices the reader saw a segment change on.
+        let mut boundaries = Vec::new();
+        for expected in 0..6u64 {
+            let before = reader.file_sequence();
+            let meta = reader
+                .try_read()?
+                .map(|m| m.header().user_meta_u64)
+                .ok_or_else(|| err_other("expected 6 records"))?;
+            if reader.file_sequence() != before {
+                boundaries.push(meta);
+            }
+            assert_eq!(meta, expected, "records must replay in order");
+        }
+        assert_eq!(
+            boundaries,
+            vec![2, 4],
+            "a change must land on the first record of each new segment"
+        );
+        assert_eq!(reader.file_sequence(), 2, "reader followed both rolls");
+
+        // A reader that joins after retention pruned the genesis segment reports the
+        // sequence it actually opened, not 0 — so sequences are absolute, not relative.
+        std::fs::remove_file(make_channel_file_path(std::path::Path::new(base), 0)?)?;
+        let late = Reader::open(base, ReaderMode::LateJoin)?;
+        assert_eq!(late.file_sequence(), 1);
 
         cleanup_channel_files(base);
         Ok(())

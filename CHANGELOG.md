@@ -1,5 +1,18 @@
 # Changelog
 
+## 4.3.0 (2026-08-06)
+
+### Added
+- `Reader::file_sequence() -> u64`: ordinal of the segment file the reader currently has
+  open, updated as it follows rolls. Rolls are otherwise invisible to a reader (`Roll`
+  markers are consumed transparently), so this is how a consumer *locates* one: sampled
+  around a single-record read, a change means the record just returned is the first user
+  record of a new segment. Lets a replicator reproduce the origin's file boundaries — and
+  therefore its `keep_files` retention — instead of inventing its own. `try_read_batch`
+  may span a roll and then reports the last segment touched; the boundary's position
+  within that batch is not recoverable. Purely additive; no format change
+  (`format_version` stays 2).
+
 ## 4.2.0 (2026-07-04)
 
 ### Added
