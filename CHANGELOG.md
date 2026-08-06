@@ -1,5 +1,23 @@
 # Changelog
 
+## 4.4.0 (2026-08-06)
+
+### Added
+- `ChannelHeader.generation` (u64, offset 120..128, consuming reserved space): an opaque
+  **incarnation id** for a channel, set at creation via `WriterBuilder::generation(u64)`,
+  stamped identically into every segment, carried across rolls, and preserved when a writer
+  reopens an existing channel (the on-disk value wins, as with `base_record_index`). Read it
+  via `Reader::generation()` / `Writer::generation()`.
+  It answers a question a path and a record index cannot: a channel deleted and recreated at
+  the same path restarts at sequence 0 and index 0, so it is indistinguishable from a
+  truncated one, and a persisted cursor silently refers to a different log. A consumer that
+  stores a read position should store the generation with it and treat a change as a
+  different channel rather than a gap. A reader that follows a roll into a segment carrying a
+  different generation now refuses it (mixed-incarnation directory), mirroring the existing
+  `channel_sequence` check. xchannel assigns no meaning to the value.
+  Purely additive; no format change (`format_version` stays 2), and the field is last in the
+  header so future additive fields cannot move it.
+
 ## 4.3.0 (2026-08-06)
 
 ### Added

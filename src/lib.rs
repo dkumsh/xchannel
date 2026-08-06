@@ -175,6 +175,7 @@ pub struct WriterBuilder {
     keep_files: Option<u64>,
     channel_name: [u8; CHANNEL_NAME_MAX],
     base_record_index: u64,
+    generation: u64,
 }
 
 impl WriterBuilder {
@@ -187,7 +188,25 @@ impl WriterBuilder {
             keep_files: None,         // default: keep all rolled files
             channel_name: [0; CHANNEL_NAME_MAX],
             base_record_index: 0, // default: genesis channel starts at index 0
+            generation: 0,        // default: unset incarnation id
         }
+    }
+
+    /// Stamp an opaque **incarnation id** into every segment of this channel, used only
+    /// when *creating* it (ignored when reopening an existing one — the on-disk value
+    /// wins, and rolls carry it forward). Defaults to 0.
+    ///
+    /// Lets a consumer distinguish "this log continues" from "this path was deleted and
+    /// recreated": a recreated channel restarts at sequence 0 and record index 0, so
+    /// without this it is indistinguishable from a channel that was merely truncated,
+    /// and a persisted cursor silently refers to a different log. Pair a stored cursor
+    /// with [`Reader::generation`] and treat a change as a new channel, not a gap.
+    ///
+    /// xchannel assigns no meaning to the value.
+    #[inline]
+    pub fn generation(mut self, generation: u64) -> Self {
+        self.generation = generation;
+        self
     }
 
     /// Set the absolute record index of the **first** record this channel will
@@ -293,6 +312,7 @@ impl WriterBuilder {
             self.keep_files,
             self.channel_name,
             self.base_record_index,
+            self.generation,
         )
     }
 
@@ -387,6 +407,10 @@ pub struct Writer {
 impl Writer {
     /// Create/open the latest channel file.
     /// Validates that `region_size` is a multiple of OS page size and large enough.
+    // Six of these are "how to create a segment" and travel together through
+    // build → open_or_create → open_file → prepare_segment_at. Worth folding into a
+    // SegmentSpec before a seventh is added; not worth churning this path for one field.
+    #[allow(clippy::too_many_arguments)]
     fn open_or_create<P: AsRef<Path>>(
         path: P,
         region_size: usize,
@@ -395,6 +419,7 @@ impl Writer {
         keep_files: Option<u64>,
         channel_name: [u8; CHANNEL_NAME_MAX],
         base_record_index: u64,
+        generation: u64,
     ) -> io::Result<Self> {
         // Validate region invariants
         let ps = region::page_size();
@@ -445,6 +470,7 @@ impl Writer {
                 mtu,
                 &channel_name,
                 base_record_index,
+                generation,
             )?;
 
         Ok(Self {
@@ -474,7 +500,7 @@ impl Writer {
     /// renames after the OLD Roll header is staged (committed=0) but
     /// before it's release-stored to `committed=1`, so readers
     /// observing Roll can immediately resolve NEW.
-    #[allow(clippy::type_complexity)]
+    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
     fn prepare_segment_at(
         partial_path: &Path,
         sequence: u64,
@@ -483,6 +509,7 @@ impl Writer {
         mtu: u64,
         channel_name: &[u8; CHANNEL_NAME_MAX],
         base_record_index: u64,
+        generation: u64,
     ) -> io::Result<(
         File,
         RegionMapping<Writable>,
@@ -535,7 +562,8 @@ impl Writer {
             (*ch_ptr).user_header_kind = USER_HEADER_KIND_DEFAULT;
             (*ch_ptr).user_header_size = USER_HEADER_SIZE;
             (*ch_ptr).channel_name = *channel_name;
-            (*ch_ptr)._reserved2 = [0; 59];
+            (*ch_ptr)._reserved2 = [0; 51];
+            (*ch_ptr).generation = generation;
         }
 
         // 3) current region + first user header pre-install
@@ -568,7 +596,7 @@ impl Writer {
         Ok((file, region0, current_region, 0, initial_len, start))
     }
 
-    #[allow(clippy::type_complexity)]
+    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
     fn open_file(
         base_path: &Path,
         sequence: u64,
@@ -577,6 +605,7 @@ impl Writer {
         mtu: u64,
         channel_name: &[u8; CHANNEL_NAME_MAX],
         base_record_index: u64,
+        generation: u64,
     ) -> io::Result<(
         File,
         RegionMapping<Writable>,
@@ -610,6 +639,7 @@ impl Writer {
                 mtu,
                 channel_name,
                 base_record_index,
+                generation,
             )?;
             std::fs::rename(&partial_path, &file_path)?;
             Ok(prepared)
@@ -745,6 +775,14 @@ impl Writer {
     pub fn next_record_index(&self) -> u64 {
         let ch = self.channel_header();
         ch.base_record_index + ch.message_count.load(Ordering::Relaxed)
+    }
+
+    /// This channel's incarnation id (see [`WriterBuilder::generation`]). Read from the
+    /// file, so reopening an existing channel reports the value it was created with —
+    /// not whatever the builder was told.
+    #[inline]
+    pub fn generation(&self) -> u64 {
+        self.channel_header().generation
     }
 
     #[inline]
@@ -1001,9 +1039,14 @@ impl Writer {
         // OLD's base plus the count of user records written to OLD. `self` is still
         // on OLD here, so its channel header carries both. (Skip markers never
         // bumped `message_count`, so this is a pure user-record count.)
-        let new_base_record_index = {
+        // The generation is a property of the channel, not of a file: every segment
+        // carries the same value, so it is read from OLD and stamped into NEW.
+        let (new_base_record_index, generation) = {
             let ch = self.channel_header();
-            ch.base_record_index + ch.message_count.load(Ordering::Relaxed)
+            (
+                ch.base_record_index + ch.message_count.load(Ordering::Relaxed),
+                ch.generation,
+            )
         };
         let new_partial_path = make_partial_channel_file_path(&self.base_path, next_seq)?;
         let new_final_path = make_channel_file_path(&self.base_path, next_seq)?;
@@ -1022,6 +1065,7 @@ impl Writer {
             self.mtu,
             &self.channel_name,
             new_base_record_index,
+            generation,
         )?;
 
         // Publish Roll in OLD file BEFORE swapping `self` to NEW. If
@@ -1390,6 +1434,9 @@ pub struct Reader {
     channel_name_cached: [u8; CHANNEL_NAME_MAX],
     /// `base_record_index` of the file currently open (updated on each roll).
     base_record_index_cached: u64,
+    /// The channel's incarnation id — identical in every segment, so it is read once at
+    /// open and re-verified on each roll.
+    generation_cached: u64,
     batch_limit: Option<u16>,
     batch_segs: Vec<BatchSeg>,
     batch_pos: Vec<MsgPos>,
@@ -1435,12 +1482,12 @@ impl Reader {
 
     /// Map region 0, validate format invariants (including that `channel_sequence`
     /// matches `expected_sequence`), and return
-    /// `(read_pos, region_size, channel_name, base_record_index)`.
+    /// `(read_pos, region_size, channel_name, base_record_index, mtu, generation)`.
     fn read_channel_header(
         file: &File,
         mode: ReaderMode,
         expected_sequence: u64,
-    ) -> io::Result<(usize, usize, [u8; CHANNEL_NAME_MAX], u64, u32)> {
+    ) -> io::Result<(usize, usize, [u8; CHANNEL_NAME_MAX], u64, u32, u64)> {
         let ps = region::page_size();
         let tmp_map = RegionMapping::create_read_only(file, 0, ps)?; // map one OS page
 
@@ -1466,8 +1513,16 @@ impl Reader {
         let channel_name = ch.channel_name;
         let base_record_index = ch.base_record_index;
         let mtu = ch.mtu;
+        let generation = ch.generation;
         drop(tmp_map);
-        Ok((read_pos, region_size, channel_name, base_record_index, mtu))
+        Ok((
+            read_pos,
+            region_size,
+            channel_name,
+            base_record_index,
+            mtu,
+            generation,
+        ))
     }
 
     fn open_sequence_file(base_path: PathBuf, sequence: u64, mode: ReaderMode) -> io::Result<Self> {
@@ -1477,7 +1532,7 @@ impl Reader {
             .write(false)
             .open(&file_path)?;
 
-        let (read_pos, region_size, channel_name, base_record_index, mtu) =
+        let (read_pos, region_size, channel_name, base_record_index, mtu, generation) =
             Self::read_channel_header(&file, mode, sequence)?;
         let region_index = (read_pos / region_size) as u64;
         let current_region =
@@ -1498,6 +1553,7 @@ impl Reader {
             mtu_cached: mtu,
             channel_name_cached: channel_name,
             base_record_index_cached: base_record_index,
+            generation_cached: generation,
             batch_limit: None,
             batch_segs: Vec::with_capacity(DEFAULT_BATCH_SEGS_CAP),
             batch_pos: Vec::with_capacity(DEFAULT_BATCH_POS_CAP),
@@ -1523,6 +1579,20 @@ impl Reader {
     #[inline]
     pub fn base_record_index(&self) -> u64 {
         self.base_record_index_cached
+    }
+
+    /// This channel's incarnation id (see [`WriterBuilder::generation`]). Constant across
+    /// the channel's segments — following a roll into a segment carrying a different value
+    /// is refused as a mixed-incarnation directory, so this never changes under a reader.
+    ///
+    /// A consumer that persists a read position must persist this alongside it: a channel
+    /// deleted and recreated at the same path restarts at sequence 0 and record index 0, so
+    /// nothing else distinguishes "the log was truncated" from "this is a different log",
+    /// and a resumed cursor would silently point into unrelated data. Reports 0 for channels
+    /// created without one.
+    #[inline]
+    pub fn generation(&self) -> u64 {
+        self.generation_cached
     }
 
     /// Ordinal of the segment file the reader currently has open, matching the `.NNN`
@@ -2074,6 +2144,17 @@ impl Reader {
         self.channel_name_cached = ch.channel_name;
         // Each rolled file has its own base; refresh so `base_record_index()` tracks it.
         self.base_record_index_cached = ch.base_record_index;
+        // Unlike the base, the generation is constant across a channel's segments, so a
+        // mismatch means this segment belongs to a different incarnation of the path —
+        // files from two channels mixed in one directory. Refuse rather than splice them,
+        // the same reasoning as the `channel_sequence` check above.
+        if ch.generation != self.generation_cached {
+            return Err(err_invalid_data(format!(
+                "generation mismatch: segment {} has generation {} but the channel is {} \
+                 (segments from a different incarnation of this path?)",
+                self.file_sequence, ch.generation, self.generation_cached
+            )));
+        }
 
         self.file = file;
         self.read_position = 0;
@@ -2529,6 +2610,96 @@ mod tests {
         Ok(())
     }
 
+    /// The generation is stamped at creation, carried into every rolled segment, and
+    /// preserved when a writer reopens the channel — so it identifies the *log*, not a file.
+    #[test]
+    fn test_generation_is_stamped_and_survives_rolls_and_reopen() -> anyhow::Result<()> {
+        let base = "test_generation";
+        cleanup_channel_files(base);
+        let region_size = crate::page_size();
+
+        let commit_one = |w: &mut Writer, ts: u64| -> io::Result<()> {
+            let payload = w.try_reserve(32)?;
+            payload.fill(0x7E);
+            w.commit(1, 32, ts)
+        };
+
+        {
+            let mut w = WriterBuilder::new(base)
+                .region_size(region_size)
+                .generation(0xFEED_1234)
+                .build()?;
+            assert_eq!(w.generation(), 0xFEED_1234);
+            commit_one(&mut w, 0)?;
+            w.roll_file()?;
+            commit_one(&mut w, 1)?;
+            assert_eq!(
+                w.generation(),
+                0xFEED_1234,
+                "carried into the rolled segment"
+            );
+        }
+
+        // Reopening ignores the builder's value — the on-disk one wins, as with
+        // `base_record_index`. A writer must not be able to relabel an existing log.
+        {
+            let mut w = WriterBuilder::new(base)
+                .region_size(region_size)
+                .generation(0xBAD)
+                .build()?;
+            assert_eq!(w.generation(), 0xFEED_1234);
+            commit_one(&mut w, 2)?;
+        }
+
+        // A reader sees it from genesis and still sees it after following the roll.
+        let mut r = Reader::open(base, ReaderMode::LateJoin)?;
+        assert_eq!(r.generation(), 0xFEED_1234);
+        for _ in 0..3 {
+            assert!(r.try_read()?.is_some());
+        }
+        assert_eq!(r.file_sequence(), 1, "reader followed the roll");
+        assert_eq!(r.generation(), 0xFEED_1234);
+
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// Recreating a channel at the same path yields a different generation — the case a
+    /// path plus a record index cannot distinguish, since both restart at 0.
+    #[test]
+    fn test_generation_distinguishes_a_recreated_channel() -> anyhow::Result<()> {
+        let base = "test_generation_recreate";
+        cleanup_channel_files(base);
+        let region_size = crate::page_size();
+
+        for generation in [7u64, 8] {
+            cleanup_channel_files(base);
+            let mut w = WriterBuilder::new(base)
+                .region_size(region_size)
+                .generation(generation)
+                .build()?;
+            let payload = w.try_reserve(16)?;
+            payload.fill(0x11);
+            w.commit(1, 16, 0)?;
+            drop(w);
+
+            let r = Reader::open(base, ReaderMode::LateJoin)?;
+            assert_eq!(
+                r.base_record_index(),
+                0,
+                "both incarnations start at genesis"
+            );
+            assert_eq!(
+                r.generation(),
+                generation,
+                "only the generation tells the two apart"
+            );
+        }
+
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
     /// `keep_files(N)` should retain only the active file plus N-1
     /// historical rolled files. Each successful `roll_file` unlinks the
     /// file at `current_seq - N` (if it exists). Files past the retention
@@ -2833,6 +3004,7 @@ mod tests {
             None,
             [0; CHANNEL_NAME_MAX],
             0, // base_record_index: genesis
+            0, // generation: unset
         )?;
 
         let msg1: Vec<u8> = (0..100).map(|i| i as u8).collect();
@@ -2897,6 +3069,7 @@ mod tests {
             None,
             [0; CHANNEL_NAME_MAX],
             0, // base_record_index: genesis
+            0, // generation: unset
         )?;
 
         let payload0 = vec![0x10; 16];
@@ -2948,6 +3121,7 @@ mod tests {
             None,
             [0; CHANNEL_NAME_MAX],
             0,
+            0, // generation: unset
         )?;
 
         // Choose len so that after header + payload the aligned end is region - header_size.
@@ -2999,6 +3173,7 @@ mod tests {
             None,
             [0; CHANNEL_NAME_MAX],
             0, // base_record_index: genesis
+            0, // generation: unset
         )?;
 
         let payload1 = vec![0xA1; 32];
@@ -3048,6 +3223,7 @@ mod tests {
             None,
             [0; CHANNEL_NAME_MAX],
             0, // base_record_index: genesis
+            0, // generation: unset
         )?;
 
         let start = align_up(MESSAGE_HEADER_SIZE + CHANNEL_HEADER_SIZE);
@@ -3100,6 +3276,7 @@ mod tests {
             None,
             [0; CHANNEL_NAME_MAX],
             0, // base_record_index: genesis
+            0, // generation: unset
         )?;
 
         let payload1 = vec![0x3A; 64];
@@ -3148,6 +3325,7 @@ mod tests {
             None,
             [0; CHANNEL_NAME_MAX],
             0, // base_record_index: genesis
+            0, // generation: unset
         )?;
 
         let mut reader = Reader::open(base, ReaderMode::Live)?;
@@ -3174,6 +3352,7 @@ mod tests {
             None,
             [0; CHANNEL_NAME_MAX],
             0, // base_record_index: genesis
+            0, // generation: unset
         )?;
 
         let mut reader = Reader::open(base, ReaderMode::LateJoin)?;

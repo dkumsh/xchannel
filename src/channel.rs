@@ -150,7 +150,25 @@ pub(crate) struct ChannelHeader {
     /// Reserved for future additive fields. Zero-filled; must be ignored on read.
     /// Additive, optional, zero-default fields may consume this without a
     /// `format_version` bump; anything that changes existing semantics must bump.
-    pub _reserved2: [u8; 59], // 69..128
+    pub _reserved2: [u8; 51], // 69..120
+    /// Opaque **incarnation id** for this channel, chosen by whoever created it
+    /// (`WriterBuilder::generation`, default 0) and stamped into every segment of
+    /// the channel — immutable for its life, carried across rolls, and preserved
+    /// when a writer reopens an existing file.
+    ///
+    /// It answers "is this the same log I read before, or was this path deleted and
+    /// recreated?" — a question a path and a record index cannot answer, since a
+    /// recreated channel restarts at sequence 0 and index 0 and so looks like a
+    /// truncation rather than a different log. A consumer that persists a cursor
+    /// should persist the generation alongside it and treat a change as "this is a
+    /// different channel now", not as a gap.
+    ///
+    /// xchannel never interprets the value; it only carries and reports it.
+    ///
+    /// Deliberately the **last** field, at a fixed offset from the end of the header:
+    /// future additive fields consume `_reserved2` from the front, so this one's offset
+    /// stays put no matter what else is added or widened.
+    pub generation: u64, // 120..128
 }
 
 const _: () = {
