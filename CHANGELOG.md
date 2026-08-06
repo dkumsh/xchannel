@@ -1,5 +1,24 @@
 # Changelog
 
+## 5.0.0 (2026-08-06)
+
+### Changed
+- **`format_version = 3`**: `channel_name` widened from 20 to 48 bytes (offsets 49..97),
+  taking the space from `_reserved2` (now 23 bytes at 97..120). The header stays 128 bytes
+  and every other field keeps its offset — `generation` is still at 120..128, exactly the
+  property that placing it last was meant to guarantee — so a v2 file is structurally
+  readable. It is nonetheless a version bump and not an additive change: a v3 writer can
+  store a name that a v2 reader would silently truncate at 20 bytes, which redefines the
+  meaning of bytes [69, 97) rather than adding to unused space. 20 bytes was too small for
+  real names (`fills.prod.options-mm` is 21).
+- `CHANNEL_NAME_MAX` is now 48, and `ChannelHeader.channel_name` is sized from it directly
+  so the public limit and the on-disk field cannot drift apart.
+
+### Removed
+- Files at `format_version` 0, 1, or 2 are refused. Like the v2 change before it, v3 is
+  greenfield — there is no in-place migration; regenerate with a 5.0 writer or pin an
+  older crate version to read them.
+
 ## 4.4.0 (2026-08-06)
 
 ### Added

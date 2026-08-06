@@ -164,7 +164,7 @@ where
 
 // ========== Builders ==========
 /// Maximum bytes available for a channel name in `ChannelHeader`.
-pub const CHANNEL_NAME_MAX: usize = 20;
+pub const CHANNEL_NAME_MAX: usize = 48;
 
 #[derive(Clone, Debug)]
 pub struct WriterBuilder {
@@ -247,7 +247,7 @@ impl WriterBuilder {
     }
 
     /// Set an optional channel name persisted in the `ChannelHeader`. The
-    /// name is UTF-8 bytes, up to `CHANNEL_NAME_MAX` (20) bytes; longer
+    /// name is UTF-8 bytes, up to `CHANNEL_NAME_MAX` (48) bytes; longer
     /// names return `ErrorKind::InvalidInput`. Read back with
     /// `Reader::channel_name`.
     pub fn channel_name(mut self, name: &str) -> io::Result<Self> {
@@ -562,7 +562,7 @@ impl Writer {
             (*ch_ptr).user_header_kind = USER_HEADER_KIND_DEFAULT;
             (*ch_ptr).user_header_size = USER_HEADER_SIZE;
             (*ch_ptr).channel_name = *channel_name;
-            (*ch_ptr)._reserved2 = [0; 51];
+            (*ch_ptr)._reserved2 = [0; 23];
             (*ch_ptr).generation = generation;
         }
 
@@ -3451,7 +3451,8 @@ mod tests {
         let base = "test_channel_name_round_trip";
         cleanup_channel_files(base);
 
-        const NAME: &str = "market-data-feed";
+        // 28 bytes — would not have fit the 20-byte field before format_version 3.
+        const NAME: &str = "fills.prod.options-mm.emea-1";
 
         let _w = WriterBuilder::new(base)
             .region_size(page_size())

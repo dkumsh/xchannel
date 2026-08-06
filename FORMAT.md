@@ -5,7 +5,7 @@ non-Rust implementations (readers, validators, archival tools) can interoperate
 with files produced by the Rust crate. The Rust source in `src/channel.rs`
 and `src/lib.rs` is the executable reference; this document is the contract.
 
-Status: **draft, format_version = 2.**
+Status: **draft, format_version = 3.**
 
 ---
 
@@ -61,7 +61,7 @@ sequence number.
 
 ---
 
-## 3. ChannelHeader (format_version = 2)
+## 3. ChannelHeader (format_version = 3)
 
 Located at byte offset `16` of file region 0 (immediately after the
 `MessageHeader(Channel)` that opens region 0). Total size: 128 bytes.
@@ -74,13 +74,13 @@ Located at byte offset `16` of file region 0 (immediately after the
 |     24 |    8 | `channel_sequence`    | u64    | Rolling file ordinal: `0` for `<base>`, `1` for `<base>.1`, etc. On open, readers and writers verify this equals the sequence parsed from the file's path and refuse a mismatch (catches a renamed/misplaced/swapped segment). |
 |     32 |    4 | `region_size`         | u32    | Region size in bytes. Multiple of OS page size. |
 |     36 |    4 | `mtu`                 | u32    | Max user payload bytes; `0` = unlimited. |
-|     40 |    2 | `format_version`      | u16    | This document describes version `2`. Versions `0`/`1` are earlier formats this build does not read (see §8). |
+|     40 |    2 | `format_version`      | u16    | This document describes version `3`. Versions `0`/`1`/`2` are earlier formats this build does not read (see §8). |
 |     42 |    1 | `endianness`          | u8     | `0x01` = little-endian. Other values reserved. |
 |     43 |    1 | `system_header_size`  | u8     | Size of the system-owned bytes inside `MessageHeader` (`8`). |
 |     44 |    4 | `user_header_kind`    | u32    | Reserved discriminant identifying the layout of the user-metadata bytes. Current writers emit `0` (the default `{message_type:u16, user_meta_u64:u64}` layout described in §4) and current readers refuse anything else. Non-zero values are reserved for future user-defined layouts; a Rust opt-in API for those layouts is intentionally not exposed today. Placed at this 4-aligned offset so the surrounding byte fields need no padding. |
 |     48 |    1 | `user_header_size`    | u8     | Size of the user-metadata bytes inside `MessageHeader` (`8`). |
-|     49 |   20 | `channel_name`        | u8[20] | Optional channel name; unused bytes are zero. |
-|     69 |   51 | `_reserved2`          | u8[51] | Reserved for future additive fields. Zero-filled; readers must ignore. Additive, optional, zero-default fields may consume this space **without** a `format_version` bump; any field that changes existing semantics must bump the version. |
+|     49 |   48 | `channel_name`        | u8[48] | Optional channel name; unused bytes are zero. Widened from 20 in version 3. |
+|     97 |   23 | `_reserved2`          | u8[23] | Reserved for future additive fields. Zero-filled; readers must ignore. Additive, optional, zero-default fields may consume this space **without** a `format_version` bump; any field that changes existing semantics must bump the version. |
 |    120 |    8 | `generation`          | u64    | Opaque incarnation id for the channel, chosen at creation and stamped identically into every segment (immutable, carried across rolls, preserved when a writer reopens). `0` when unset. Distinguishes "this log continues" from "this path was deleted and recreated" — a recreated channel restarts at `channel_sequence = 0` and `base_record_index = 0`, so nothing else tells the two apart, and a persisted cursor would silently refer to unrelated data. A consumer that stores a read position should store this alongside it and treat a change as a different channel, not a gap. xchannel assigns no meaning to the value. Placed **last** so that additive fields consuming `_reserved2` from the front never move it. |
 
 The `MessageHeader(Channel)` at offset `0` covers the bytes `[16, 144)`; its
@@ -207,15 +207,25 @@ transitions to `1`.
 
 ## 8. Versioning and forward compatibility
 
-xchannel 4.0 introduces `format_version = 2`, which widens `ChannelHeader`
-to 128 bytes (adding `base_record_index` and reserved space) and redefines
-`message_count` as a per-file user-record count. Because the header grew,
-the records area shifts (first user record at offset 144 instead of 80), so
-v2 is **greenfield**: there is no in-place migration, and files at
-`format_version` `0` or `1` are not read by this build — regenerate them
-with a 4.0 writer, or keep using an older crate version to read them.
+xchannel 5.0 introduces `format_version = 3`, which widens `channel_name`
+from 20 to 48 bytes, taking the space from `_reserved2`. The header stays 128
+bytes and every other field — including `generation`, pinned at offset 120 —
+keeps its offset, so a v2 file is structurally readable. It is still a version
+bump rather than an additive change, because a v3 writer can store a name that
+a v2 reader would silently truncate at 20 bytes: the change redefines the
+meaning of bytes `[69, 97)` instead of adding to unused space. Like v2 before
+it, v3 is **greenfield** — there is no in-place migration.
 
-- A reader that sees `format_version != 2` must refuse the file.
+xchannel 4.0 introduced `format_version = 2`, which widened `ChannelHeader`
+to 128 bytes (adding `base_record_index` and reserved space) and redefined
+`message_count` as a per-file user-record count. Because the header grew,
+the records area shifted (first user record at offset 144 instead of 80).
+
+Files at `format_version` `0`, `1`, or `2` are not read by this build —
+regenerate them with a 5.0 writer, or keep using an older crate version to
+read them.
+
+- A reader that sees `format_version != 3` must refuse the file.
 - A reader that sees `endianness != 0x01` must refuse the file. (Only
   little-endian is defined today; values are reserved for future use.)
 - A reader that sees `user_header_kind != 0` must refuse the file unless

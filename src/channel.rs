@@ -89,13 +89,19 @@ impl HeaderType {
 
 /// Wire format version emitted and accepted by this crate. See `FORMAT.md`.
 ///
+/// v3 widened `channel_name` from 20 to 48 bytes, taking the space from `_reserved2`.
+/// The header stays 128 bytes and every other field keeps its offset, so v2 files are
+/// *structurally* readable — but a v3 writer can store a name a v2 reader would silently
+/// truncate at 20 bytes, which changes the meaning of existing bytes rather than adding
+/// to them. Per §8 that requires a version bump; v3 is greenfield like v2 before it.
+///
 /// v2 widened `ChannelHeader` from 64 to 128 bytes, adding `base_record_index`
 /// (absolute index of this file's first user record) and 56 reserved bytes, and
 /// redefined `message_count` as a per-file count of **user** records only (it no
 /// longer counts the Channel header or Skip markers). The records area consequently
 /// starts later in region 0, so v1 files are not read in place — there is no v1->v2
 /// migration; v2 is greenfield.
-pub(crate) const FORMAT_VERSION: u16 = 2;
+pub(crate) const FORMAT_VERSION: u16 = 3;
 /// Endianness discriminant for `ChannelHeader::endianness`. Only LE is defined.
 pub(crate) const ENDIANNESS_LE: u8 = 0x01;
 /// Default user-metadata layout: `{message_type:u16 @ 2, user_meta_u64:u64 @ 8}`.
@@ -146,11 +152,14 @@ pub(crate) struct ChannelHeader {
     /// Size of the user-owned bytes inside `MessageHeader` (`USER_HEADER_SIZE`).
     pub user_header_size: u8, // 48..49
     /// Optional channel name (unused bytes are 0).
-    pub channel_name: [u8; 20], // 49..69
+    /// Sized from [`crate::CHANNEL_NAME_MAX`] so the public limit and the on-disk
+    /// field can never drift apart — widening one widens the other, and the
+    /// `size_of::<ChannelHeader>() == 128` assertion below catches an overrun.
+    pub channel_name: [u8; crate::CHANNEL_NAME_MAX], // 49..97
     /// Reserved for future additive fields. Zero-filled; must be ignored on read.
     /// Additive, optional, zero-default fields may consume this without a
     /// `format_version` bump; anything that changes existing semantics must bump.
-    pub _reserved2: [u8; 51], // 69..120
+    pub _reserved2: [u8; 23], // 97..120
     /// Opaque **incarnation id** for this channel, chosen by whoever created it
     /// (`WriterBuilder::generation`, default 0) and stamped into every segment of
     /// the channel — immutable for its life, carried across rolls, and preserved
