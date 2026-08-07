@@ -2123,6 +2123,15 @@ impl Reader {
     }
 
     fn open_next_file(&mut self) -> io::Result<()> {
+        // The absolute index the next segment must begin at, computed from the one we are
+        // leaving: a roll stamps the new file's base as the old file's `base + message_count`.
+        // Read from the file we still hold open, so this works even after retention unlinked
+        // it (readers finish a pruned file through their inode reference).
+        let expected_base = {
+            let map = RegionMapping::create_read_only(&self.file, 0, region::page_size())?;
+            let ch = get_channel_header(map.as_ptr());
+            ch.base_record_index + ch.message_count.load(Ordering::Relaxed)
+        };
         self.file_sequence += 1;
         let file_path = make_channel_file_path(&self.base_path, self.file_sequence)?;
         let file = OpenOptions::new()
@@ -2144,6 +2153,19 @@ impl Reader {
         self.channel_name_cached = ch.channel_name;
         // Each rolled file has its own base; refresh so `base_record_index()` tracks it.
         self.base_record_index_cached = ch.base_record_index;
+        // The next segment must continue the absolute numbering. Anything else means this
+        // file did not come from the series we have been reading — segments from two
+        // different logs sharing a directory, an out-of-order or hand-copied file, or a
+        // channel that was deleted and rebuilt at the same path while we held an unlinked
+        // file open (the rebuilt series restarts at sequence 0 and reuses these very
+        // filenames, so nothing else about it looks wrong). Refuse rather than splice.
+        if ch.base_record_index != expected_base {
+            return Err(err_invalid_data(format!(
+                "base_record_index discontinuity: segment {} starts at {} but the previous \
+                 segment ends at {} (segments from a different series?)",
+                self.file_sequence, ch.base_record_index, expected_base
+            )));
+        }
         // Unlike the base, the generation is constant across a channel's segments, so a
         // mismatch means this segment belongs to a different incarnation of the path —
         // files from two channels mixed in one directory. Refuse rather than splice them,
@@ -2697,6 +2719,75 @@ mod tests {
         }
 
         cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// A segment that does not continue the absolute numbering is refused rather than
+    /// spliced. This is the case nothing else catches: a channel deleted and rebuilt at the
+    /// same path restarts at sequence 0 and reuses the same filenames, so a reader holding an
+    /// unlinked file can follow a roll into the *rebuilt* series with `channel_sequence` and
+    /// `generation` both matching. Only the base gives it away.
+    #[test]
+    fn test_roll_into_a_foreign_segment_is_refused() -> anyhow::Result<()> {
+        let region_size = crate::page_size();
+        let write_segments = |base: &str, start: u64, first: u64, second: u64| -> io::Result<()> {
+            let mut w = WriterBuilder::new(base)
+                .region_size(region_size)
+                .base_record_index(start)
+                .build()?;
+            let mut commit = |w: &mut Writer, n: u64| -> io::Result<()> {
+                for _ in 0..n {
+                    let buf = w.try_reserve(16)?;
+                    buf.fill(0x2C);
+                    w.commit(1, 16, 0)?;
+                }
+                Ok(())
+            };
+            commit(&mut w, first)?;
+            w.roll_file()?;
+            commit(&mut w, second)?;
+            Ok(())
+        };
+
+        let ours = "test_continuity_ours";
+        let theirs = "test_continuity_theirs";
+        cleanup_channel_files(ours);
+        cleanup_channel_files(theirs);
+        write_segments(ours, 0, 2, 2)?; // segments at bases 0 and 2
+        write_segments(theirs, 100, 5, 1)?; // segments at bases 100 and 105
+
+        // Intact, the series reads straight through — the check must not fire on a real roll.
+        {
+            let mut r = Reader::open(ours, ReaderMode::LateJoin)?;
+            let mut seen = 0;
+            while r.try_read()?.is_some() {
+                seen += 1;
+            }
+            assert_eq!(seen, 4);
+        }
+
+        // Swap in a segment from the other series. Same sequence number, same generation,
+        // same geometry — every other check passes.
+        std::fs::copy(
+            make_channel_file_path(Path::new(theirs), 1)?,
+            make_channel_file_path(Path::new(ours), 1)?,
+        )?;
+
+        let mut r = Reader::open(ours, ReaderMode::LateJoin)?;
+        assert!(r.try_read()?.is_some());
+        assert!(r.try_read()?.is_some());
+        let err = match r.try_read() {
+            Ok(_) => panic!("following the roll must refuse the foreign segment"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("discontinuity"),
+            "unexpected error: {err}"
+        );
+
+        cleanup_channel_files(ours);
+        cleanup_channel_files(theirs);
         Ok(())
     }
 

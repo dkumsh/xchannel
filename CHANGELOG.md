@@ -1,5 +1,22 @@
 # Changelog
 
+## 5.1.0 (2026-08-07)
+
+### Fixed
+- **A reader following a roll now verifies that the next segment continues the absolute
+  numbering** — its `base_record_index` must equal the previous segment's
+  `base_record_index + message_count` — and refuses it otherwise, joining the existing
+  `channel_sequence` and `generation` checks.
+  This catches the case none of the others can: a channel deleted and rebuilt at the same path
+  restarts at `channel_sequence` 0 and reuses the very same filenames, so a reader holding an
+  unlinked segment (normal under `keep_files` retention) could follow a roll straight into the
+  *rebuilt* series with sequence and generation both matching, and silently splice two
+  unrelated histories. It also catches segments from two logs sharing a directory, and
+  hand-copied or out-of-order files.
+  Note an inode check would not work here: retention unlinks files under live readers as a
+  matter of course, so "my file vanished" is a false positive on every prune — continuity is
+  the discriminator. Purely additive; no format change (`format_version` stays 3).
+
 ## 5.0.0 (2026-08-06)
 
 ### Changed
