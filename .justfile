@@ -57,6 +57,10 @@ bench-build:
 stress:
     cargo run --example two_readers --release -- --file xchan --messages 5m --region-size 1m --roll-size 8m --burst-pause-us 1 --burst-size 5
 
+# what the owned read path costs vs the borrowed one, across payload sizes
+owned-vs-borrowed:
+    cargo run --example owned_vs_borrowed --release -- --path {{ TMPFS_PATH }}/xch-owned-vs-borrowed
+
 # bursty workload with batch coalescing
 burst:
     # 16k region + 32k roll => ~341 msgs/region and ~682 msgs/file, so a 1024 batch spans 3+ regions and 2+ files.

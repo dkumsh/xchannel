@@ -16,6 +16,10 @@
   writer is finished, so a later call may yield more. It is therefore deliberately **not** a
   `FusedIterator`, and because it borrows the reader it can be re-driven on each poll; bound a
   single pass with `.take(n)` rather than assuming one terminates.
+- An `owned_vs_borrowed` example (`just owned-vs-borrowed`) pricing the owned path against the
+  borrowed one, and against copying the payload out as a cloning iterator would. The refcount
+  costs a roughly fixed few nanoseconds while a copy scales with payload, so which is cheaper
+  flips with record size — near 300 bytes on the author's hardware.
 
 ### Changed
 - Region mappings are stored behind `Arc` so an `OwnedMessage` stays valid after the reader has
