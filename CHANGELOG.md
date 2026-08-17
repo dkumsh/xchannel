@@ -1,5 +1,35 @@
 # Changelog
 
+## 5.2.0 (2026-08-17)
+
+### Added
+- **`Reader::try_read_owned` and `OwnedMessage`** — the same zero-copy view as `try_read`, but
+  holding a share of the mapped region instead of borrowing it, so it carries no lifetime.
+  `try_read` cannot be wrapped in an `Iterator`: `Iterator::next` yields an item that outlives
+  the `&mut self` call, whereas a `MessageRef<'_>` is tied to it, and handing out several would
+  let a later read unmap a region still in use. That is a lending iterator, which `std` cannot
+  express. An owned message has no lifetime to leak, so `Iterator` becomes expressible — and
+  since it is `Send`, a message can cross a thread boundary or be stored past the read that
+  produced it.
+- **`Reader::owned_messages`**, an `Iterator<Item = OwnedMessage>` over what is currently
+  available. `None` means *caught up*, not end of stream: nothing in a channel records that a
+  writer is finished, so a later call may yield more. It is therefore deliberately **not** a
+  `FusedIterator`, and because it borrows the reader it can be re-driven on each poll; bound a
+  single pass with `.take(n)` rather than assuming one terminates.
+
+### Changed
+- Region mappings are stored behind `Arc` so an `OwnedMessage` stays valid after the reader has
+  pruned that region, rolled past it, or been dropped entirely. The borrowed path is unaffected
+  in behaviour and in cost — no refcount is touched unless a message is taken by
+  `try_read_owned`; region setup and prune touch the count once per region, not per message.
+- **`prune_to_current` is now best-effort rather than a guarantee.** It drops the reader's share;
+  the `munmap` happens when the last share goes. Readers that only ever call `try_read` behave
+  exactly as before, but a retained `OwnedMessage` keeps its whole region mapped
+  (`region_size`, 1 MiB by default), so a consumer that stores messages makes the mapped
+  footprint its own responsibility. Copy the payload out if you need to hold it for long.
+
+Purely additive; no format change (`format_version` stays 3).
+
 ## 5.1.0 (2026-08-07)
 
 ### Fixed

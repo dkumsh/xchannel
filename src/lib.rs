@@ -32,6 +32,7 @@ use std::io::{self, ErrorKind};
 use std::mem::{align_of, size_of};
 use std::path::{Path, PathBuf};
 use std::slice;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -1323,6 +1324,102 @@ impl<'a> MessageRef<'a> {
         self.payload_len
     }
 }
+
+/// Where a located record lives, decoded so the borrow does not freeze `self`.
+#[derive(Clone, Copy, Debug)]
+struct RecordLoc {
+    map_idx: usize,
+    header_offset: usize,
+    payload_len: usize,
+}
+
+/// An owned message: a share of the mapped region plus the record's position
+/// within it. Carries no lifetime, so it can be stored, returned from an
+/// `Iterator`, or sent to another thread.
+///
+/// # Retention
+///
+/// Holding one keeps its **entire region** mapped — `region_size` bytes, 1 MiB
+/// by default — even after the Reader has pruned it, rolled past it, or been
+/// dropped. Retaining messages therefore makes the reader's mapped footprint
+/// consumer-controlled rather than bounded by the read cursor. Copy the payload
+/// out if you need to hold it for long.
+///
+/// # Truncation
+///
+/// As with [`MessageRef`], the mapping outlives the Reader's file descriptor but
+/// not a writer that *shrinks* the file: touching a page past a truncation
+/// raises `SIGBUS`. A long-lived `OwnedMessage` widens that window
+/// considerably.
+pub struct OwnedMessage {
+    region: Arc<MappedRegion>,
+    header_offset: usize,
+    payload_len: usize,
+}
+
+impl OwnedMessage {
+    #[inline]
+    pub fn header(&self) -> &MessageHeader {
+        let ptr = unsafe { self.region.mapping.as_ptr().add(self.header_offset) };
+        unsafe { &*(ptr as *const MessageHeader) }
+    }
+
+    /// Payload bytes. Borrowed from `self` rather than the mapping, so the
+    /// message must outlive the slice.
+    #[inline]
+    pub fn payload(&self) -> &[u8] {
+        let ptr = unsafe {
+            self.region
+                .mapping
+                .as_ptr()
+                .add(self.header_offset + HEADER_SLOT)
+        };
+        unsafe { slice::from_raw_parts(ptr, self.payload_len) }
+    }
+
+    #[inline]
+    #[allow(clippy::len_without_is_empty)]
+    pub fn len(&self) -> usize {
+        self.payload_len
+    }
+
+    /// Borrowed view of the same record, for code generic over `MessageRef`.
+    #[inline]
+    pub fn as_ref(&self) -> MessageRef<'_> {
+        MessageRef {
+            mapping: &self.region.mapping,
+            header_offset: self.header_offset,
+            payload_len: self.payload_len,
+        }
+    }
+}
+
+/// Iterator returned by [`Reader::owned_messages`].
+///
+/// Yields `None` when the reader is caught up, which is not end of stream; see
+/// [`Reader::owned_messages`]. Read errors terminate iteration — call
+/// [`Reader::try_read_owned`] directly if you need to observe them.
+pub struct OwnedMessages<'r> {
+    reader: &'r mut Reader,
+}
+
+impl<'r> OwnedMessages<'r> {
+    /// The borrowed Reader, e.g. to call `wait_for_message` between passes.
+    #[inline]
+    pub fn reader(&mut self) -> &mut Reader {
+        self.reader
+    }
+}
+
+impl Iterator for OwnedMessages<'_> {
+    type Item = OwnedMessage;
+
+    #[inline]
+    fn next(&mut self) -> Option<OwnedMessage> {
+        self.reader.try_read_owned().ok().flatten()
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct MsgPos {
     // Index into Reader.batch_segs (not maps).
@@ -1359,7 +1456,7 @@ struct ScannedHeader {
 pub struct MessageBatch<'a> {
     segs: &'a [BatchSeg],
     pos: &'a [MsgPos],
-    maps: &'a [MappedRegion],
+    maps: &'a [Arc<MappedRegion>],
 }
 
 impl<'a> MessageBatch<'a> {
@@ -1440,7 +1537,9 @@ pub struct Reader {
     batch_limit: Option<u16>,
     batch_segs: Vec<BatchSeg>,
     batch_pos: Vec<MsgPos>,
-    maps: Vec<MappedRegion>, // last entry is current; older entries kept for batch segments
+    // Refcounted so an `OwnedMessage` can keep its region mapped after the
+    // Reader has pruned it, rolled past it, or been dropped entirely.
+    maps: Vec<Arc<MappedRegion>>, // last entry is current; older entries kept for batch segments
 }
 
 impl Reader {
@@ -1538,11 +1637,11 @@ impl Reader {
         let current_region =
             RegionMapping::create_read_only(&file, region_index * region_size as u64, region_size)?;
         let mut maps = Vec::with_capacity(DEFAULT_BATCH_MAPS_CAP);
-        maps.push(MappedRegion {
+        maps.push(Arc::new(MappedRegion {
             file_sequence: sequence,
             region_idx: region_index,
             mapping: current_region,
-        });
+        }));
 
         Ok(Self {
             base_path,
@@ -1664,7 +1763,7 @@ impl Reader {
 
     #[inline]
     fn current_map(&self) -> Option<&MappedRegion> {
-        self.maps.last()
+        self.maps.last().map(Arc::as_ref)
     }
 
     #[inline]
@@ -1691,11 +1790,11 @@ impl Reader {
         let file = scan_file.unwrap_or(&self.file);
         let map =
             RegionMapping::create_read_only(file, region_idx * region_size as u64, region_size)?;
-        self.maps.push(MappedRegion {
+        self.maps.push(Arc::new(MappedRegion {
             file_sequence: scan_file_sequence,
             region_idx,
             mapping: map,
-        });
+        }));
         Ok(())
     }
 
@@ -1858,6 +1957,60 @@ impl Reader {
     /// Read next message if available. Roll to next file on `Roll`.
     /// Steady path: rely on per-record `committed` plus Skip/Roll markers; no `write_position`.
     pub fn try_read(&mut self) -> io::Result<Option<MessageRef<'_>>> {
+        let Some(loc) = self.advance_to_user_record()? else {
+            return Ok(None);
+        };
+        Ok(Some(MessageRef {
+            mapping: &self.maps[loc.map_idx].mapping,
+            header_offset: loc.header_offset,
+            payload_len: loc.payload_len,
+        }))
+    }
+
+    /// Like [`Reader::try_read`], but the returned message owns a share of the
+    /// region it points into, so it carries no lifetime and may outlive the
+    /// Reader.
+    ///
+    /// Prefer `try_read` on hot paths: this clones an `Arc` per message, and a
+    /// retained message keeps its whole region mapped (see [`OwnedMessage`]).
+    pub fn try_read_owned(&mut self) -> io::Result<Option<OwnedMessage>> {
+        let Some(loc) = self.advance_to_user_record()? else {
+            return Ok(None);
+        };
+        Ok(Some(OwnedMessage {
+            region: Arc::clone(&self.maps[loc.map_idx]),
+            header_offset: loc.header_offset,
+            payload_len: loc.payload_len,
+        }))
+    }
+
+    /// Iterator over messages currently available, yielding owned messages.
+    ///
+    /// `None` means *caught up*, not end of stream — a later call may yield
+    /// more once the writer appends, which is why this is deliberately not a
+    /// `FusedIterator`. Because it borrows the Reader, the same iterator can
+    /// be re-driven on the next poll; bound a single pass with
+    /// [`Iterator::take`].
+    ///
+    /// ```no_run
+    /// # use xchannel::{Reader, ReaderMode};
+    /// # fn f(reader: &mut Reader) -> std::io::Result<()> {
+    /// for msg in reader.owned_messages().take(1024) {
+    ///     let _ = msg.payload();
+    /// }
+    /// # Ok(()) }
+    /// ```
+    pub fn owned_messages(&mut self) -> OwnedMessages<'_> {
+        OwnedMessages { reader: self }
+    }
+
+    /// Advance the cursor to the next committed user record, transparently
+    /// consuming Skip / Channel / Roll service records.
+    ///
+    /// Returns where the record lives rather than a view of it, so the borrow
+    /// does not freeze `self` and both the borrowed and owned readers can build
+    /// their own view afterwards.
+    fn advance_to_user_record(&mut self) -> io::Result<Option<RecordLoc>> {
         self.prune_to_current();
         loop {
             let region_size = self.region_size();
@@ -1891,17 +2044,18 @@ impl Reader {
             match hdr.header_type {
                 HeaderType::User => {
                     let region_size = self.region_size();
+                    // Captured before `switch_region`, which only ever pushes,
+                    // so the index stays valid for the record just located.
                     let msg_map_idx = self.maps.len() - 1;
                     self.read_position = next_pos;
                     if next_pos.is_multiple_of(region_size) {
                         self.switch_region((next_pos / region_size) as u64)?;
                     }
-                    let msg = MessageRef {
-                        mapping: &self.maps[msg_map_idx].mapping,
+                    return Ok(Some(RecordLoc {
+                        map_idx: msg_map_idx,
                         header_offset: off,
                         payload_len: hdr.payload_len,
-                    };
-                    return Ok(Some(msg));
+                    }));
                 }
                 HeaderType::Skip | HeaderType::Channel => {
                     let region_size = self.region_size();
@@ -2114,11 +2268,11 @@ impl Reader {
         let region_size = self.region_size();
         let new_map =
             RegionMapping::create_read_only(&self.file, idx * region_size as u64, region_size)?;
-        self.maps.push(MappedRegion {
+        self.maps.push(Arc::new(MappedRegion {
             file_sequence: self.file_sequence,
             region_idx: idx,
             mapping: new_map,
-        });
+        }));
         Ok(())
     }
 
@@ -2181,11 +2335,11 @@ impl Reader {
         self.file = file;
         self.read_position = 0;
         self.maps.clear();
-        self.maps.push(MappedRegion {
+        self.maps.push(Arc::new(MappedRegion {
             file_sequence: self.file_sequence,
             region_idx: 0,
             mapping: region0,
-        });
+        }));
         Ok(())
     }
 }
@@ -4477,6 +4631,211 @@ mod tests {
             seen > 0,
             "reader should observe at least some of the writes (saw {seen})"
         );
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    fn write_msgs(base: &str, region_size: usize, ids: &[u16], fill: u8) -> anyhow::Result<()> {
+        let mut writer = WriterBuilder::new(base)
+            .region_size(region_size)
+            .file_roll_size((region_size as u64) * 8)
+            .mtu(0)
+            .build()?;
+        for (i, id) in ids.iter().enumerate() {
+            let buf = writer.try_reserve(64)?;
+            buf.fill(fill.wrapping_add(i as u8));
+            writer.commit(*id, 64, i as u64)?;
+        }
+        Ok(())
+    }
+
+    /// The whole point of the owned flavour: the region stays mapped after the
+    /// Reader that produced the message is gone.
+    #[test]
+    fn owned_message_outlives_its_reader() -> anyhow::Result<()> {
+        let base = "test_owned_outlives_reader";
+        cleanup_channel_files(base);
+        let region_size = crate::page_size();
+        write_msgs(base, region_size, &[7], 0xA1)?;
+
+        let msg = {
+            let mut reader = Reader::open(base, ReaderMode::LateJoin)?;
+            reader
+                .try_read_owned()?
+                .expect("one committed user record is available")
+        };
+        // Reader dropped here; the mapping must survive with it.
+
+        assert_eq!(msg.len(), 64);
+        assert_eq!(msg.header().message_type, 7);
+        assert!(msg.payload().iter().all(|&b| b == 0xA1));
+        assert_eq!(msg.as_ref().payload(), msg.payload());
+
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// Prune and region switches drop the Reader's share only.
+    #[test]
+    fn owned_message_survives_prune_and_region_switch() -> anyhow::Result<()> {
+        let base = "test_owned_survives_prune";
+        cleanup_channel_files(base);
+        let region_size = crate::page_size();
+        // Enough 64-byte records to spill well past the first region.
+        let ids: Vec<u16> = (0..(region_size as u16 / 64) * 3).collect();
+        write_msgs(base, region_size, &ids, 0xB2)?;
+
+        let mut reader = Reader::open(base, ReaderMode::LateJoin)?;
+        let first = reader.try_read_owned()?.expect("first record");
+        let first_payload: Vec<u8> = first.payload().to_vec();
+
+        // Drain the rest, forcing switch_region + prune_to_current repeatedly.
+        let mut drained = 0usize;
+        while reader.try_read_owned()?.is_some() {
+            drained += 1;
+        }
+        assert!(
+            drained >= ids.len() - 1,
+            "expected to drain the remaining records, got {drained} of {}",
+            ids.len() - 1
+        );
+
+        // The first message still points at intact bytes.
+        assert_eq!(first.payload(), first_payload.as_slice());
+        assert!(first.payload().iter().all(|&b| b == 0xB2));
+
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// `None` means caught up, not finished: the same iterator yields more once
+    /// the writer appends. This is why `OwnedMessages` is not a `FusedIterator`.
+    #[test]
+    fn owned_messages_iterator_resumes_after_more_writes() -> anyhow::Result<()> {
+        let base = "test_owned_iter_resumes";
+        cleanup_channel_files(base);
+        let region_size = crate::page_size();
+        let file_roll_size = (region_size as u64) * 8;
+
+        let mut writer = WriterBuilder::new(base)
+            .region_size(region_size)
+            .file_roll_size(file_roll_size)
+            .mtu(0)
+            .build()?;
+        let publish = |w: &mut Writer, id: u16| -> anyhow::Result<()> {
+            let buf = w.try_reserve(64)?;
+            buf.fill(id as u8);
+            w.commit(id, 64, id as u64)?;
+            Ok(())
+        };
+
+        publish(&mut writer, 1)?;
+        publish(&mut writer, 2)?;
+
+        let mut reader = Reader::open(base, ReaderMode::LateJoin)?;
+        let first: Vec<u16> = reader
+            .owned_messages()
+            .map(|m| m.header().message_type)
+            .collect();
+        assert_eq!(first, vec![1, 2], "first pass drains what was available");
+
+        // Caught up, not finished.
+        assert!(reader.try_read_owned()?.is_none());
+
+        publish(&mut writer, 3)?;
+        let second: Vec<u16> = reader
+            .owned_messages()
+            .map(|m| m.header().message_type)
+            .collect();
+        assert_eq!(second, vec![3], "iteration resumes after None");
+
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// A pass can be bounded with a plain adapter, so the reader keeps control.
+    #[test]
+    fn owned_messages_take_bounds_a_pass() -> anyhow::Result<()> {
+        let base = "test_owned_iter_take";
+        cleanup_channel_files(base);
+        let region_size = crate::page_size();
+        write_msgs(base, region_size, &[10, 11, 12, 13], 0xC3)?;
+
+        let mut reader = Reader::open(base, ReaderMode::LateJoin)?;
+        let batch: Vec<u16> = reader
+            .owned_messages()
+            .take(2)
+            .map(|m| m.header().message_type)
+            .collect();
+        assert_eq!(batch, vec![10, 11]);
+
+        // The cursor advanced by exactly two; the rest is still pending.
+        let rest: Vec<u16> = reader
+            .owned_messages()
+            .map(|m| m.header().message_type)
+            .collect();
+        assert_eq!(rest, vec![12, 13]);
+
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// Borrowed and owned readers must agree, and interleave on one cursor.
+    #[test]
+    fn borrowed_and_owned_reads_share_one_cursor() -> anyhow::Result<()> {
+        let base = "test_owned_borrowed_interleave";
+        cleanup_channel_files(base);
+        let region_size = crate::page_size();
+        write_msgs(base, region_size, &[21, 22, 23], 0xD4)?;
+
+        let mut reader = Reader::open(base, ReaderMode::LateJoin)?;
+        let a = reader.try_read()?.expect("first").header().message_type;
+        let b = reader
+            .try_read_owned()?
+            .expect("second")
+            .header()
+            .message_type;
+        let c = reader.try_read()?.expect("third").header().message_type;
+        assert_eq!((a, b, c), (21, 22, 23));
+        assert!(reader.try_read()?.is_none());
+
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// `Send` and `Sync` here are auto-trait properties, not declarations: they
+    /// hold only because the mapping behind the `Arc` is itself `Send + Sync`.
+    /// Swapping `Arc` for `Rc` would strip them from `Reader` too, and nothing
+    /// else in the suite would notice, so pin them.
+    #[test]
+    fn owned_message_and_reader_are_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<OwnedMessage>();
+        assert_send_sync::<Reader>();
+        assert_send_sync::<MessageRef<'static>>();
+    }
+
+    /// The property `Send` is there for: hand a message to another thread and
+    /// read it there, after the reader that produced it is already gone.
+    #[test]
+    fn owned_message_can_be_read_on_another_thread() -> anyhow::Result<()> {
+        let base = "test_owned_crosses_thread";
+        cleanup_channel_files(base);
+        let region_size = crate::page_size();
+        write_msgs(base, region_size, &[31], 0xE5)?;
+
+        let msg = {
+            let mut reader = Reader::open(base, ReaderMode::LateJoin)?;
+            reader.try_read_owned()?.expect("one record")
+        };
+
+        let (len, first, msg_type) =
+            std::thread::spawn(move || (msg.len(), msg.payload()[0], msg.header().message_type))
+                .join()
+                .expect("worker panicked");
+
+        assert_eq!((len, first, msg_type), (64, 0xE5, 31));
+
         cleanup_channel_files(base);
         Ok(())
     }
