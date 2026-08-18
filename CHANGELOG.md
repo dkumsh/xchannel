@@ -5,19 +5,29 @@
 ### Added
 - **`Reader::try_read_owned` and `OwnedMessage`** — the same zero-copy view as `try_read`, but
   holding a share of the mapped region instead of borrowing it, so it carries no lifetime.
-  `try_read` cannot be wrapped in an `Iterator`: `Iterator::next` yields an item that outlives
-  the `&mut self` call, whereas a `MessageRef<'_>` is tied to it, and handing out several would
-  let a later read unmap a region still in use. That is a lending iterator, which `std` cannot
-  express. An owned message has no lifetime to leak, so `Iterator` becomes expressible — and
-  since it is `Send`, a message can cross a thread boundary or be stored past the read that
-  produced it.
-- **`Reader::owned_messages`**, an `Iterator<Item = OwnedMessage>` over what is currently
-  available. `None` means *caught up*, not end of stream: nothing in a channel records that a
-  writer is finished, so a later call may yield more. It is therefore deliberately **not** a
-  `FusedIterator`, and because it borrows the reader it can be re-driven on each poll; bound a
-  single pass with `.take(n)` rather than assuming one terminates.
+  A `MessageRef<'_>` is tied to the `&mut self` call that produced it and cannot be stored,
+  returned, or sent anywhere; an owned message has no lifetime to leak, and since it is `Send`
+  it can cross a thread boundary or outlive the reader entirely.
+- **`Reader::read_owned_into`**, which drains available messages into a caller-owned
+  `Vec<OwnedMessage>` and returns how many, plus **`Reader::owned_batch`** as the allocating
+  wrapper. `max` bounds the pass; `None` drains until caught up. A short count — including `0` —
+  means *caught up*, not end of stream: nothing in a channel records that a writer is finished,
+  so a later call may yield more. Prefer `Some(n)` on a polling loop: an unbounded pass returns
+  only once the reader reaches an uncommitted header, so a writer that keeps committing can keep
+  it going, growing the buffer and pinning a region per retained message.
+
+  This is deliberately **not** an `Iterator` over the reader. A lazy iterator driving the read
+  cursor is unsound to combine with any adapter that buffers or discards an item — `peekable`,
+  `take_while`, `zip`, `chunks` — because every pull *consumes* from the channel and there is no
+  way to put a message back. `Peekable::peek` advances the cursor and parks the message inside
+  the adapter, and since the adapter borrows the reader you must drop it before reading again,
+  which loses that message permanently. Draining into a buffer first makes all of them sound:
+  what an adapter discards is a message the caller already holds. It also lets read errors
+  surface at the call instead of being flattened into "no more messages".
+- **`MessageBatch::get_owned`** — promote one message out of a borrowed batch, for the few
+  records a consumer wants to keep past the next poll.
 - An `owned_vs_borrowed` example (`just owned-vs-borrowed`) pricing the owned path against the
-  borrowed one, and against copying the payload out as a cloning iterator would. The refcount
+  borrowed one, and against copying the payload out as a cloning reader would. The refcount
   costs a roughly fixed few nanoseconds while a copy scales with payload, so which is cheaper
   flips with record size — near 300 bytes on the author's hardware.
 

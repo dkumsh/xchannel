@@ -2,14 +2,14 @@
 //!
 //! `try_read` hands out a `MessageRef<'_>` borrowed from the mapping and
 //! touches no refcount. `try_read_owned` clones an `Arc` per message so the
-//! result carries no lifetime, which is what makes `owned_messages()` a real
-//! `Iterator` and lets a message outlive the reader or cross a thread.
+//! result carries no lifetime, which lets a message outlive the reader or cross
+//! a thread.
 //!
 //! Four passes over the same channel are compared:
 //!   - `try_read`          — borrowed, the baseline
 //!   - `try_read_owned`    — owned, one Arc clone + drop per message
-//!   - `owned_messages()`  — the same via the Iterator, to price the wrapper
-//!   - copy payload out    — what a cloning iterator does instead of sharing
+//!   - `read_owned_into`   — the same, drained through a reused buffer
+//!   - copy payload out    — what a cloning reader does instead of sharing
 //!
 //! The last one is the interesting comparison. The refcount costs a roughly
 //! fixed few nanoseconds while the copy scales with payload, so which flavour
@@ -37,7 +37,10 @@ use std::io;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use xchannel::{Reader, ReaderMode, WriterBuilder, cleanup_channel_files};
+use xchannel::{OwnedMessage, Reader, ReaderMode, WriterBuilder, cleanup_channel_files};
+
+/// Messages drained per `read_owned_into` call in the buffered pass.
+const DRAIN_BATCH: usize = 1024;
 
 /// Payload sizes benchmarked. Fixed at compile time because the copy-out pass
 /// needs a `[u8; N]` to model a bitwise copy of an owned record without a
@@ -140,14 +143,18 @@ fn pass_owned(base: &str) -> io::Result<(usize, u64)> {
     Ok((n, t.elapsed().as_nanos() as u64))
 }
 
-/// Same work through the Iterator, to price the wrapper itself.
-fn pass_owned_iter(base: &str) -> io::Result<(usize, u64)> {
+/// Same work drained into a reused buffer, to price the round-trip through it.
+fn pass_owned_drain(base: &str) -> io::Result<(usize, u64)> {
     let mut r = Reader::open(base, ReaderMode::LateJoin)?;
+    // Allocated outside the timer: on a polling path the buffer is reused.
+    let mut buf: Vec<OwnedMessage> = Vec::with_capacity(DRAIN_BATCH);
     let (mut n, mut sum) = (0usize, 0u64);
     let t = Instant::now();
-    for m in r.owned_messages() {
-        sum += black_box(m.payload()[0]) as u64;
-        n += 1;
+    while r.read_owned_into(&mut buf, Some(DRAIN_BATCH))? > 0 {
+        for m in buf.drain(..) {
+            sum += black_box(m.payload()[0]) as u64;
+            n += 1;
+        }
     }
     black_box(sum);
     Ok((n, t.elapsed().as_nanos() as u64))
@@ -184,7 +191,7 @@ fn run<const P: usize>(base: &str, working_set: usize, rounds: usize) -> io::Res
         // Interleaved so any drift lands on every variant equally.
         let (n1, t1) = pass_borrowed(base)?;
         let (n2, t2) = pass_owned(base)?;
-        let (n3, t3) = pass_owned_iter(base)?;
+        let (n3, t3) = pass_owned_drain(base)?;
         let (n4, t4) = pass_copied::<P>(base)?;
         assert!(
             n1 == msgs && n2 == msgs && n3 == msgs && n4 == msgs,
@@ -217,7 +224,7 @@ fn run<const P: usize>(base: &str, working_set: usize, rounds: usize) -> io::Res
         os.min, os.median, od, op
     );
     println!(
-        "  owned_messages  {:7.2}  {:8.2}   {:+7.2} ns  {:+6.1}%",
+        "  read_owned_into {:7.2}  {:8.2}   {:+7.2} ns  {:+6.1}%",
         is.min, is.median, idd, ip
     );
     println!(

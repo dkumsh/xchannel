@@ -1334,8 +1334,8 @@ struct RecordLoc {
 }
 
 /// An owned message: a share of the mapped region plus the record's position
-/// within it. Carries no lifetime, so it can be stored, returned from an
-/// `Iterator`, or sent to another thread.
+/// within it. Carries no lifetime, so it can be stored, collected into a
+/// `Vec`, or sent to another thread.
 ///
 /// # Retention
 ///
@@ -1391,32 +1391,6 @@ impl OwnedMessage {
             header_offset: self.header_offset,
             payload_len: self.payload_len,
         }
-    }
-}
-
-/// Iterator returned by [`Reader::owned_messages`].
-///
-/// Yields `None` when the reader is caught up, which is not end of stream; see
-/// [`Reader::owned_messages`]. Read errors terminate iteration — call
-/// [`Reader::try_read_owned`] directly if you need to observe them.
-pub struct OwnedMessages<'r> {
-    reader: &'r mut Reader,
-}
-
-impl<'r> OwnedMessages<'r> {
-    /// The borrowed Reader, e.g. to call `wait_for_message` between passes.
-    #[inline]
-    pub fn reader(&mut self) -> &mut Reader {
-        self.reader
-    }
-}
-
-impl Iterator for OwnedMessages<'_> {
-    type Item = OwnedMessage;
-
-    #[inline]
-    fn next(&mut self) -> Option<OwnedMessage> {
-        self.reader.try_read_owned().ok().flatten()
     }
 }
 
@@ -1518,6 +1492,28 @@ impl<'a> MessageBatch<'a> {
     /// Iterate user messages in this batch (supports `.rev()`).
     pub fn iter(&'a self) -> impl DoubleEndedIterator<Item = MessageRef<'a>> + 'a {
         self.pos.iter().map(|p| self.message_at(*p))
+    }
+
+    /// Promote one message to an [`OwnedMessage`], which carries no lifetime and
+    /// so may outlive both the batch and the Reader.
+    ///
+    /// Shares the mapping rather than copying the payload, so this is the cheap
+    /// way to keep a few records out of an otherwise borrowed batch — at the
+    /// retention cost described on [`OwnedMessage`].
+    #[inline]
+    pub fn get_owned(&self, index: usize) -> Option<OwnedMessage> {
+        self.pos.get(index).map(|pos| self.owned_at(*pos))
+    }
+
+    #[inline]
+    fn owned_at(&self, pos: MsgPos) -> OwnedMessage {
+        // Via `message_at` so the bounds assertions live in exactly one place.
+        let msg = self.message_at(pos);
+        OwnedMessage {
+            region: Arc::clone(&self.maps[self.segs[pos.seg as usize].map_idx]),
+            header_offset: msg.header_offset,
+            payload_len: msg.payload_len,
+        }
     }
 }
 
@@ -1984,24 +1980,98 @@ impl Reader {
         }))
     }
 
-    /// Iterator over messages currently available, yielding owned messages.
+    /// Drain currently-available user messages into `out`, appending them in
+    /// stream order, and return how many were appended.
     ///
-    /// `None` means *caught up*, not end of stream — a later call may yield
-    /// more once the writer appends, which is why this is deliberately not a
-    /// `FusedIterator`. Because it borrows the Reader, the same iterator can
-    /// be re-driven on the next poll; bound a single pass with
-    /// [`Iterator::take`].
+    /// `max` bounds the pass; `None` drains until the reader is caught up.
+    /// `Some(0)` returns `Ok(0)` without touching the cursor. Unlike
+    /// [`Reader::try_read_batch`], `None` here is plain unbounded — it does not
+    /// consult the builder's `batch_limit`, which governs the batch scan.
+    ///
+    /// A short count — including `0` — means *caught up*, not end of stream: a
+    /// later call yields more once the writer appends. Service records (Skip /
+    /// Channel / Roll) are consumed transparently and do not count against
+    /// `max`.
+    ///
+    /// `out` is appended to, never cleared, and its capacity is reused across
+    /// polls — this is the allocation-free way to work through owned messages.
+    ///
+    /// On error, messages read before the failure stay in `out` and the cursor
+    /// has advanced past them; the caller can still process them, and should
+    /// compare `out.len()` before and after to know how many arrived.
+    ///
+    /// # Choosing a bound
+    ///
+    /// `None` terminates only when the reader reaches an uncommitted header, so
+    /// against a writer that keeps committing it may not terminate at all —
+    /// `out` grows without bound, and every retained message pins its whole
+    /// region mapped (see [`OwnedMessage`]). Use it for a drain-and-stop pass,
+    /// and pass `Some(n)` on a steady polling loop so each poll is bounded and
+    /// the buffer settles at a known capacity.
+    ///
+    /// # Why this instead of an `Iterator` over the Reader
+    ///
+    /// A lazy iterator driving the read cursor cannot be combined safely with
+    /// the adapters that buffer or discard an item — `peekable`, `take_while`,
+    /// `zip`, `chunks` — because every pull *consumes* from the channel and
+    /// there is no way to put a message back. `Peekable::peek` advances the
+    /// cursor and parks the message inside the adapter, so dropping the adapter
+    /// loses that message permanently. Draining into `out` first makes all of
+    /// them sound: what an adapter discards is a message you already hold.
     ///
     /// ```no_run
-    /// # use xchannel::{Reader, ReaderMode};
+    /// # use xchannel::{OwnedMessage, Reader, ReaderMode};
     /// # fn f(reader: &mut Reader) -> std::io::Result<()> {
-    /// for msg in reader.owned_messages().take(1024) {
-    ///     let _ = msg.payload();
+    /// let mut buf: Vec<OwnedMessage> = Vec::with_capacity(1024);
+    /// loop {
+    ///     if reader.read_owned_into(&mut buf, Some(1024))? == 0 {
+    ///         reader.wait_for_message(None)?;
+    ///         continue;
+    ///     }
+    ///     let mut it = buf.drain(..).peekable();
+    ///     while let Some(msg) = it.next() {
+    ///         // Safe here: anything `peek` holds is a message we own.
+    ///         let more_of_the_same =
+    ///             it.peek().is_some_and(|n| n.header().message_type == msg.header().message_type);
+    ///         let _ = (msg.payload(), more_of_the_same);
+    ///     }
     /// }
-    /// # Ok(()) }
+    /// # }
     /// ```
-    pub fn owned_messages(&mut self) -> OwnedMessages<'_> {
-        OwnedMessages { reader: self }
+    pub fn read_owned_into(
+        &mut self,
+        out: &mut Vec<OwnedMessage>,
+        max: Option<usize>,
+    ) -> io::Result<usize> {
+        let max = max.unwrap_or(usize::MAX);
+        if max == 0 {
+            return Ok(0);
+        }
+        // No reserve: `max` may be huge (unbounded passes it as `usize::MAX`)
+        // and a reused buffer settles at the right capacity after one pass.
+        let mut n = 0;
+        while n < max {
+            match self.try_read_owned()? {
+                Some(msg) => {
+                    out.push(msg);
+                    n += 1;
+                }
+                None => break,
+            }
+        }
+        Ok(n)
+    }
+
+    /// [`Reader::read_owned_into`] with the buffer allocated for you. `None`
+    /// drains until caught up; see there on choosing a bound.
+    ///
+    /// Convenience for scripts and tests; on a polling path prefer
+    /// `read_owned_into` with a reused buffer, which allocates once rather than
+    /// once per call.
+    pub fn owned_batch(&mut self, max: Option<usize>) -> io::Result<Vec<OwnedMessage>> {
+        let mut out = Vec::new();
+        self.read_owned_into(&mut out, max)?;
+        Ok(out)
     }
 
     /// Advance the cursor to the next committed user record, transparently
@@ -2889,7 +2959,7 @@ mod tests {
                 .region_size(region_size)
                 .base_record_index(start)
                 .build()?;
-            let mut commit = |w: &mut Writer, n: u64| -> io::Result<()> {
+            let commit = |w: &mut Writer, n: u64| -> io::Result<()> {
                 for _ in 0..n {
                     let buf = w.try_reserve(16)?;
                     buf.fill(0x2C);
@@ -4635,6 +4705,10 @@ mod tests {
         Ok(())
     }
 
+    fn types(msgs: &[OwnedMessage]) -> Vec<u16> {
+        msgs.iter().map(|m| m.header().message_type).collect()
+    }
+
     fn write_msgs(base: &str, region_size: usize, ids: &[u16], fill: u8) -> anyhow::Result<()> {
         let mut writer = WriterBuilder::new(base)
             .region_size(region_size)
@@ -4681,8 +4755,9 @@ mod tests {
         let base = "test_owned_survives_prune";
         cleanup_channel_files(base);
         let region_size = crate::page_size();
-        // Enough 64-byte records to spill well past the first region.
-        let ids: Vec<u16> = (0..(region_size as u16 / 64) * 3).collect();
+        // Enough 64-byte records to spill well past the first region. Counted in
+        // usize: `region_size as u16` truncates to 0 on a 64 KiB-page host.
+        let ids: Vec<u16> = (0..(region_size / 64) * 3).map(|i| i as u16).collect();
         write_msgs(base, region_size, &ids, 0xB2)?;
 
         let mut reader = Reader::open(base, ReaderMode::LateJoin)?;
@@ -4708,11 +4783,11 @@ mod tests {
         Ok(())
     }
 
-    /// `None` means caught up, not finished: the same iterator yields more once
-    /// the writer appends. This is why `OwnedMessages` is not a `FusedIterator`.
+    /// A short count means caught up, not finished: a later drain sees more once
+    /// the writer appends.
     #[test]
-    fn owned_messages_iterator_resumes_after_more_writes() -> anyhow::Result<()> {
-        let base = "test_owned_iter_resumes";
+    fn read_owned_into_resumes_after_more_writes() -> anyhow::Result<()> {
+        let base = "test_owned_drain_resumes";
         cleanup_channel_files(base);
         let region_size = crate::page_size();
         let file_roll_size = (region_size as u64) * 8;
@@ -4733,48 +4808,133 @@ mod tests {
         publish(&mut writer, 2)?;
 
         let mut reader = Reader::open(base, ReaderMode::LateJoin)?;
-        let first: Vec<u16> = reader
-            .owned_messages()
-            .map(|m| m.header().message_type)
-            .collect();
-        assert_eq!(first, vec![1, 2], "first pass drains what was available");
+        let mut buf: Vec<OwnedMessage> = Vec::new();
 
-        // Caught up, not finished.
-        assert!(reader.try_read_owned()?.is_none());
+        // Unbounded: drains until caught up.
+        assert_eq!(reader.read_owned_into(&mut buf, None)?, 2);
+        assert_eq!(types(&buf), vec![1, 2], "first pass drains what was there");
+        buf.clear();
+
+        // Caught up, not finished — an unbounded pass still returns.
+        assert_eq!(reader.read_owned_into(&mut buf, None)?, 0);
+        assert!(buf.is_empty());
 
         publish(&mut writer, 3)?;
-        let second: Vec<u16> = reader
-            .owned_messages()
-            .map(|m| m.header().message_type)
-            .collect();
-        assert_eq!(second, vec![3], "iteration resumes after None");
+        assert_eq!(reader.read_owned_into(&mut buf, None)?, 1);
+        assert_eq!(types(&buf), vec![3], "draining resumes after a zero count");
 
         cleanup_channel_files(base);
         Ok(())
     }
 
-    /// A pass can be bounded with a plain adapter, so the reader keeps control.
+    /// `max` bounds the pass exactly, and appends rather than clearing.
     #[test]
-    fn owned_messages_take_bounds_a_pass() -> anyhow::Result<()> {
-        let base = "test_owned_iter_take";
+    fn read_owned_into_bounds_a_pass_and_appends() -> anyhow::Result<()> {
+        let base = "test_owned_drain_max";
         cleanup_channel_files(base);
         let region_size = crate::page_size();
         write_msgs(base, region_size, &[10, 11, 12, 13], 0xC3)?;
 
         let mut reader = Reader::open(base, ReaderMode::LateJoin)?;
-        let batch: Vec<u16> = reader
-            .owned_messages()
-            .take(2)
-            .map(|m| m.header().message_type)
-            .collect();
-        assert_eq!(batch, vec![10, 11]);
+        let mut buf: Vec<OwnedMessage> = Vec::new();
 
-        // The cursor advanced by exactly two; the rest is still pending.
-        let rest: Vec<u16> = reader
-            .owned_messages()
-            .map(|m| m.header().message_type)
-            .collect();
-        assert_eq!(rest, vec![12, 13]);
+        assert_eq!(reader.read_owned_into(&mut buf, Some(2))?, 2);
+        assert_eq!(types(&buf), vec![10, 11]);
+
+        // Appends to the same buffer; the cursor advanced by exactly two.
+        assert_eq!(reader.read_owned_into(&mut buf, Some(2))?, 2);
+        assert_eq!(types(&buf), vec![10, 11, 12, 13]);
+
+        assert_eq!(
+            reader.read_owned_into(&mut buf, Some(0))?,
+            0,
+            "Some(0) is a no-op"
+        );
+        assert_eq!(types(&buf), vec![10, 11, 12, 13]);
+        assert_eq!(
+            reader.read_owned_into(&mut buf, None)?,
+            0,
+            "and there is nothing left for an unbounded pass"
+        );
+
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// The reason the drain exists: adapters that buffer or discard are sound
+    /// over an owned buffer. Peeking here cannot lose a message, because the
+    /// peeked one is already ours — the pre-batch iterator lost it on drop.
+    #[test]
+    fn draining_buffer_survives_peekable() -> anyhow::Result<()> {
+        let base = "test_owned_drain_peekable";
+        cleanup_channel_files(base);
+        let region_size = crate::page_size();
+        write_msgs(base, region_size, &[21, 22, 23], 0xD4)?;
+
+        let mut reader = Reader::open(base, ReaderMode::LateJoin)?;
+        let mut buf = reader.owned_batch(None)?;
+        assert_eq!(types(&buf), vec![21, 22, 23]);
+
+        // Peek, then abandon the adapter mid-pass. Nothing is lost: the records
+        // are still in `buf`, because `drain` was never started.
+        {
+            let mut it = buf.iter().peekable();
+            assert_eq!(it.peek().map(|m| m.header().message_type), Some(21));
+        }
+        assert_eq!(types(&buf), vec![21, 22, 23]);
+
+        // And a real drain with a peek ahead reaches every message.
+        let mut seen = Vec::new();
+        let mut it = buf.drain(..).peekable();
+        while let Some(msg) = it.next() {
+            let next_type = it.peek().map(|m| m.header().message_type);
+            seen.push((msg.header().message_type, next_type));
+        }
+        assert_eq!(seen, vec![(21, Some(22)), (22, Some(23)), (23, None)]);
+
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// `owned_batch` is the allocating wrapper over the same drain.
+    #[test]
+    fn owned_batch_matches_read_owned_into() -> anyhow::Result<()> {
+        let base = "test_owned_batch_wrapper";
+        cleanup_channel_files(base);
+        let region_size = crate::page_size();
+        write_msgs(base, region_size, &[41, 42, 43, 44], 0xF6)?;
+
+        let mut reader = Reader::open(base, ReaderMode::LateJoin)?;
+        assert_eq!(types(&reader.owned_batch(Some(2))?), vec![41, 42]);
+        assert_eq!(types(&reader.owned_batch(None)?), vec![43, 44]);
+        assert!(reader.owned_batch(None)?.is_empty());
+
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// A borrowed batch can hand out owned messages for the few records the
+    /// consumer wants to keep past the next poll.
+    #[test]
+    fn batch_get_owned_outlives_the_batch_and_reader() -> anyhow::Result<()> {
+        let base = "test_batch_get_owned";
+        cleanup_channel_files(base);
+        let region_size = crate::page_size();
+        write_msgs(base, region_size, &[51, 52, 53], 0x17)?;
+
+        let kept = {
+            let mut reader = Reader::open(base, ReaderMode::LateJoin)?;
+            let batch = reader.try_read_batch(None)?.expect("three records");
+            assert_eq!(batch.len(), 3);
+            assert!(batch.get_owned(3).is_none(), "out of range");
+            let kept = batch.get_owned(1).expect("second record");
+            assert_eq!(kept.payload(), batch.get(1).expect("second").payload());
+            kept
+        };
+        // Batch and Reader both gone; the retained share keeps the region mapped.
+        assert_eq!(kept.header().message_type, 52);
+        assert_eq!(kept.len(), 64);
+        assert!(kept.payload().iter().all(|&b| b == 0x17u8.wrapping_add(1)));
 
         cleanup_channel_files(base);
         Ok(())
