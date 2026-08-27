@@ -1,8 +1,14 @@
 # Changelog
 
-## 5.2.0 (2026-08-17)
+## 5.2.0 (2026-08-27)
 
 ### Added
+- **`Reader::peek_header` and `PeekedHeader`** — the next user record's header (message type,
+  user meta, payload length) without consuming the record. Returned by value and borrowing
+  nothing, so a caller holding several readers can peek all of them, decide which to take, and
+  take only that one — what merging channels in timestamp order needs. Service records on the
+  way are consumed exactly as `try_read` consumes them; `Ok(None)` means caught up, not end of
+  stream, and peeking twice returns the same header.
 - **`Reader::try_read_owned` and `OwnedMessage`** — the same zero-copy view as `try_read`, but
   holding a share of the mapped region instead of borrowing it, so it carries no lifetime.
   A `MessageRef<'_>` is tied to the `&mut self` call that produced it and cannot be stored,

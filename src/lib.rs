@@ -1333,6 +1333,27 @@ struct RecordLoc {
     payload_len: usize,
 }
 
+struct FoundRecord {
+    loc: RecordLoc,
+    message_type: u16,
+    user_meta_u64: u64,
+}
+
+/// What the next user record says about itself, read without consuming it.
+///
+/// Enough to decide whether to read that record, or which of several channels to read from
+/// first — both without decoding a payload or copying one out.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct PeekedHeader {
+    /// The producer's record kind.
+    pub message_type: u16,
+    /// The producer's 8 opaque bytes. By convention across most publishers this is when the
+    /// record reached the channel, which is what makes ordering several channels possible here.
+    pub user_meta_u64: u64,
+    /// Payload length in bytes.
+    pub length: u32,
+}
+
 /// An owned message: a share of the mapped region plus the record's position
 /// within it. Carries no lifetime, so it can be stored, collected into a
 /// `Vec`, or sent to another thread.
@@ -1424,6 +1445,8 @@ struct ScannedHeader {
     header_type: HeaderType,
     payload_len: usize,
     total_len: usize,
+    message_type: u16,
+    user_meta_u64: u64,
 }
 
 /// Borrowed view over a batch of user messages.
@@ -1963,6 +1986,43 @@ impl Reader {
         }))
     }
 
+    /// The next user record's header, **without consuming the record**.
+    ///
+    /// Returned by value and borrowing nothing, so a caller holding several readers can peek all
+    /// of them, decide which to take, and take only that one. That is what merging channels in
+    /// timestamp order needs: without it the only way to learn a record's time is to read it, and
+    /// a record read from the wrong channel has to be copied somewhere until its turn comes.
+    ///
+    /// `Ok(None)` means caught up — the writer has not committed the next record yet — not end of
+    /// stream. Peeking twice returns the same header; the record is still there.
+    ///
+    /// Service records (Skip / Channel / Roll) encountered on the way are consumed transparently,
+    /// exactly as [`try_read`](Reader::try_read) consumes them, and this may open the next file.
+    /// They carry no data, so stepping over them changes nothing a caller can observe.
+    ///
+    /// ```no_run
+    /// # use xchannel::Reader;
+    /// # fn pick(readers: &mut [Reader]) -> std::io::Result<Option<usize>> {
+    /// let mut earliest: Option<(u64, usize)> = None;
+    /// for (i, reader) in readers.iter_mut().enumerate() {
+    ///     if let Some(hdr) = reader.peek_header()?
+    ///         && earliest.is_none_or(|(at, _)| hdr.user_meta_u64 < at)
+    ///     {
+    ///         earliest = Some((hdr.user_meta_u64, i));
+    ///     }
+    /// }
+    /// // only the winner is read, and its payload can be borrowed in place
+    /// Ok(earliest.map(|(_, i)| i))
+    /// # }
+    /// ```
+    pub fn peek_header(&mut self) -> io::Result<Option<PeekedHeader>> {
+        Ok(self.scan_to_user_record(false)?.map(|found| PeekedHeader {
+            message_type: found.message_type,
+            user_meta_u64: found.user_meta_u64,
+            length: found.loc.payload_len as u32,
+        }))
+    }
+
     /// Like [`Reader::try_read`], but the returned message owns a share of the
     /// region it points into, so it carries no lifetime and may outlive the
     /// Reader.
@@ -2081,6 +2141,16 @@ impl Reader {
     /// does not freeze `self` and both the borrowed and owned readers can build
     /// their own view afterwards.
     fn advance_to_user_record(&mut self) -> io::Result<Option<RecordLoc>> {
+        Ok(self.scan_to_user_record(true)?.map(|found| found.loc))
+    }
+
+    /// Scan forward to the next user record.
+    ///
+    /// Service records (Skip / Channel / Roll) are consumed either way — they carry no data, so
+    /// stepping over them is not observable. `consume` decides only what happens at the user
+    /// record: `true` advances the cursor past it, `false` leaves the cursor on it so the next read
+    /// returns that same record.
+    fn scan_to_user_record(&mut self, consume: bool) -> io::Result<Option<FoundRecord>> {
         self.prune_to_current();
         loop {
             let region_size = self.region_size();
@@ -2117,14 +2187,20 @@ impl Reader {
                     // Captured before `switch_region`, which only ever pushes,
                     // so the index stays valid for the record just located.
                     let msg_map_idx = self.maps.len() - 1;
-                    self.read_position = next_pos;
-                    if next_pos.is_multiple_of(region_size) {
-                        self.switch_region((next_pos / region_size) as u64)?;
+                    if consume {
+                        self.read_position = next_pos;
+                        if next_pos.is_multiple_of(region_size) {
+                            self.switch_region((next_pos / region_size) as u64)?;
+                        }
                     }
-                    return Ok(Some(RecordLoc {
-                        map_idx: msg_map_idx,
-                        header_offset: off,
-                        payload_len: hdr.payload_len,
+                    return Ok(Some(FoundRecord {
+                        loc: RecordLoc {
+                            map_idx: msg_map_idx,
+                            header_offset: off,
+                            payload_len: hdr.payload_len,
+                        },
+                        message_type: hdr.message_type,
+                        user_meta_u64: hdr.user_meta_u64,
                     }));
                 }
                 HeaderType::Skip | HeaderType::Channel => {
@@ -2316,6 +2392,8 @@ impl Reader {
                 header_type: HeaderType::User, // ignored by callers in this case
                 payload_len: 0,
                 total_len: 0,
+                message_type: 0,
+                user_meta_u64: 0,
             });
         }
 
@@ -2325,6 +2403,8 @@ impl Reader {
             header_type: mh.parsed_header_type()?,
             payload_len,
             total_len: HEADER_SLOT + payload_len,
+            message_type: mh.message_type,
+            user_meta_u64: mh.user_meta_u64,
         })
     }
 
@@ -2649,6 +2729,68 @@ pub fn cleanup_channel_files<P: AsRef<std::path::Path>>(base: P) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Peeking says what the next record is without taking it, and says the same thing twice.
+    #[test]
+    fn peek_header_does_not_consume() -> anyhow::Result<()> {
+        let base = "test_peek_header";
+        cleanup_channel_files(base);
+
+        let mut writer = WriterBuilder::new(base).build()?;
+        for (i, body) in [b"one".as_slice(), b"two".as_slice()].iter().enumerate() {
+            let buf = writer.try_reserve(body.len())?;
+            buf.copy_from_slice(body);
+            writer.commit(7 + i as u16, body.len() as u32, 1_000 + i as u64)?;
+        }
+
+        let mut reader = ReaderBuilder::new(base)
+            .mode(ReaderMode::LateJoin)
+            .build()?;
+
+        let first = reader.peek_header()?.expect("a record is there");
+        assert_eq!(first.message_type, 7);
+        assert_eq!(first.user_meta_u64, 1_000);
+        assert_eq!(first.length, 3);
+
+        // nothing was taken, so it says the same thing again
+        assert_eq!(reader.peek_header()?.expect("still there"), first);
+
+        // and the record itself is still the one waiting
+        let msg = reader.try_read()?.expect("still there");
+        assert_eq!(msg.header().message_type, 7);
+        assert_eq!(msg.payload(), b"one");
+
+        // now the second is on top
+        let second = reader.peek_header()?.expect("the second");
+        assert_eq!(second.message_type, 8);
+        assert_eq!(second.user_meta_u64, 1_001);
+
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// Caught up is `None`, not an error — and the reader keeps working once more arrives.
+    #[test]
+    fn peek_header_when_caught_up() -> anyhow::Result<()> {
+        let base = "test_peek_header_empty";
+        cleanup_channel_files(base);
+
+        let mut writer = WriterBuilder::new(base).build()?;
+        let mut reader = ReaderBuilder::new(base)
+            .mode(ReaderMode::LateJoin)
+            .build()?;
+        assert!(reader.peek_header()?.is_none());
+
+        let buf = writer.try_reserve(2)?;
+        buf.copy_from_slice(b"hi");
+        writer.commit(1, 2, 42)?;
+
+        assert_eq!(reader.peek_header()?.expect("arrived").user_meta_u64, 42);
+        assert_eq!(reader.try_read()?.expect("arrived").payload(), b"hi");
+
+        cleanup_channel_files(base);
+        Ok(())
+    }
 
     /// Demonstrate earliest vs latest file usage (explicit roll).
     #[test]
