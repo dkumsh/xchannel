@@ -279,6 +279,12 @@ impl WriterBuilder {
     /// inode alive while it is open or mapped); they will only fail with
     /// `ENOENT` if they fall further behind than `n` files and try to open
     /// a file that has already been pruned.
+    ///
+    /// That same rule means retention only bounds on-disk usage if readers let
+    /// pruned files go. A reader that keeps an [`OwnedMessage`] from a pruned
+    /// segment holds that segment's inode alive in full, so its bytes are not
+    /// reclaimed and the cap is not the bound it looks like — see
+    /// [`OwnedMessage`]'s retention notes.
     #[inline]
     pub fn keep_files(mut self, n: u64) -> Self {
         assert!(n >= 1, "WriterBuilder::keep_files: n must be >= 1");
@@ -1365,6 +1371,18 @@ pub struct PeekedHeader {
 /// dropped. Retaining messages therefore makes the reader's mapped footprint
 /// consumer-controlled rather than bounded by the read cursor. Copy the payload
 /// out if you need to hold it for long.
+///
+/// The mapped bytes are the floor, not the whole cost. A live mapping is a
+/// reference to the file's inode, so once a writer's `keep_files` retention has
+/// unlinked that segment, one retained message keeps the **whole segment file**
+/// alive — `file_roll_size` bytes, not `region_size`. On a memory-backed
+/// filesystem those bytes are RAM that is not reclaimed until the last message
+/// from that segment is dropped, so a consumer keeping even one message per
+/// segment defeats the bound `keep_files` exists to enforce and can exhaust the
+/// filesystem (a writer then hits `ENOSPC`, or `SIGBUS` on its next page
+/// touch). On tmpfs with retention configured, treat a retained message as
+/// pinning a file rather than a region, and copy the payload out instead of
+/// keeping messages across rolls.
 ///
 /// # Truncation
 ///

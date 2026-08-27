@@ -48,6 +48,12 @@
   (`region_size`, 1 MiB by default), so a consumer that stores messages makes the mapped
   footprint its own responsibility. Copy the payload out if you need to hold it for long.
 
+  The mapped bytes are the floor, not the whole cost: a live mapping keeps the file's inode
+  alive, so once `keep_files` retention has unlinked a segment, one retained message pins the
+  **entire segment file** (`file_roll_size`), not its region. On tmpfs those bytes stay
+  allocated until the last message from that segment is dropped, so a consumer keeping one
+  message per segment defeats the bound `keep_files` enforces and can exhaust the filesystem.
+
 ### Fixed
 - **A roll that cannot open the next segment no longer wedges the reader.** `open_next_file`
   bumped `file_sequence` before the open and the header checks could fail, leaving the counter
