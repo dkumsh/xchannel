@@ -2213,7 +2213,8 @@ impl Reader {
                     continue;
                 }
                 HeaderType::Roll => {
-                    self.read_position = next_pos;
+                    // `open_next_file` resets the cursor to the new segment's start; moving it
+                    // here first would only strand it inside the old file if the roll failed.
                     self.open_next_file()?;
                     continue;
                 }
@@ -2313,7 +2314,8 @@ impl Reader {
                     continue;
                 }
                 HeaderType::Roll => {
-                    self.read_position = next_pos;
+                    // See the Roll arm in `scan_to_user_record`: the cursor moves only once
+                    // the next segment is actually open.
                     self.open_next_file()?;
                     continue;
                 }
@@ -2426,6 +2428,12 @@ impl Reader {
         Ok(())
     }
 
+    /// Roll into the next segment.
+    ///
+    /// Nothing on `self` moves until the new segment is open and validated. A failure — the
+    /// segment not visible yet, retention having removed it, or one of the checks below
+    /// refusing it — leaves the reader exactly where it was, so the error can be returned
+    /// again, or the same call retried once the segment appears.
     fn open_next_file(&mut self) -> io::Result<()> {
         // The absolute index the next segment must begin at, computed from the one we are
         // leaving: a roll stamps the new file's base as the old file's `base + message_count`.
@@ -2436,8 +2444,8 @@ impl Reader {
             let ch = get_channel_header(map.as_ptr());
             ch.base_record_index + ch.message_count.load(Ordering::Relaxed)
         };
-        self.file_sequence += 1;
-        let file_path = make_channel_file_path(&self.base_path, self.file_sequence)?;
+        let next_sequence = self.file_sequence + 1;
+        let file_path = make_channel_file_path(&self.base_path, next_sequence)?;
         let file = OpenOptions::new()
             .read(true)
             .write(false)
@@ -2450,13 +2458,7 @@ impl Reader {
             return Err(err_other("next file missing Channel header"));
         }
         let ch = get_channel_header(region0.as_ptr());
-        // `self.file_sequence` was incremented above to the new file's ordinal.
-        validate_channel_header(ch, region_size, self.file_sequence)?;
-        // Refresh cached channel_name from the new file (the bytes are authoritative
-        // even though in practice the name carries across rolls).
-        self.channel_name_cached = ch.channel_name;
-        // Each rolled file has its own base; refresh so `base_record_index()` tracks it.
-        self.base_record_index_cached = ch.base_record_index;
+        validate_channel_header(ch, region_size, next_sequence)?;
         // The next segment must continue the absolute numbering. Anything else means this
         // file did not come from the series we have been reading — segments from two
         // different logs sharing a directory, an out-of-order or hand-copied file, or a
@@ -2467,7 +2469,7 @@ impl Reader {
             return Err(err_invalid_data(format!(
                 "base_record_index discontinuity: segment {} starts at {} but the previous \
                  segment ends at {} (segments from a different series?)",
-                self.file_sequence, ch.base_record_index, expected_base
+                next_sequence, ch.base_record_index, expected_base
             )));
         }
         // Unlike the base, the generation is constant across a channel's segments, so a
@@ -2478,15 +2480,22 @@ impl Reader {
             return Err(err_invalid_data(format!(
                 "generation mismatch: segment {} has generation {} but the channel is {} \
                  (segments from a different incarnation of this path?)",
-                self.file_sequence, ch.generation, self.generation_cached
+                next_sequence, ch.generation, self.generation_cached
             )));
         }
 
+        // Past the last fallible step: commit the new segment in one go.
+        self.file_sequence = next_sequence;
+        // Refresh cached channel_name from the new file (the bytes are authoritative
+        // even though in practice the name carries across rolls).
+        self.channel_name_cached = ch.channel_name;
+        // Each rolled file has its own base; refresh so `base_record_index()` tracks it.
+        self.base_record_index_cached = ch.base_record_index;
         self.file = file;
         self.read_position = 0;
         self.maps.clear();
         self.maps.push(Arc::new(MappedRegion {
-            file_sequence: self.file_sequence,
+            file_sequence: next_sequence,
             region_idx: 0,
             mapping: region0,
         }));
@@ -2787,6 +2796,56 @@ mod tests {
 
         assert_eq!(reader.peek_header()?.expect("arrived").user_meta_u64, 42);
         assert_eq!(reader.try_read()?.expect("arrived").payload(), b"hi");
+
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// A roll that cannot open the next segment is an error the caller can handle, not a
+    /// state the reader never recovers from. The reader keeps its position in the segment it
+    /// still holds, reports the failure as often as it is asked, and rolls through once the
+    /// segment appears — which is what a reader lagging behind `keep_files` retention, or one
+    /// reaching a segment the writer has not published yet, actually runs into.
+    #[test]
+    fn failed_roll_is_reported_not_fatal() -> anyhow::Result<()> {
+        let base = "test_failed_roll_no_poison";
+        cleanup_channel_files(base);
+
+        let mut writer = WriterBuilder::new(base).build()?;
+        let buf = writer.try_reserve(2)?;
+        buf.copy_from_slice(b"a1");
+        writer.commit(1, 2, 0)?;
+        writer.roll_file()?;
+        let buf = writer.try_reserve(2)?;
+        buf.copy_from_slice(b"b1");
+        writer.commit(2, 2, 0)?;
+
+        let mut reader = ReaderBuilder::new(base)
+            .mode(ReaderMode::LateJoin)
+            .build()?;
+        assert_eq!(reader.try_read()?.expect("first segment").payload(), b"a1");
+
+        // The next segment goes missing before the reader rolls into it.
+        let next = make_channel_file_path(Path::new(base), 1)?;
+        let stashed = next.with_extension("stashed");
+        std::fs::rename(&next, &stashed)?;
+
+        assert!(
+            reader.try_read().is_err(),
+            "the roll must surface the error"
+        );
+        // ... and every later call must keep reporting it rather than panicking on a
+        // half-advanced cursor.
+        assert!(reader.try_read().is_err(), "the error must repeat");
+        assert!(reader.peek_header().is_err(), "peeking must repeat it too");
+        assert!(
+            reader.try_read_batch(None).is_err(),
+            "so must the batch path"
+        );
+
+        // Once the segment is there, the same reader rolls through as if nothing happened.
+        std::fs::rename(&stashed, &next)?;
+        assert_eq!(reader.try_read()?.expect("second segment").payload(), b"b1");
 
         cleanup_channel_files(base);
         Ok(())

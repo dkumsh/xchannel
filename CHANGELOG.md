@@ -48,6 +48,19 @@
   (`region_size`, 1 MiB by default), so a consumer that stores messages makes the mapped
   footprint its own responsibility. Copy the payload out if you need to hold it for long.
 
+### Fixed
+- **A roll that cannot open the next segment no longer wedges the reader.** `open_next_file`
+  bumped `file_sequence` before the open and the header checks could fail, leaving the counter
+  one ahead of the regions still mapped; the error surfaced once and every later call —
+  `try_read`, `try_read_batch`, `peek_header`, the owned reads — then panicked with
+  "current map does not match reader position" instead of returning it. The segment is now
+  opened and validated in full before anything on the reader moves, so a failed roll leaves the
+  reader on the segment it still holds and reports the error as often as it is asked. It also
+  makes the roll retryable: a segment that is merely not published yet, or one temporarily
+  missing, is picked up by a later call rather than ending the reader. This is reachable
+  whenever a reader lags past `keep_files` retention, and 5.1.0's continuity check deliberately
+  refuses a foreign segment — which was itself a way into the panic.
+
 Purely additive; no format change (`format_version` stays 3).
 
 ## 5.1.0 (2026-08-07)
