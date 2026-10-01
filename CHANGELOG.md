@@ -24,8 +24,9 @@
   `GenerationMismatch::of`.
 
 ### Changed
-- **`ReaderMode` gained a variant** (`At`) and now derives `PartialEq`/`Eq`. An exhaustive
-  `match` on `ReaderMode` outside this crate no longer compiles.
+- **`ReaderMode` gained a variant** (`At`), is now `#[non_exhaustive]`, and derives
+  `PartialEq`/`Eq`. A `match` on it outside this crate needs a wildcard arm; future modes can
+  then be added without a major version.
 - **The writer publishes `message_count` before `write_position`, both Release** (previously
   a Relaxed `fetch_add` and a Relaxed store). The order is now part of the format contract
   (FORMAT.md §1, §6 step 7): it is what lets a `Live` reader read the pair consistently and so

@@ -1465,7 +1465,10 @@ impl Writer {
 
 // ========== Reader ==========
 
+/// Where a new [`Reader`] starts. Non-exhaustive: further modes may be added without a major
+/// version, so a `match` on it needs a wildcard arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ReaderMode {
     LateJoin, // start from earliest existing file
     Live,     // start from latest existing file (at next header slot)
