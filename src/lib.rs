@@ -151,6 +151,45 @@ fn verify_preinstall_signature(hdr: &MessageHeader) -> io::Result<()> {
 }
 // -------- Error types: --------
 
+/// The channel at a reader's path is not the incarnation the caller expected.
+///
+/// Returned (wrapped in an `io::Error` of kind `InvalidData`) by a reader built with
+/// [`ReaderBuilder::expect_generation`], and by [`Reader::seek`] / [`Reader::rewind`] /
+/// [`Reader::seek_to_head`] when the path has been deleted and recreated under the reader.
+/// A recreated channel restarts at record index 0, so a saved index would silently point into
+/// unrelated data; this is checked before the index is, so it is never misreported as a
+/// pruned or out-of-range index. Recover it from the `io::Error` with [`GenerationMismatch::of`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GenerationMismatch {
+    /// The generation the caller asked for.
+    pub expected: u64,
+    /// The generation found on disk.
+    pub found: u64,
+}
+
+impl GenerationMismatch {
+    /// The mismatch carried by `err`, if that is what it is.
+    pub fn of(err: &io::Error) -> Option<Self> {
+        err.get_ref()?.downcast_ref::<Self>().copied()
+    }
+
+    fn into_io(self) -> io::Error {
+        io::Error::new(ErrorKind::InvalidData, self)
+    }
+}
+
+impl std::fmt::Display for GenerationMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "channel generation is {} but {} was expected (path deleted and recreated?)",
+            self.found, self.expected
+        )
+    }
+}
+
+impl std::error::Error for GenerationMismatch {}
+
 // -------- Small internal helpers (low-level ops) --------
 #[inline]
 fn with_ch_mut<F>(file: &File, region_size: usize, f: F) -> io::Result<()>
@@ -422,6 +461,7 @@ pub struct ReaderBuilder {
     path: PathBuf,
     mode: ReaderMode,
     batch_limit: Option<u16>,
+    expected_generation: Option<u64>,
 }
 
 impl ReaderBuilder {
@@ -430,6 +470,7 @@ impl ReaderBuilder {
             path: path.as_ref().to_path_buf(),
             mode: ReaderMode::LateJoin,
             batch_limit: None,
+            expected_generation: None,
         }
     }
 
@@ -448,6 +489,27 @@ impl ReaderBuilder {
         self.mode = ReaderMode::LateJoin;
         self
     }
+    /// Start so the next user record read is absolute index `index`; shorthand for
+    /// `mode(ReaderMode::At(index))`. See [`ReaderMode::At`] for the errors and the cost.
+    #[inline]
+    pub fn start_at(mut self, index: u64) -> Self {
+        self.mode = ReaderMode::At(index);
+        self
+    }
+
+    /// Refuse to open unless the channel's generation is `generation`.
+    ///
+    /// A resumed cursor is an index *and* the generation it was taken from: a channel deleted
+    /// and recreated at the same path restarts at index 0, so the index alone would silently
+    /// point into unrelated data. With this set, `build` fails with a [`GenerationMismatch`]
+    /// (checked before the index, so a recreated channel is never misreported as a pruned or
+    /// out-of-range index).
+    #[inline]
+    pub fn expect_generation(mut self, generation: u64) -> Self {
+        self.expected_generation = Some(generation);
+        self
+    }
+
     /// Default batch size limit used when `try_read_batch(None)` is called.
     /// `None` means unlimited.
     #[inline]
@@ -459,7 +521,7 @@ impl ReaderBuilder {
     /// Open a Reader according to the configured mode.
     #[inline]
     pub fn build(self) -> io::Result<Reader> {
-        let mut reader = Reader::open(self.path, self.mode)?;
+        let mut reader = Reader::open_with(self.path, self.mode, self.expected_generation)?;
         reader.batch_limit = self.batch_limit;
         Ok(reader)
     }
@@ -1404,10 +1466,22 @@ impl Writer {
 
 // ========== Reader ==========
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReaderMode {
     LateJoin, // start from earliest existing file
     Live,     // start from latest existing file (at next header slot)
+    /// Start so the next user record read is absolute index `i` (see [`Reader::position`]).
+    ///
+    /// `i` may equal the channel head, in which case the reader waits for the next record like
+    /// `Live`. Opening fails with `ErrorKind::NotFound` if `i` is older than the earliest
+    /// retained segment (pruned by `keep_files`), and with `ErrorKind::InvalidInput` if `i` is
+    /// past the head.
+    ///
+    /// Cost: the segment holding `i` is found by binary search over the segments' headers
+    /// (one page each); inside it the reader steps over the records before `i` one header at
+    /// a time, without touching payloads. That is O(records ahead of `i` in its segment) —
+    /// milliseconds for millions of records — so open once, not per message.
+    At(u64),
 }
 
 /// Borrowed view of a message payload and header.
@@ -1700,6 +1774,38 @@ enum SegmentStart {
     Beginning,
     /// The next header slot, read from `write_position` (`Live`).
     Head,
+    /// A header slot already located, and the absolute index of the record there.
+    At { read_pos: usize, position: u64 },
+}
+
+/// The fields of a segment's `ChannelHeader` that locating a record needs.
+#[derive(Debug, Clone, Copy)]
+struct SegmentHeader {
+    region_size: usize,
+    base_record_index: u64,
+    message_count: u64,
+    generation: u64,
+}
+
+/// Map one page of `file`, check it opens with a valid `ChannelHeader` for `sequence`, and
+/// return the fields a seek needs. `message_count` is acquired, so every record it counts is
+/// visibly committed.
+fn read_segment_header(file: &File, sequence: u64) -> io::Result<SegmentHeader> {
+    let map = RegionMapping::create_read_only(file, 0, region::page_size())?;
+    let mh = unsafe { &*(map.as_ptr() as *const MessageHeader) };
+    if mh.parsed_header_type()? != HeaderType::Channel {
+        return Err(err_invalid_data(format!(
+            "segment {sequence} does not begin with a Channel header"
+        )));
+    }
+    let ch = get_channel_header(map.as_ptr());
+    validate_channel_header(ch, ch.region_size as usize, sequence)?;
+    Ok(SegmentHeader {
+        region_size: ch.region_size as usize,
+        base_record_index: ch.base_record_index,
+        message_count: ch.message_count.load(Ordering::Acquire),
+        generation: ch.generation,
+    })
 }
 
 /// Open segment `sequence` read-only; `Ok(None)` if it does not exist (never created, or
@@ -1717,10 +1823,11 @@ impl Reader {
     /// Open a Reader:
     /// - LateJoin => earliest file; read_position = 0
     /// - Live => latest file; read_position = write_position (next header slot)
+    /// - At(i) => the file holding record `i`; read_position = that record's header slot
     ///
-    /// LateJoin races with a writer configured with `keep_files(N)`: the
-    /// earliest sequence returned by the directory scan can be unlinked by
-    /// the writer's next roll before this call's `open()` syscall runs,
+    /// LateJoin and At race with a writer configured with `keep_files(N)`:
+    /// a sequence returned by the directory scan can be unlinked by the
+    /// writer's next roll before this call's `open()` syscall runs,
     /// surfacing as `ENOENT`. The next-lowest sequence is almost always
     /// still present, so we re-scan and try again up to
     /// `MAX_OPEN_RETRIES` times. A genuinely missing channel still fails
@@ -1728,27 +1835,63 @@ impl Reader {
     /// Live mode does not retry: it targets the *latest* sequence, which
     /// the writer is actively writing to and will not unlink.
     pub fn open<P: AsRef<Path>>(path: P, mode: ReaderMode) -> io::Result<Self> {
+        Self::open_with(path, mode, None)
+    }
+
+    /// [`Reader::open`], refusing a channel whose generation is not `expected_generation`.
+    fn open_with<P: AsRef<Path>>(
+        path: P,
+        mode: ReaderMode,
+        expected_generation: Option<u64>,
+    ) -> io::Result<Self> {
         const MAX_OPEN_RETRIES: usize = 8;
         let base_path = path.as_ref().to_path_buf();
-        match mode {
+        let reader = match mode {
             ReaderMode::Live => {
                 let seq = find_latest_sequence(&base_path)?;
                 let file = OpenOptions::new()
                     .read(true)
                     .write(false)
                     .open(make_channel_file_path(&base_path, seq)?)?;
-                Self::from_segment(base_path, seq, file, SegmentStart::Head)
+                Self::from_segment(base_path, seq, file, SegmentStart::Head)?
             }
             ReaderMode::LateJoin => {
+                let mut opened = None;
                 for _ in 0..MAX_OPEN_RETRIES {
                     let seq = find_earliest_sequence(&base_path)?;
                     if let Some(file) = open_segment_if_present(&base_path, seq)? {
-                        return Self::from_segment(base_path, seq, file, SegmentStart::Beginning);
+                        opened = Some(Self::from_segment(
+                            base_path.clone(),
+                            seq,
+                            file,
+                            SegmentStart::Beginning,
+                        )?);
+                        break;
                     }
                 }
-                Err(Self::retries_exhausted(&base_path))
+                opened.ok_or_else(|| Self::retries_exhausted(&base_path))?
             }
+            ReaderMode::At(index) => {
+                let mut opened = None;
+                for _ in 0..MAX_OPEN_RETRIES {
+                    opened = Self::locate(&base_path, index, expected_generation)?;
+                    if opened.is_some() {
+                        break;
+                    }
+                }
+                opened.ok_or_else(|| Self::retries_exhausted(&base_path))?
+            }
+        };
+        if let Some(expected) = expected_generation
+            && reader.generation_cached != expected
+        {
+            return Err(GenerationMismatch {
+                expected,
+                found: reader.generation_cached,
+            }
+            .into_io());
         }
+        Ok(reader)
     }
 
     fn retries_exhausted(base_path: &Path) -> io::Error {
@@ -1759,6 +1902,111 @@ impl Reader {
                 base_path
             ),
         )
+    }
+
+    /// Find the segment holding absolute record `index` and open a Reader positioned on it.
+    /// `Ok(None)` means a segment vanished under retention mid-search; the caller rescans.
+    fn locate(
+        base_path: &Path,
+        index: u64,
+        expected_generation: Option<u64>,
+    ) -> io::Result<Option<Self>> {
+        let seqs = find_all_sequences(base_path)?;
+        let (Some(&first), Some(&last)) = (seqs.first(), seqs.last()) else {
+            return Err(io::Error::new(
+                ErrorKind::NotFound,
+                format!("no channel at {:?}", base_path),
+            ));
+        };
+        let probe = |seq: u64| -> io::Result<Option<(File, SegmentHeader)>> {
+            let Some(file) = open_segment_if_present(base_path, seq)? else {
+                return Ok(None);
+            };
+            let header = read_segment_header(&file, seq)?;
+            Ok(Some((file, header)))
+        };
+
+        let Some((_, earliest)) = probe(first)? else {
+            return Ok(None);
+        };
+        // Generation first: a recreated channel restarts at index 0, and must be reported as a
+        // different channel rather than as a pruned or out-of-range index.
+        if let Some(expected) = expected_generation
+            && earliest.generation != expected
+        {
+            return Err(GenerationMismatch {
+                expected,
+                found: earliest.generation,
+            }
+            .into_io());
+        }
+        if index < earliest.base_record_index {
+            return Err(io::Error::new(
+                ErrorKind::NotFound,
+                format!(
+                    "record {index} has been pruned: the earliest retained record is {}",
+                    earliest.base_record_index
+                ),
+            ));
+        }
+        let Some((_, latest)) = probe(last)? else {
+            return Ok(None);
+        };
+        let head = latest.base_record_index + latest.message_count;
+        if index > head {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                format!("record {index} is past the channel head {head}"),
+            ));
+        }
+
+        // The last segment whose first record is at or before `index`. Bases only grow with
+        // the sequence, and `seqs[0]` qualifies, so the search keeps `base(lo) <= index`.
+        let (mut lo, mut hi) = (0, seqs.len() - 1);
+        while lo < hi {
+            let mid = lo + (hi - lo).div_ceil(2);
+            let Some((_, header)) = probe(seqs[mid])? else {
+                return Ok(None);
+            };
+            if header.base_record_index <= index {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        let seq = seqs[lo];
+        let Some((file, header)) = probe(seq)? else {
+            return Ok(None);
+        };
+        if header.generation != earliest.generation {
+            return Err(err_invalid_data(format!(
+                "generation mismatch: segment {seq} has generation {} but segment {first} has {} \
+                 (segments from a different incarnation of this path?)",
+                header.generation, earliest.generation
+            )));
+        }
+
+        let skip = index - header.base_record_index;
+        let walked = walk_segment(&file, header.region_size, |_, header_type, users| {
+            header_type == HeaderType::User && users == skip
+        })?;
+        if walked.users != skip || walked.stop == WalkStop::EndOfFile {
+            return Err(err_invalid_data(format!(
+                "segment {seq} holds {} user records before stopping ({:?}), \
+                 but its header implies record {index} is in it",
+                walked.users, walked.stop
+            )));
+        }
+        Self::from_segment(
+            base_path.to_path_buf(),
+            seq,
+            file,
+            SegmentStart::At {
+                read_pos: walked.pos,
+                position: index,
+            },
+        )
+        .map(Some)
     }
 
     /// Where a `Live` reader starts, and the absolute index of the record there.
@@ -1837,6 +2085,7 @@ impl Reader {
         let (read_pos, position) = match start {
             SegmentStart::Beginning => (0, ch.base_record_index),
             SegmentStart::Head => Self::live_start(&file, ch, region_size)?,
+            SegmentStart::At { read_pos, position } => (read_pos, position),
         };
         let channel_name = ch.channel_name;
         let base_record_index = ch.base_record_index;
@@ -1877,13 +2126,60 @@ impl Reader {
     /// (`try_read`, `try_read_owned`, `read_owned_into`, `read_blocking`, and by the batch
     /// length for `try_read_batch`); `peek_header` and `wait_for_message` leave it alone.
     ///
-    /// Together with [`generation`](Self::generation) it identifies a record across restarts.
+    /// Together with [`generation`](Self::generation) this is a resumable cursor: persist
+    /// both, and reopen with `ReaderBuilder::new(path).expect_generation(g).start_at(i)`.
     /// Resynchronised from the on-disk numbering (`base_record_index`) at every roll.
     #[inline]
     pub fn position(&self) -> u64 {
         self.position
     }
 
+    /// Absolute index of the oldest record still on disk — the earliest retained segment's
+    /// `base_record_index`. With [`head_record_index`](Self::head_record_index) it bounds the
+    /// indices [`seek`](Self::seek) accepts (`tail..=head`). Scans the directory and reads one
+    /// page; not a hot-path accessor.
+    pub fn tail_record_index(&self) -> io::Result<u64> {
+        const MAX_OPEN_RETRIES: usize = 8;
+        for _ in 0..MAX_OPEN_RETRIES {
+            let seq = find_earliest_sequence(&self.base_path)?;
+            if let Some(file) = open_segment_if_present(&self.base_path, seq)? {
+                return Ok(read_segment_header(&file, seq)?.base_record_index);
+            }
+        }
+        Err(Self::retries_exhausted(&self.base_path))
+    }
+
+    /// Reposition so the next user record read is absolute index `index`.
+    ///
+    /// Same rules and cost as opening with [`ReaderMode::At`]: `ErrorKind::NotFound` if
+    /// `index` has been pruned, `ErrorKind::InvalidInput` if it is past the head, and a
+    /// [`GenerationMismatch`] if the path now holds a different channel than this reader
+    /// was opened on. On any error the reader is left exactly where it was.
+    ///
+    /// Messages already taken with `try_read_owned` stay valid; they hold their own share of
+    /// their region.
+    pub fn seek(&mut self, index: u64) -> io::Result<()> {
+        self.reopen(ReaderMode::At(index))
+    }
+
+    /// Reposition at the oldest retained record, as a fresh `LateJoin` reader would start.
+    /// Errors as for [`seek`](Self::seek).
+    pub fn rewind(&mut self) -> io::Result<()> {
+        self.reopen(ReaderMode::LateJoin)
+    }
+
+    /// Reposition at the channel head, as a fresh `Live` reader would start: everything
+    /// already written is skipped. Errors as for [`seek`](Self::seek).
+    pub fn seek_to_head(&mut self) -> io::Result<()> {
+        self.reopen(ReaderMode::Live)
+    }
+
+    fn reopen(&mut self, mode: ReaderMode) -> io::Result<()> {
+        let mut fresh = Self::open_with(&self.base_path, mode, Some(self.generation_cached))?;
+        fresh.batch_limit = self.batch_limit;
+        *self = fresh;
+        Ok(())
+    }
     /// Channel name as set by `WriterBuilder::channel_name`, trimmed of trailing zero bytes.
     /// Returns `""` if no name was set. Invalid UTF-8 yields a lossy conversion.
     pub fn channel_name(&self) -> std::borrow::Cow<'_, str> {
@@ -1967,16 +2263,8 @@ impl Reader {
             .read(true)
             .write(false)
             .open(&file_path)?;
-        let ps = region::page_size();
-        let map = RegionMapping::create_read_only(&file, 0, ps)?;
-        let mh = unsafe { &*(map.as_ptr() as *const MessageHeader) };
-        if mh.parsed_header_type()? != HeaderType::Channel {
-            return Err(err_invalid_data(
-                "head_record_index: latest segment does not begin with a Channel header",
-            ));
-        }
-        let ch = get_channel_header(map.as_ptr());
-        Ok(ch.base_record_index + ch.message_count.load(Ordering::Acquire))
+        let header = read_segment_header(&file, latest)?;
+        Ok(header.base_record_index + header.message_count)
     }
 
     /// The channel's region size in bytes (from its header). Constant for a channel's life.
@@ -5487,7 +5775,7 @@ mod tests {
         Ok(())
     }
 
-    // ---------- position ----------
+    // ---------- position / start_at / seek ----------
 
     /// Small geometry so a few hundred records span several regions and files.
     fn rolling_writer(base: &str) -> io::Result<WriterBuilder> {
@@ -5551,6 +5839,163 @@ mod tests {
         assert!(r.try_read()?.is_none());
         assert_eq!(r.file_sequence(), w.file_sequence);
         assert!(r.base_record_index() > 0);
+
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// Opening at any index from 0 through the head lands exactly there.
+    #[test]
+    fn start_at_every_index() -> anyhow::Result<()> {
+        let base = "test_start_at_every_index";
+        cleanup_channel_files(base);
+        let n = 1000u64;
+        let mut w = rolling_writer(base)?.build()?;
+        write_indexed(&mut w, 0..n)?;
+
+        for i in 0..=n {
+            let mut r = ReaderBuilder::new(base).start_at(i).build()?;
+            assert_eq!(r.position(), i);
+            for k in i..(i + 3).min(n) {
+                let m = r.try_read()?.expect("record");
+                assert_eq!(m.header().user_meta_u64, k, "start_at({i})");
+                assert_eq!(m.payload(), &k.to_le_bytes());
+            }
+            if i == n {
+                assert!(r.try_read()?.is_none(), "start_at(head) waits");
+            }
+        }
+
+        // At the head, the reader picks up what is written next.
+        let mut r = ReaderBuilder::new(base).start_at(n).build()?;
+        write_indexed(&mut w, n..n + 1)?;
+        assert_eq!(r.try_read()?.expect("new record").header().user_meta_u64, n);
+        assert_eq!(r.position(), n + 1);
+
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// Pruned indices are `NotFound`, indices past the head are `InvalidInput`, and the
+    /// boundaries themselves open.
+    #[test]
+    fn start_at_out_of_range() -> anyhow::Result<()> {
+        let base = "test_start_at_out_of_range";
+        cleanup_channel_files(base);
+        let n = 2000u64;
+        let mut w = rolling_writer(base)?.keep_files(2).build()?;
+        write_indexed(&mut w, 0..n)?;
+
+        let r = ReaderBuilder::new(base).build()?;
+        let tail = r.tail_record_index()?;
+        assert!(tail > 0, "retention should have pruned the start");
+        assert_eq!(tail, r.position(), "LateJoin starts at the tail");
+        assert_eq!(r.head_record_index()?, n);
+
+        let err = ReaderBuilder::new(base).start_at(tail - 1).build().err();
+        assert_eq!(err.map(|e| e.kind()), Some(ErrorKind::NotFound));
+        let err = ReaderBuilder::new(base).start_at(n + 1).build().err();
+        assert_eq!(err.map(|e| e.kind()), Some(ErrorKind::InvalidInput));
+
+        let mut r = ReaderBuilder::new(base).start_at(tail).build()?;
+        assert_eq!(r.try_read()?.expect("tail").header().user_meta_u64, tail);
+        let mut r = ReaderBuilder::new(base).start_at(n).build()?;
+        assert!(r.try_read()?.is_none());
+
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// `seek` moves both ways; `rewind` and `seek_to_head` match fresh LateJoin / Live readers;
+    /// a refused seek leaves the reader where it was.
+    #[test]
+    fn seek_rewind_and_seek_to_head() -> anyhow::Result<()> {
+        let base = "test_seek_rewind_head";
+        cleanup_channel_files(base);
+        let n = 1000u64;
+        let mut w = rolling_writer(base)?.build()?;
+        write_indexed(&mut w, 0..n)?;
+
+        let mut r = ReaderBuilder::new(base).batch_limit(5).build()?;
+        for target in [700, 3, 999, 0, 512] {
+            r.seek(target)?;
+            assert_eq!(r.position(), target);
+            assert_eq!(
+                r.try_read()?.expect("record").header().user_meta_u64,
+                target
+            );
+        }
+        // The builder's batch limit survives a seek.
+        assert_eq!(r.try_read_batch(None)?.expect("batch").len(), 5);
+        assert_eq!(r.position(), 518);
+
+        let err = r.seek(n + 5).expect_err("past head");
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(r.position(), 518, "refused seek leaves the reader alone");
+        assert_eq!(r.try_read()?.expect("record").header().user_meta_u64, 518);
+
+        r.rewind()?;
+        assert_eq!(r.position(), 0);
+        assert_eq!(r.try_read()?.expect("record").header().user_meta_u64, 0);
+
+        r.seek_to_head()?;
+        assert_eq!(r.position(), n);
+        assert!(r.try_read()?.is_none());
+        write_indexed(&mut w, n..n + 1)?;
+        assert_eq!(r.try_read()?.expect("record").header().user_meta_u64, n);
+
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// A resumed cursor is refused against a recreated channel, before the index is judged.
+    #[test]
+    fn expect_generation_guards_the_cursor() -> anyhow::Result<()> {
+        let base = "test_expect_generation";
+        cleanup_channel_files(base);
+        let mut w = rolling_writer(base)?.generation(7).build()?;
+        write_indexed(&mut w, 0..10)?;
+
+        let mut r = ReaderBuilder::new(base)
+            .expect_generation(7)
+            .start_at(4)
+            .build()?;
+        assert_eq!(r.try_read()?.expect("record").header().user_meta_u64, 4);
+
+        for mode in [
+            ReaderMode::LateJoin,
+            ReaderMode::Live,
+            ReaderMode::At(1_000_000),
+        ] {
+            let err = ReaderBuilder::new(base)
+                .mode(mode)
+                .expect_generation(8)
+                .build()
+                .err()
+                .expect("wrong generation");
+            assert_eq!(
+                GenerationMismatch::of(&err),
+                Some(GenerationMismatch {
+                    expected: 8,
+                    found: 7
+                }),
+                "{mode:?}"
+            );
+        }
+
+        // The path is deleted and recreated under the reader: seeking is refused.
+        drop(w);
+        cleanup_channel_files(base);
+        let mut w = rolling_writer(base)?.generation(9).build()?;
+        write_indexed(&mut w, 0..10)?;
+        let err = r.seek(0).expect_err("different channel now");
+        assert_eq!(
+            GenerationMismatch::of(&err),
+            Some(GenerationMismatch {
+                expected: 7,
+                found: 9
+            })
+        );
 
         cleanup_channel_files(base);
         Ok(())
@@ -5641,13 +6086,14 @@ mod tests {
                 assert_eq!(r.try_read()?.expect("record").header().user_meta_u64, i);
             }
             assert_eq!(r.base_record_index(), 2);
+            assert_eq!(ReaderBuilder::new(base).start_at(2).build()?.position(), 2);
         }
         cleanup_channel_files(base);
         Ok(())
     }
 
-    /// Live opens racing a busy writer: whatever the reader computes as its position must be
-    /// the index of the first record it then reads.
+    /// Live and At opens racing a busy writer: whatever the reader computes as its position must
+    /// be the index of the first record it then reads.
     #[test]
     fn opens_racing_a_writer_agree_with_the_records() -> anyhow::Result<()> {
         let base = "test_opens_racing_a_writer";
@@ -5686,6 +6132,9 @@ mod tests {
             if let Some(got) = first_record(&mut live)? {
                 assert_eq!(got, at, "Live open");
             }
+            let target = at / 2;
+            let mut seeker = ReaderBuilder::new(base).start_at(target).build()?;
+            assert_eq!(first_record(&mut seeker)?, Some(target), "At open");
             opens += 1;
         }
         writer.join().expect("writer thread")?;

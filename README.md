@@ -394,8 +394,10 @@ they shape what the library is and isn't suited for.
 
 - **A reader that falls more than `keep_files(N)` files behind will
   get `ENOENT`** when it tries to follow a Roll into a file that has
-  already been pruned. There is no "skip ahead" recovery — opening a
-  fresh `Reader` is the supported path. `Reader::open` in `LateJoin`
+  already been pruned. There is no automatic "skip ahead" — the reader
+  decides: `Reader::rewind()` jumps to the oldest retained record, and
+  `position()` before and `tail_record_index()` after tell it how many
+  records it lost. `Reader::open` in `LateJoin`
   mode retries internally on the narrow start-up race where the
   earliest sequence is unlinked between the directory scan and the
   open syscall; a truly missing channel still fails fast with
@@ -978,6 +980,41 @@ Useful for:
 * real-time consumers
 * monitoring
 * streaming pipelines
+
+---
+
+### At an index
+
+```
+start at absolute record index i
+```
+
+Every user record has an absolute index, counted from channel genesis
+across rolls. `Reader::position()` is the index of the next record a
+reader will return, so it and `generation()` together are a cursor you can
+persist and resume from:
+
+```rust
+// save
+let cursor = (reader.generation(), reader.position());
+
+// resume
+let mut reader = ReaderBuilder::new(path)
+    .expect_generation(cursor.0) // a recreated channel is refused, not misread
+    .start_at(cursor.1)
+    .build()?;
+```
+
+An open reader can move with `seek(i)`, `rewind()` (oldest retained
+record) and `seek_to_head()`; `tail_record_index()..=head_record_index()`
+is the range they accept. A pruned index is `ErrorKind::NotFound`, one past
+the head is `ErrorKind::InvalidInput`, and a different channel at the path
+is a `GenerationMismatch`.
+
+Cost: the segment holding `i` is found by binary search over segment
+headers; inside it the reader steps over the records before `i` one header
+at a time without touching payloads — O(records ahead of `i` in its
+segment). Open or seek once, not per message.
 
 ---
 

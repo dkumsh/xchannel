@@ -7,8 +7,25 @@
   maintained on every read path (single, owned, drain and batch) and resynchronised from
   `base_record_index` at each roll. With `generation()` it is a cursor that can be persisted
   and resumed.
+- **`ReaderMode::At(i)` / `ReaderBuilder::start_at(i)`** — open a reader so the next record is
+  absolute index `i`. The segment is found by binary search over segment headers; inside it the
+  reader steps over the preceding records header by header, never touching payloads, so the
+  cost is O(records ahead of `i` in its segment). A pruned index is `ErrorKind::NotFound`, one
+  past the head `ErrorKind::InvalidInput`; `i == head` waits like `Live`.
+- **`Reader::seek`, `Reader::rewind`, `Reader::seek_to_head`** — reposition an open reader (at
+  an index, at the oldest retained record, at the head). A refused move leaves the reader where
+  it was; the builder's `batch_limit` is kept.
+- **`Reader::tail_record_index`** — the oldest retained index, the counterpart of
+  `head_record_index`.
+- **`ReaderBuilder::expect_generation` and `GenerationMismatch`** — refuse to open a channel of
+  a different incarnation, checked before the index so a recreated channel is never misreported
+  as a pruned or out-of-range index. `seek`/`rewind`/`seek_to_head` apply the same check
+  against the generation the reader was opened on. Recover it from an `io::Error` with
+  `GenerationMismatch::of`.
 
 ### Changed
+- **`ReaderMode` gained a variant** (`At`) and now derives `PartialEq`/`Eq`. An exhaustive
+  `match` on `ReaderMode` outside this crate no longer compiles.
 - **The writer publishes `message_count` before `write_position`, both Release** (previously
   a Relaxed `fetch_add` and a Relaxed store). The order is now part of the format contract
   (FORMAT.md §1, §6 step 7): it is what lets a `Live` reader read the pair consistently and so

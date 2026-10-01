@@ -224,6 +224,15 @@ and its `write_position` update); retry. A writer that died in that window
 leaves the slot committed for good, so after a bounded wait the reader
 counts the user records before `w - 16` by walking the segment instead.
 
+**Start at index `i`:** list the segments; the earliest one's
+`base_record_index` is the oldest index still retained, and the latest one's
+`base_record_index + message_count` is the head. Indices outside
+`[oldest, head]` are refused. Otherwise binary-search the segments for the
+last one whose `base_record_index <= i`, then scan it from offset 0 stepping
+over records by `length` (headers only), counting `User` records, and start
+at the header slot of the `(i - base_record_index)`-th one. There is no
+per-record index in the format, so the in-segment step is linear.
+
 A reader that observes `committed = 0` on a header slot must not advance;
 it must retry (busy/backoff is implementation-defined) until `committed`
 transitions to `1`.
