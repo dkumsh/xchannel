@@ -453,12 +453,13 @@ readers refuse anything else.
 
 The on-disk format is identified by `ChannelHeader.format_version`; a reader
 refuses any file whose version it does not implement. The current version is
-**2** (128-byte `ChannelHeader` with `base_record_index`; see `FORMAT.md`).
+**3** (128-byte `ChannelHeader` with `base_record_index`, `generation` and a
+48-byte `channel_name`; see `FORMAT.md`).
 
-Format **2 is greenfield**: because the header grew, the records area shifts,
-so files written at earlier versions are not read in place and there is no
-in-place migration. Regenerate channels with a current writer, or read old
-archives with the crate version that produced them.
+Format **3 is greenfield**, like 2 before it: files written at earlier
+versions are not read in place and there is no in-place migration.
+Regenerate channels with a current writer, or read old archives with the
+crate version that produced them.
 
 ---
 
