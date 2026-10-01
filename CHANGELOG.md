@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Added
+- **`IndexPruned`** — the `NotFound` from `start_at` / `ReaderMode::At` / `seek` for an index
+  retention has removed now carries `IndexPruned { index, earliest }`, recovered with
+  `IndexPruned::of(&err)`. A missing channel stays a plain `NotFound`, so the two can be told
+  apart without parsing the message, and `earliest` says where to resume.
+
+### Changed
+- **`Reader::tail_record_index` checks the generation**, like `seek`: on a path that now holds a
+  channel with a different generation it fails with `GenerationMismatch` instead of reporting
+  the new channel's tail.
+
 ### Fixed
 - **A failed region mapping no longer poisons the reader.** `try_read` (and `peek_header`,
   `wait_for_message`) moved the cursor before mapping the region it moved into; if that `mmap`

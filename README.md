@@ -1011,8 +1011,9 @@ An open reader can move with `seek(i)`, `rewind()` (oldest retained
 record) and `seek_to_head()`; `tail_record_index()..=head_record_index()`
 is the range they accept. `index == head` is fine: the reader waits for the
 next record. One past the head is `ErrorKind::InvalidInput`. A pruned index
-is `ErrorKind::NotFound`, which is also what a missing channel returns, so
-check the message or `tail_record_index()` if the difference matters.
+is `ErrorKind::NotFound` carrying an `IndexPruned { index, earliest }`
+(recover it with `IndexPruned::of(&err)`); a missing channel is a plain
+`NotFound` without one.
 
 `GenerationMismatch` means the path holds a channel with a different
 generation. It catches a recreated channel only if its writers set one with

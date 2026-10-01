@@ -195,6 +195,44 @@ impl std::fmt::Display for GenerationMismatch {
 
 impl std::error::Error for GenerationMismatch {}
 
+/// The requested record index is older than anything still on disk: retention (`keep_files`)
+/// has removed the segment that held it.
+///
+/// Returned (wrapped in an `io::Error` of kind `NotFound`) by [`ReaderMode::At`] /
+/// [`ReaderBuilder::start_at`] and [`Reader::seek`]. `NotFound` alone can also mean there is no
+/// channel at the path; recover this payload with [`IndexPruned::of`] to tell the two apart, and
+/// to learn where the retained records begin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexPruned {
+    /// The index that was asked for.
+    pub index: u64,
+    /// The oldest index still retained: the earliest segment's `base_record_index`.
+    pub earliest: u64,
+}
+
+impl IndexPruned {
+    /// The pruned-index details carried by `err`, if that is what it is.
+    pub fn of(err: &io::Error) -> Option<Self> {
+        err.get_ref()?.downcast_ref::<Self>().copied()
+    }
+
+    fn into_io(self) -> io::Error {
+        io::Error::new(ErrorKind::NotFound, self)
+    }
+}
+
+impl std::fmt::Display for IndexPruned {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "record {} has been pruned: the earliest retained record is {}",
+            self.index, self.earliest
+        )
+    }
+}
+
+impl std::error::Error for IndexPruned {}
+
 /// Internal: a `Live` open found a newer segment than the one it opened, so the file it holds
 /// is no longer the tail. `Reader::open` retries on the newest segment; never surfaces.
 #[derive(Debug)]
@@ -1512,9 +1550,9 @@ pub enum ReaderMode {
     /// `i` may equal the channel head, in which case the reader waits for the next record like
     /// `Live`. Opening fails with `ErrorKind::InvalidInput` if `i` is past the head, and with
     /// `ErrorKind::NotFound` if `i` is older than the earliest retained segment (pruned by
-    /// `keep_files`). `NotFound` also means there is no channel at the path, or that its
-    /// segments kept disappearing under retention during the search; the message says which,
-    /// and [`Reader::tail_record_index`] on a live reader tells a pruned index apart.
+    /// `keep_files`); that error carries an [`IndexPruned`] naming the earliest retained index.
+    /// A `NotFound` without it means there is no channel at the path, or that its segments kept
+    /// disappearing under retention during the search.
     ///
     /// Cost: the segment holding `i` is found by binary search over the segments' headers
     /// (one page each); inside it the reader steps over the records before `i` one header at
@@ -1998,13 +2036,11 @@ impl Reader {
             .into_io());
         }
         if index < earliest.base_record_index {
-            return Err(io::Error::new(
-                ErrorKind::NotFound,
-                format!(
-                    "record {index} has been pruned: the earliest retained record is {}",
-                    earliest.base_record_index
-                ),
-            ));
+            return Err(IndexPruned {
+                index,
+                earliest: earliest.base_record_index,
+            }
+            .into_io());
         }
         let Some((_, latest)) = probe(last)? else {
             return Ok(None);
@@ -2232,12 +2268,25 @@ impl Reader {
     /// `base_record_index`. With [`head_record_index`](Self::head_record_index) it bounds the
     /// indices [`seek`](Self::seek) accepts (`tail..=head`). Scans the directory and reads one
     /// page; not a hot-path accessor.
+    ///
+    /// Fails with a [`GenerationMismatch`] if the path now holds a channel with a different
+    /// generation than this reader was opened on, as [`seek`](Self::seek) does: an index from a
+    /// recreated channel would not be comparable with this reader's
+    /// [`position`](Self::position).
     pub fn tail_record_index(&self) -> io::Result<u64> {
         const MAX_OPEN_RETRIES: usize = 8;
         for _ in 0..MAX_OPEN_RETRIES {
             let seq = find_earliest_sequence(&self.base_path)?;
             if let Some(file) = open_segment_if_present(&self.base_path, seq)? {
-                return Ok(read_segment_header(&file, seq)?.base_record_index);
+                let header = read_segment_header(&file, seq)?;
+                if header.generation != self.generation_cached {
+                    return Err(GenerationMismatch {
+                        expected: self.generation_cached,
+                        found: header.generation,
+                    }
+                    .into_io());
+                }
+                return Ok(header.base_record_index);
             }
         }
         Err(Self::retries_exhausted(&self.base_path))
@@ -2245,8 +2294,9 @@ impl Reader {
 
     /// Reposition so the next user record read is absolute index `index`.
     ///
-    /// Same rules and cost as opening with [`ReaderMode::At`]: `ErrorKind::NotFound` if
-    /// `index` has been pruned (or the channel is gone), `ErrorKind::InvalidInput` if it is
+    /// Same rules and cost as opening with [`ReaderMode::At`]: `ErrorKind::NotFound` carrying an
+    /// [`IndexPruned`] if `index` has been pruned (a plain `NotFound` if the channel is gone),
+    /// `ErrorKind::InvalidInput` if it is
     /// past the head, and a [`GenerationMismatch`] if the path now holds a channel with a
     /// different generation than this reader was opened on — which catches a recreated
     /// channel only if its writers stamp generations (see [`GenerationMismatch`]). On any
@@ -6014,8 +6064,30 @@ mod tests {
         assert_eq!(tail, r.position(), "LateJoin starts at the tail");
         assert_eq!(r.head_record_index()?, n);
 
-        let err = ReaderBuilder::new(base).start_at(tail - 1).build().err();
-        assert_eq!(err.map(|e| e.kind()), Some(ErrorKind::NotFound));
+        let err = ReaderBuilder::new(base)
+            .start_at(tail - 1)
+            .build()
+            .err()
+            .expect("pruned");
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+        assert_eq!(
+            IndexPruned::of(&err),
+            Some(IndexPruned {
+                index: tail - 1,
+                earliest: tail
+            })
+        );
+        let missing = ReaderBuilder::new("test_start_at_no_such_channel")
+            .start_at(0)
+            .build()
+            .err()
+            .expect("no channel");
+        assert_eq!(missing.kind(), ErrorKind::NotFound);
+        assert_eq!(
+            IndexPruned::of(&missing),
+            None,
+            "a missing channel is not a pruned index"
+        );
         let err = ReaderBuilder::new(base).start_at(n + 1).build().err();
         assert_eq!(err.map(|e| e.kind()), Some(ErrorKind::InvalidInput));
 
@@ -6111,6 +6183,14 @@ mod tests {
         let mut w = rolling_writer(base)?.generation(9).build()?;
         write_indexed(&mut w, 0..10)?;
         let err = r.seek(0).expect_err("different channel now");
+        assert_eq!(
+            GenerationMismatch::of(&err),
+            Some(GenerationMismatch {
+                expected: 7,
+                found: 9
+            })
+        );
+        let err = r.tail_record_index().expect_err("different channel now");
         assert_eq!(
             GenerationMismatch::of(&err),
             Some(GenerationMismatch {
