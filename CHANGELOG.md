@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### Added
+- **`Reader::position`** — the absolute index of the next user record the reader will return,
+  maintained on every read path (single, owned, drain and batch) and resynchronised from
+  `base_record_index` at each roll. With `generation()` it is a cursor that can be persisted
+  and resumed.
+
+### Changed
+- **The writer publishes `message_count` before `write_position`, both Release** (previously
+  a Relaxed `fetch_add` and a Relaxed store). The order is now part of the format contract
+  (FORMAT.md §1, §6 step 7): it is what lets a `Live` reader read the pair consistently and so
+  know the index it starts at. The count is a plain load + store — there is one writer — so the
+  locked RMW on the commit path is gone. All other `write_position` updates are Release too.
+- A `Live` open checks that the slot at `write_position` is uncommitted before trusting
+  `message_count`; if a writer died between commit and publish, it counts by walking the
+  segment after a 1 ms wait instead of starting with a wrong index.
+
 ### Fixed
 - **Crash recovery now counts the orphaned record.** A writer reopening after a crash between
   commit and publish stepped over the committed record but never counted it, so

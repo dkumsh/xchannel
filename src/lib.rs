@@ -448,7 +448,6 @@ impl ReaderBuilder {
         self.mode = ReaderMode::LateJoin;
         self
     }
-
     /// Default batch size limit used when `try_read_batch(None)` is called.
     /// `None` means unlimited.
     #[inline]
@@ -894,21 +893,32 @@ impl Writer {
         self.channel_header().generation
     }
 
+    /// Publish the advisory `(message_count, write_position)` pair after a commit.
+    ///
+    /// Both are Release stores, `message_count` first. That order is what lets a `Live` reader
+    /// read the pair consistently (see `Reader::live_start`): having acquired `write_position`,
+    /// it sees at least the count published with it, and a count that ran ahead of that position
+    /// implies the record at the position is already visibly committed — which the reader checks.
+    ///
+    /// There is a single writer, so the count is a plain load + store rather than a locked RMW.
     #[inline]
     fn publish_wp(&self, pos: usize) {
         let ch = self.channel_header();
-        ch.message_count.fetch_add(1, Ordering::Relaxed);
-        ch.write_position.store(pos as u64, Ordering::Relaxed);
+        let count = ch.message_count.load(Ordering::Relaxed);
+        ch.message_count.store(count + 1, Ordering::Release);
+        ch.write_position.store(pos as u64, Ordering::Release);
     }
 
     /// Store `val` to the channel header's `write_position` through
     /// the writer's already-mapped `channel_region`. Infallible —
     /// no extra mmap, no syscall. Used during roll publish to keep
-    /// the entire path past the rename non-fallible.
+    /// the entire path past the rename non-fallible. Release for the
+    /// same reason as `publish_wp`: any `write_position` a reader
+    /// acquires must carry the `message_count` stored before it.
     #[inline]
     fn store_wp_local(&self, val: u64) {
         let ch = self.channel_header();
-        ch.write_position.store(val, Ordering::Relaxed);
+        ch.write_position.store(val, Ordering::Release);
     }
 
     /// Add `delta` to the channel header's `write_position` through
@@ -917,7 +927,7 @@ impl Writer {
     #[inline]
     fn fetch_add_wp_local(&self, delta: u64) -> u64 {
         let ch = self.channel_header();
-        ch.write_position.fetch_add(delta, Ordering::Relaxed)
+        ch.write_position.fetch_add(delta, Ordering::Release)
     }
 
     /// Reserve space for a message payload of length `msg_size` placed **after** a pre-installed header.
@@ -1665,6 +1675,8 @@ pub struct Reader {
     file_sequence: u64,
     file: File,
     read_position: usize,
+    /// Absolute index of the next user record this reader will return (see `position()`).
+    position: u64,
     region_size_cached: usize,
     mtu_cached: u32,
     channel_name_cached: [u8; CHANNEL_NAME_MAX],
@@ -1679,6 +1691,26 @@ pub struct Reader {
     // Refcounted so an `OwnedMessage` can keep its region mapped after the
     // Reader has pruned it, rolled past it, or been dropped entirely.
     maps: Vec<Arc<MappedRegion>>, // last entry is current; older entries kept for batch segments
+}
+
+/// Where in a segment a new Reader starts.
+#[derive(Debug, Clone, Copy)]
+enum SegmentStart {
+    /// Offset 0: the segment's first record.
+    Beginning,
+    /// The next header slot, read from `write_position` (`Live`).
+    Head,
+}
+
+/// Open segment `sequence` read-only; `Ok(None)` if it does not exist (never created, or
+/// unlinked by retention since the directory scan).
+fn open_segment_if_present(base_path: &Path, sequence: u64) -> io::Result<Option<File>> {
+    let path = make_channel_file_path(base_path, sequence)?;
+    match OpenOptions::new().read(true).write(false).open(&path) {
+        Ok(file) => Ok(Some(file)),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 impl Reader {
@@ -1698,39 +1730,99 @@ impl Reader {
     pub fn open<P: AsRef<Path>>(path: P, mode: ReaderMode) -> io::Result<Self> {
         const MAX_OPEN_RETRIES: usize = 8;
         let base_path = path.as_ref().to_path_buf();
-        let mut last_err: Option<io::Error> = None;
-        for _ in 0..MAX_OPEN_RETRIES {
-            let seq = match mode {
-                ReaderMode::LateJoin => find_earliest_sequence(&base_path)?,
-                ReaderMode::Live => find_latest_sequence(&base_path)?,
-            };
-            match Self::open_sequence_file(base_path.clone(), seq, mode) {
-                Ok(r) => return Ok(r),
-                Err(e)
-                    if e.kind() == ErrorKind::NotFound && matches!(mode, ReaderMode::LateJoin) =>
-                {
-                    last_err = Some(e);
-                    continue;
+        match mode {
+            ReaderMode::Live => {
+                let seq = find_latest_sequence(&base_path)?;
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(false)
+                    .open(make_channel_file_path(&base_path, seq)?)?;
+                Self::from_segment(base_path, seq, file, SegmentStart::Head)
+            }
+            ReaderMode::LateJoin => {
+                for _ in 0..MAX_OPEN_RETRIES {
+                    let seq = find_earliest_sequence(&base_path)?;
+                    if let Some(file) = open_segment_if_present(&base_path, seq)? {
+                        return Self::from_segment(base_path, seq, file, SegmentStart::Beginning);
+                    }
                 }
-                Err(e) => return Err(e),
+                Err(Self::retries_exhausted(&base_path))
             }
         }
-        Err(last_err.unwrap_or_else(|| err_other("Reader::open: exhausted retries with no error")))
     }
 
-    /// Map region 0, validate format invariants (including that `channel_sequence`
-    /// matches `expected_sequence`), and return
-    /// `(read_pos, region_size, channel_name, base_record_index, mtu, generation)`.
-    fn read_channel_header(
-        file: &File,
-        mode: ReaderMode,
-        expected_sequence: u64,
-    ) -> io::Result<(usize, usize, [u8; CHANNEL_NAME_MAX], u64, u32, u64)> {
-        let ps = region::page_size();
-        let tmp_map = RegionMapping::create_read_only(file, 0, ps)?; // map one OS page
+    fn retries_exhausted(base_path: &Path) -> io::Error {
+        io::Error::new(
+            ErrorKind::NotFound,
+            format!(
+                "Reader::open: segments of {:?} kept disappearing under retention (or none exist)",
+                base_path
+            ),
+        )
+    }
 
-        // Verify first record is Channel
-        let mh = unsafe { &*(tmp_map.as_ptr() as *const MessageHeader) };
+    /// Where a `Live` reader starts, and the absolute index of the record there.
+    ///
+    /// The writer publishes `message_count` then `write_position`, both Release, after
+    /// committing a record. Acquiring `write_position` therefore guarantees a count at least
+    /// as new as that position; a count *newer* than the position means the writer has
+    /// since committed the record at that position, and the count was acquired before the
+    /// slot is checked. So an uncommitted slot proves the count matches the position exactly.
+    /// A committed one means the writer is mid-publish — or a skip/roll — and a moment
+    /// later the pair has moved on.
+    ///
+    /// A writer that died between commit and publish leaves the slot committed for good; past
+    /// a short budget the count is taken by walking the segment instead.
+    fn live_start(file: &File, ch: &ChannelHeader, region_size: usize) -> io::Result<(usize, u64)> {
+        const SPIN_BUDGET: Duration = Duration::from_millis(1);
+        let started = Instant::now();
+        let mut map: Option<(usize, RegionMapping<ReadOnly>)> = None;
+        loop {
+            let wp = ch.write_position.load(Ordering::Acquire) as usize;
+            let count = ch.message_count.load(Ordering::Acquire);
+            let read_pos = wp.saturating_sub(HEADER_SLOT);
+            let region_idx = read_pos / region_size;
+            let region = match &map {
+                Some((idx, region)) if *idx == region_idx => region,
+                _ => {
+                    let region = RegionMapping::create_read_only(
+                        file,
+                        (region_idx * region_size) as u64,
+                        region_size,
+                    )?;
+                    &map.insert((region_idx, region)).1
+                }
+            };
+            let mh =
+                unsafe { &*(region.as_ptr().add(read_pos % region_size) as *const MessageHeader) };
+            if !mh.is_committed()? {
+                return Ok((read_pos, ch.base_record_index + count));
+            }
+            if started.elapsed() >= SPIN_BUDGET {
+                let walked = walk_segment(file, region_size, |pos, _, _| pos >= read_pos)?;
+                if walked.pos != read_pos {
+                    return Err(err_invalid_data(format!(
+                        "Live open: write_position slot {read_pos} is not on the record chain \
+                         (walk stopped at {}, {:?})",
+                        walked.pos, walked.stop
+                    )));
+                }
+                return Ok((read_pos, ch.base_record_index + walked.users));
+            }
+            std::hint::spin_loop();
+        }
+    }
+
+    /// Build a Reader over an already-open segment: validate its header, work out where to
+    /// start, and map that region.
+    fn from_segment(
+        base_path: PathBuf,
+        sequence: u64,
+        file: File,
+        start: SegmentStart,
+    ) -> io::Result<Self> {
+        let page0 = RegionMapping::create_read_only(&file, 0, region::page_size())?;
+        let mh = unsafe { &*(page0.as_ptr() as *const MessageHeader) };
         let header_type = mh.parsed_header_type()?;
         if header_type != HeaderType::Channel {
             return Err(err_invalid_data(format!(
@@ -1738,40 +1830,20 @@ impl Reader {
                 header_type
             )));
         }
-
-        let ch = get_channel_header(tmp_map.as_ptr());
+        let ch = get_channel_header(page0.as_ptr());
         let region_size = ch.region_size as usize;
-        validate_channel_header(ch, region_size, expected_sequence)?;
+        validate_channel_header(ch, region_size, sequence)?;
 
-        let wp = ch.write_position.load(Ordering::Relaxed) as usize; // next header slot
-        let read_pos = match mode {
-            ReaderMode::LateJoin => 0,
-            ReaderMode::Live => wp.saturating_sub(HEADER_SLOT), // header slot
+        let (read_pos, position) = match start {
+            SegmentStart::Beginning => (0, ch.base_record_index),
+            SegmentStart::Head => Self::live_start(&file, ch, region_size)?,
         };
         let channel_name = ch.channel_name;
         let base_record_index = ch.base_record_index;
         let mtu = ch.mtu;
         let generation = ch.generation;
-        drop(tmp_map);
-        Ok((
-            read_pos,
-            region_size,
-            channel_name,
-            base_record_index,
-            mtu,
-            generation,
-        ))
-    }
+        drop(page0);
 
-    fn open_sequence_file(base_path: PathBuf, sequence: u64, mode: ReaderMode) -> io::Result<Self> {
-        let file_path = make_channel_file_path(&base_path, sequence)?;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(false)
-            .open(&file_path)?;
-
-        let (read_pos, region_size, channel_name, base_record_index, mtu, generation) =
-            Self::read_channel_header(&file, mode, sequence)?;
         let region_index = (read_pos / region_size) as u64;
         let current_region =
             RegionMapping::create_read_only(&file, region_index * region_size as u64, region_size)?;
@@ -1787,6 +1859,7 @@ impl Reader {
             file_sequence: sequence,
             file,
             read_position: read_pos,
+            position,
             region_size_cached: region_size,
             mtu_cached: mtu,
             channel_name_cached: channel_name,
@@ -1797,6 +1870,18 @@ impl Reader {
             batch_pos: Vec::with_capacity(DEFAULT_BATCH_POS_CAP),
             maps,
         })
+    }
+
+    /// Absolute index (from channel genesis, across all rolls) of the next user record this
+    /// reader will return. Advances by one for every user record consumed, on every read path
+    /// (`try_read`, `try_read_owned`, `read_owned_into`, `read_blocking`, and by the batch
+    /// length for `try_read_batch`); `peek_header` and `wait_for_message` leave it alone.
+    ///
+    /// Together with [`generation`](Self::generation) it identifies a record across restarts.
+    /// Resynchronised from the on-disk numbering (`base_record_index`) at every roll.
+    #[inline]
+    pub fn position(&self) -> u64 {
+        self.position
     }
 
     /// Channel name as set by `WriterBuilder::channel_name`, trimmed of trailing zero bytes.
@@ -1812,9 +1897,8 @@ impl Reader {
 
     /// Absolute index (from channel genesis) of the first user record in the file
     /// the reader currently has open. Updated as the reader follows rolls, including rolls
-    /// crossed inside a [`try_read_batch`](Self::try_read_batch). Combine with the number of
-    /// user records read so far in this file to get the absolute index of any record.
-    /// Genesis files report 0.
+    /// crossed inside a [`try_read_batch`](Self::try_read_batch). Genesis files report 0.
+    /// For the index of the reader's own cursor use [`position`](Self::position).
     #[inline]
     pub fn base_record_index(&self) -> u64 {
         self.base_record_index_cached
@@ -1892,7 +1976,7 @@ impl Reader {
             ));
         }
         let ch = get_channel_header(map.as_ptr());
-        Ok(ch.base_record_index + ch.message_count.load(Ordering::Relaxed))
+        Ok(ch.base_record_index + ch.message_count.load(Ordering::Acquire))
     }
 
     /// The channel's region size in bytes (from its header). Constant for a channel's life.
@@ -1993,6 +2077,7 @@ impl Reader {
         };
 
         self.read_position = end.cursor;
+        self.position = end.position;
         self.file_sequence = end.file_sequence;
         if let Some(rolled) = end.rolled {
             self.file = rolled.file;
@@ -2022,6 +2107,7 @@ impl Reader {
         let mut scan_file_sequence = self.file_sequence;
         let mut rolled: Option<BatchRoll> = None;
         let mut cursor = self.read_position;
+        let mut position = self.position;
         let mut progressed = false;
 
         'scan: loop {
@@ -2077,6 +2163,7 @@ impl Reader {
                             seg: seg_idx as u16,
                             off: cursor_off as u32,
                         });
+                        position += 1;
                         if self.batch_pos.len() >= max_batch {
                             // Cap batch size to avoid scanning too far in one call.
                             progressed = true;
@@ -2094,6 +2181,7 @@ impl Reader {
                         progressed = true;
                         self.batch_segs[seg_idx].end = next_off as u32;
                         scan_file_sequence = next.sequence;
+                        position = next.base_record_index;
                         // Its region 0 is already mapped; hand it to the next segment's scan.
                         self.maps.push(Arc::new(MappedRegion {
                             file_sequence: next.sequence,
@@ -2122,6 +2210,7 @@ impl Reader {
 
         Ok(progressed.then_some(BatchEnd {
             cursor,
+            position,
             file_sequence: scan_file_sequence,
             rolled,
         }))
@@ -2342,6 +2431,7 @@ impl Reader {
                     // so the index stays valid for the record just located.
                     let msg_map_idx = self.maps.len() - 1;
                     if consume {
+                        self.position += 1;
                         self.read_position = next_pos;
                         if next_pos.is_multiple_of(region_size) {
                             self.switch_region((next_pos / region_size) as u64)?;
@@ -2598,6 +2688,9 @@ impl Reader {
         self.channel_name_cached = next.channel_name;
         // Each rolled file has its own base; refresh so `base_record_index()` tracks it.
         self.base_record_index_cached = next.base_record_index;
+        // The on-disk numbering is authoritative; it equals the count carried so far unless a
+        // segment was written by a pre-fix writer that lost a record's count in crash recovery.
+        self.position = next.base_record_index;
         self.file = next.file;
         self.read_position = 0;
         self.maps.clear();
@@ -2675,6 +2768,7 @@ impl Reader {
 /// Where a batch scan ended, for `try_read_batch` to commit.
 struct BatchEnd {
     cursor: usize,
+    position: u64,
     file_sequence: u64,
     /// The last segment the scan rolled into, if it crossed a roll.
     rolled: Option<BatchRoll>,
@@ -5393,6 +5487,16 @@ mod tests {
         Ok(())
     }
 
+    // ---------- position ----------
+
+    /// Small geometry so a few hundred records span several regions and files.
+    fn rolling_writer(base: &str) -> io::Result<WriterBuilder> {
+        let region_size = page_size();
+        Ok(WriterBuilder::new(base)
+            .region_size(region_size)
+            .file_roll_size(region_size as u64 * 2))
+    }
+
     /// Commit records `range`, each carrying its own absolute index as payload and user meta.
     fn write_indexed(w: &mut Writer, range: std::ops::Range<u64>) -> io::Result<()> {
         for i in range {
@@ -5400,6 +5504,75 @@ mod tests {
             buf.copy_from_slice(&i.to_le_bytes());
             w.commit(0, 8, i)?;
         }
+        Ok(())
+    }
+
+    /// `position()` names the next record on every read path, across region and file rolls,
+    /// and a batch that crosses a roll refreshes `base_record_index()` like a single read does.
+    #[test]
+    fn position_tracks_every_read_path_across_rolls() -> anyhow::Result<()> {
+        let base = "test_position_tracks_every_read_path";
+        cleanup_channel_files(base);
+        let n = 1000u64;
+        let mut w = rolling_writer(base)?.build()?;
+        write_indexed(&mut w, 0..n)?;
+        assert!(w.file_sequence > 1, "expected several rolls");
+
+        let mut r = ReaderBuilder::new(base).build()?;
+        assert_eq!(r.position(), 0);
+        let mut step = 0u64;
+        while r.position() < n {
+            let before = r.position();
+            assert_eq!(r.peek_header()?.expect("record").user_meta_u64, before);
+            assert_eq!(r.position(), before, "peek does not consume");
+            match step % 3 {
+                0 => {
+                    let m = r.try_read()?.expect("record");
+                    assert_eq!(m.header().user_meta_u64, before);
+                }
+                1 => {
+                    let m = r.try_read_owned()?.expect("record");
+                    assert_eq!(m.header().user_meta_u64, before);
+                }
+                _ => {
+                    let batch = r.try_read_batch(Some(37))?.expect("records");
+                    for (k, m) in batch.iter().enumerate() {
+                        assert_eq!(m.header().user_meta_u64, before + k as u64);
+                    }
+                    let len = batch.len() as u64;
+                    assert_eq!(r.position(), before + len);
+                    assert!(r.base_record_index() <= r.position());
+                }
+            }
+            step += 1;
+        }
+        assert_eq!(r.position(), n);
+        assert_eq!(r.position(), r.head_record_index()?);
+        assert!(r.try_read()?.is_none());
+        assert_eq!(r.file_sequence(), w.file_sequence);
+        assert!(r.base_record_index() > 0);
+
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// A Live reader knows the index of the record it starts at.
+    #[test]
+    fn live_open_knows_its_position() -> anyhow::Result<()> {
+        let base = "test_live_open_position";
+        cleanup_channel_files(base);
+        let n = 777u64;
+        let mut w = rolling_writer(base)?.build()?;
+        write_indexed(&mut w, 0..n)?;
+
+        let mut r = ReaderBuilder::new(base).live().build()?;
+        assert_eq!(r.position(), n);
+        assert!(r.try_read()?.is_none());
+        write_indexed(&mut w, n..n + 2)?;
+        assert_eq!(r.try_read()?.expect("record").header().user_meta_u64, n);
+        assert_eq!(r.position(), n + 1);
+
+        cleanup_channel_files(base);
         Ok(())
     }
 
@@ -5416,6 +5589,30 @@ mod tests {
     }
 
     const RECORD_8: u64 = (HEADER_SLOT + 8).next_multiple_of(ALIGN) as u64;
+
+    /// A writer that died between commit and publish leaves the `write_position` slot committed
+    /// for good. Whether or not the count was bumped before it died, a Live reader starts on that
+    /// record and knows its index.
+    #[test]
+    fn live_open_past_a_dead_writer_publish() -> anyhow::Result<()> {
+        let base = "test_live_open_dead_publish";
+        for count_bumped in [false, true] {
+            cleanup_channel_files(base);
+            {
+                let mut w = WriterBuilder::new(base).build()?;
+                write_indexed(&mut w, 0..3)?;
+            }
+            rewind_write_position_on_disk(base, RECORD_8)?;
+            set_message_count_on_disk(base, if count_bumped { 3 } else { 2 })?;
+
+            let mut r = ReaderBuilder::new(base).live().build()?;
+            assert_eq!(r.position(), 2, "count_bumped={count_bumped}");
+            assert_eq!(r.try_read()?.expect("orphan").header().user_meta_u64, 2);
+            assert_eq!(r.position(), 3);
+        }
+        cleanup_channel_files(base);
+        Ok(())
+    }
 
     /// Crash recovery counts the orphaned record whichever side of the count bump the writer
     /// died on, so the head and the next segment's base stay true and a reader rolls cleanly.
@@ -5440,11 +5637,60 @@ mod tests {
 
             let mut r = ReaderBuilder::new(base).build()?;
             for i in 0..3 {
+                assert_eq!(r.position(), i);
                 assert_eq!(r.try_read()?.expect("record").header().user_meta_u64, i);
             }
             assert_eq!(r.base_record_index(), 2);
-            assert_eq!(r.head_record_index()?, 3);
         }
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// Live opens racing a busy writer: whatever the reader computes as its position must be
+    /// the index of the first record it then reads.
+    #[test]
+    fn opens_racing_a_writer_agree_with_the_records() -> anyhow::Result<()> {
+        let base = "test_opens_racing_a_writer";
+        cleanup_channel_files(base);
+        let n = 300_000u64;
+        // Big enough not to roll: this exercises the publish pair, not roll timing.
+        let mut w = WriterBuilder::new(base).file_roll_size(64 << 20).build()?;
+        write_indexed(&mut w, 0..1)?;
+        // Paced so the reader gets many opens in while records are still landing.
+        let writer = thread::spawn(move || -> io::Result<()> {
+            for chunk in (1..n).step_by(16) {
+                write_indexed(&mut w, chunk..(chunk + 16).min(n))?;
+                let until = Instant::now() + Duration::from_micros(2);
+                while Instant::now() < until {
+                    std::hint::spin_loop();
+                }
+            }
+            Ok(())
+        });
+
+        let first_record = |r: &mut Reader| -> anyhow::Result<Option<u64>> {
+            loop {
+                if let Some(m) = r.try_read()? {
+                    return Ok(Some(m.header().user_meta_u64));
+                }
+                if r.position() >= n {
+                    return Ok(None);
+                }
+                std::hint::spin_loop();
+            }
+        };
+        let mut opens = 0u64;
+        while !writer.is_finished() {
+            let mut live = ReaderBuilder::new(base).live().build()?;
+            let at = live.position();
+            if let Some(got) = first_record(&mut live)? {
+                assert_eq!(got, at, "Live open");
+            }
+            opens += 1;
+        }
+        writer.join().expect("writer thread")?;
+        assert!(opens > 0);
+
         cleanup_channel_files(base);
         Ok(())
     }

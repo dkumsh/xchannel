@@ -27,7 +27,10 @@ Status: **draft, format_version = 3.**
   memory_order_release)` / `atomic_load_explicit(&hdr->committed,
   memory_order_acquire)`. No other field in the file requires atomic access
   on the steady-state path — `write_position` and `message_count` in
-  `ChannelHeader` are advisory only.
+  `ChannelHeader` are advisory only. When a writer publishes them it stores
+  `message_count` first and `write_position` second, both with
+  `memory_order_release`; a reader that needs them as a consistent pair
+  (`Live` join, §7) acquires `write_position` first.
 
 ---
 
@@ -162,9 +165,13 @@ For each user record `i`:
    plus the release-store in step 6.
 6. Writer publishes record `i` by storing `committed = 1` to header `i`
    with release semantics.
-7. Writer updates `ChannelHeader.write_position` and increments
-   `ChannelHeader.message_count` (relaxed; advisory). `message_count` counts
-   **user** records only — see §6.1 for why `Skip` does not increment it.
+7. Writer increments `ChannelHeader.message_count`, then stores
+   `ChannelHeader.write_position`, both with release semantics and in that
+   order. Both are advisory, but the order is part of the contract: it is
+   what lets a `Live` reader read the pair consistently (§7). Any other
+   update of `write_position` (`Skip`, `Roll`) is also a release store.
+   `message_count` counts **user** records only — see §6.1 for why `Skip`
+   does not increment it.
 
    A writer that reopens a file and finds the slot at `write_position - 16`
    already committed (it crashed between steps 6 and 7) steps over that
@@ -205,6 +212,17 @@ records to the application.
 **Live:** open the latest-sequence file, read `ChannelHeader.write_position`
 once, start scanning from the header slot at `write_position - 16`, follow
 records as above. Subsequent reads do not need `write_position`.
+
+A Live reader that also wants the absolute index of the record it starts at
+reads the pair as: acquire `write_position` (`w`), acquire `message_count`
+(`c`), then acquire `committed` of the slot at `w - 16`. If that slot is
+uncommitted, the record there has index `base_record_index + c` exactly: the
+acquire of `w` guarantees `c` is at least as new as `w`, and had `c` already
+counted the record at `w - 16`, its commit would be visible. If the slot is
+committed the writer is between steps 6 and 7 (or between a `Skip`/`Roll`
+and its `write_position` update); retry. A writer that died in that window
+leaves the slot committed for good, so after a bounded wait the reader
+counts the user records before `w - 16` by walking the segment instead.
 
 A reader that observes `committed = 0` on a header slot must not advance;
 it must retry (busy/backoff is implementation-defined) until `committed`
