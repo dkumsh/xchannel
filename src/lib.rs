@@ -859,10 +859,6 @@ impl Writer {
                         };
                         verify_preinstall_signature(advanced_hdr)?;
                         next_hdr += advance;
-                        with_ch_mut(&file, region_size, |ch| {
-                            ch.write_position
-                                .store((next_hdr + HEADER_SLOT) as u64, Ordering::Release);
-                        })?;
                     }
                     HeaderType::Skip => {
                         // Recover into the next region. By construction in
@@ -891,10 +887,6 @@ impl Writer {
                         next_hdr += advance;
                         region_index = next_region_index;
                         current_region = new_region;
-                        with_ch_mut(&file, region_size, |ch| {
-                            ch.write_position
-                                .store((next_hdr + HEADER_SLOT) as u64, Ordering::Release);
-                        })?;
                     }
                     HeaderType::Roll | HeaderType::Channel => {
                         return Err(err_invalid_data(format!(
@@ -917,8 +909,15 @@ impl Writer {
                         walked.pos, walked.stop, next_hdr
                     )));
                 }
+                // Nothing is written until every fallible step above has passed, and then in the
+                // publish order (count, then position, both Release). A recovery that dies before
+                // the position store leaves the orphan still at `write_position`, so the next open
+                // simply recovers again; a `Live` reader never sees the new position with the old
+                // count.
                 with_ch_mut(&file, region_size, |ch| {
                     ch.message_count.store(walked.users, Ordering::Release);
+                    ch.write_position
+                        .store((next_hdr + HEADER_SLOT) as u64, Ordering::Release);
                 })?;
             }
 
@@ -4695,14 +4694,23 @@ mod tests {
         //    publish_wp). The rewind is exactly the Skip record size,
         //    which is also the publish_wp delta inside roll_over_region.
         rewind_write_position_on_disk(base, 32)?;
+        // A wrong count proves recovery recounts rather than trusting it: the
+        // orphan is a Skip, which is not a user record, so the true count is 1.
+        set_message_count_on_disk(base, 7)?;
 
         // 3) Reopen — must succeed (recovery follows the Skip into region 1).
         let mut w = WriterBuilder::new(base).region_size(region_size).build()?;
+        assert_eq!(
+            w.next_record_index(),
+            1,
+            "Skip orphan recounted, not counted"
+        );
 
         // 4) Recovered writer writes a new message in region 1.
         let buf = w.try_reserve(small_payload.len())?;
         buf.copy_from_slice(&small_payload);
         w.commit(2, small_payload.len() as u32, 0)?;
+        assert_eq!(w.next_record_index(), 2);
         drop(w);
 
         // 5) Reader: big message, then the post-recovery small message.
@@ -6055,6 +6063,68 @@ mod tests {
             assert_eq!(r.try_read()?.expect("orphan").header().user_meta_u64, 2);
             assert_eq!(r.position(), 3);
         }
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// Overwrite `bytes` at `offset` in segment `seq` of channel `base`.
+    fn poke_on_disk(base: &str, seq: u64, offset: u64, bytes: &[u8]) -> anyhow::Result<()> {
+        use std::os::unix::fs::FileExt;
+        let f = OpenOptions::new()
+            .write(true)
+            .open(make_channel_file_path(Path::new(base), seq)?)?;
+        f.write_all_at(bytes, offset)?;
+        f.sync_all()?;
+        Ok(())
+    }
+
+    /// Read the little-endian `u64` at `offset` in segment `seq` of channel `base`.
+    fn peek_u64_on_disk(base: &str, seq: u64, offset: u64) -> anyhow::Result<u64> {
+        use std::os::unix::fs::FileExt;
+        let f = File::open(make_channel_file_path(Path::new(base), seq)?)?;
+        let mut bytes = [0u8; 8];
+        f.read_exact_at(&mut bytes, offset)?;
+        Ok(u64::from_le_bytes(bytes))
+    }
+
+    /// File offsets of `ChannelHeader.write_position` / `message_count`, and of the first user
+    /// record's header (right after the Channel record).
+    const WP_AT: u64 = MESSAGE_HEADER_SIZE as u64;
+    const COUNT_AT: u64 = MESSAGE_HEADER_SIZE as u64 + 8;
+    const FIRST_RECORD_AT: u64 = (MESSAGE_HEADER_SIZE + CHANNEL_HEADER_SIZE) as u64;
+
+    /// A recovery that fails partway writes nothing: the orphan is still at `write_position` and
+    /// the count is untouched, so the next open recovers from scratch. (A recovery that dies after
+    /// storing the count but before the position leaves the "count already bumped" state that
+    /// `writer_recovery_counts_the_orphan` covers.)
+    #[test]
+    fn failed_recovery_leaves_the_header_untouched() -> anyhow::Result<()> {
+        let base = "test_failed_recovery_untouched";
+        cleanup_channel_files(base);
+        {
+            let mut w = WriterBuilder::new(base).build()?;
+            write_indexed(&mut w, 0..3)?;
+        }
+        rewind_write_position_on_disk(base, RECORD_8)?;
+        set_message_count_on_disk(base, 2)?;
+        let wp = peek_u64_on_disk(base, 0, WP_AT)?;
+
+        // Make the recount fail: record 0's committed flag becomes invalid.
+        poke_on_disk(base, 0, FIRST_RECORD_AT, &[2])?;
+        let err = WriterBuilder::new(base)
+            .build()
+            .err()
+            .expect("recount fails");
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert_eq!(peek_u64_on_disk(base, 0, WP_AT)?, wp, "position untouched");
+        assert_eq!(peek_u64_on_disk(base, 0, COUNT_AT)?, 2, "count untouched");
+
+        // Repaired, the next open recovers as if the failed attempt never happened.
+        poke_on_disk(base, 0, FIRST_RECORD_AT, &[1])?;
+        let w = WriterBuilder::new(base).build()?;
+        assert_eq!(w.next_record_index(), 3);
+        assert_eq!(peek_u64_on_disk(base, 0, WP_AT)?, wp + RECORD_8);
+
         cleanup_channel_files(base);
         Ok(())
     }

@@ -178,7 +178,11 @@ For each user record `i`:
    record and must then **recount** `message_count` from the segment's
    records: the crash may have landed on either side of the increment, and
    the orphaned record is delivered to readers, so it must be counted. The
-   next segment's `base_record_index` is derived from this count.
+   next segment's `base_record_index` is derived from this count. The writer
+   stores nothing until the recount has succeeded, and then stores the new
+   `message_count` before the new `write_position`, the same order as a
+   publish. A recovery interrupted partway therefore leaves the orphan at
+   `write_position`, and the next open simply recovers again.
 
 Readers observe `committed = 1` with acquire semantics and then read the
 header fields and payload. The pre-installed header at slot `i+1`
