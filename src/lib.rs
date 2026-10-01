@@ -203,6 +203,7 @@ impl std::error::Error for GenerationMismatch {}
 /// channel at the path; recover this payload with [`IndexPruned::of`] to tell the two apart, and
 /// to learn where the retained records begin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct IndexPruned {
     /// The index that was asked for.
     pub index: u64,
@@ -709,7 +710,10 @@ impl Writer {
             )?;
         if sequence > 0 {
             // Best-effort, like retention: the previous segment does not affect writing.
-            let _ = Self::commit_stranded_roll(&base_path, sequence - 1, region_size);
+            let ch = get_channel_header(channel_region.as_ptr());
+            let (generation, base) = (ch.generation, ch.base_record_index);
+            let _ =
+                Self::commit_stranded_roll(&base_path, sequence - 1, region_size, generation, base);
         }
 
         Ok(Self {
@@ -744,16 +748,38 @@ impl Writer {
     /// `write_position` past it, as `roll_file` would have. A segment whose roll completed
     /// stops the walk on its committed `Roll` instead, and is left alone. Costs one walk of at
     /// most one region, at writer open only.
-    fn commit_stranded_roll(base_path: &Path, sequence: u64, region_size: usize) -> io::Result<()> {
+    ///
+    /// It only touches a segment that is really this one's predecessor: same generation, and
+    /// its `base_record_index + message_count` equal to `next_base`, the checks a reader makes
+    /// when it follows the roll. It never grows a file (a truncated stub is left alone), and
+    /// the `write_position` advance is a compare-and-swap from the staged state, so running it
+    /// twice advances it once.
+    fn commit_stranded_roll(
+        base_path: &Path,
+        sequence: u64,
+        region_size: usize,
+        generation: u64,
+        next_base: u64,
+    ) -> io::Result<()> {
         let path = make_channel_file_path(base_path, sequence)?;
         let file = match OpenOptions::new().read(true).write(true).open(&path) {
             Ok(file) => file,
             Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()), // pruned by retention
             Err(e) => return Err(e),
         };
+        // `create_writable` extends a short file; a segment shorter than one region is not a
+        // rolled predecessor, and must not be changed.
+        if file.metadata()?.len() < region_size as u64 {
+            return Ok(());
+        }
         let mut region0 = RegionMapping::create_writable(&file, 0, region_size)?;
         let ch = get_channel_header(region0.as_ptr());
         validate_channel_header(ch, region_size, sequence)?;
+        let continues = ch.generation == generation
+            && ch.base_record_index + ch.message_count.load(Ordering::Acquire) == next_base;
+        if !continues {
+            return Ok(());
+        }
         let slot = (ch.write_position.load(Ordering::Acquire) as usize).saturating_sub(HEADER_SLOT);
         let region_start = slot - slot % region_size;
         let walked = walk_segment_from(&file, region_size, region_start, |_, _, _| false)?;
@@ -785,9 +811,13 @@ impl Writer {
         MessageHeader::commit(hdr);
         let ch_mut =
             unsafe { &*(region0.as_mut_ptr().add(MESSAGE_HEADER_SIZE) as *const ChannelHeader) };
-        ch_mut
-            .write_position
-            .fetch_add(HEADER_SLOT as u64, Ordering::Release);
+        let staged_wp = (slot + HEADER_SLOT) as u64;
+        let _ = ch_mut.write_position.compare_exchange(
+            staged_wp,
+            staged_wp + HEADER_SLOT as u64,
+            Ordering::Release,
+            Ordering::Relaxed,
+        );
         Ok(())
     }
 
@@ -6585,6 +6615,40 @@ mod tests {
             roll_at + 2 * HEADER_SLOT as u64,
             "write_position advanced past the Roll, as roll_file does"
         );
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// The roll repair only touches a real predecessor: a staged Roll in a segment whose
+    /// numbering does not continue into this one (copied in from another series) is left
+    /// uncommitted, as is a truncated stub, which must not be grown either.
+    #[test]
+    fn writer_open_leaves_a_foreign_or_truncated_predecessor_alone() -> anyhow::Result<()> {
+        let base = "test_writer_leaves_foreign_predecessor";
+        let roll_at = rolled_once(base)?;
+        poke_on_disk(base, 0, roll_at, &[0])?;
+        poke_on_disk(
+            base,
+            0,
+            WP_AT,
+            &(roll_at + HEADER_SLOT as u64).to_le_bytes(),
+        )?;
+        poke_on_disk(base, 0, BASE_AT, &100u64.to_le_bytes())?; // no longer continues into seg 1
+        let _w = WriterBuilder::new(base).build()?;
+        let seg0 = std::fs::read(make_channel_file_path(Path::new(base), 0)?)?;
+        assert_eq!(
+            seg0[roll_at as usize], 0,
+            "foreign segment's Roll left staged"
+        );
+        drop(_w);
+
+        let seg0_path = make_channel_file_path(Path::new(base), 0)?;
+        OpenOptions::new()
+            .write(true)
+            .open(&seg0_path)?
+            .set_len(64)?;
+        let _w = WriterBuilder::new(base).build()?;
+        assert_eq!(std::fs::metadata(&seg0_path)?.len(), 64, "stub not grown");
         cleanup_channel_files(base);
         Ok(())
     }

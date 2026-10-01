@@ -1,7 +1,9 @@
 //! A reader whose next region cannot be mapped reports the error and stays usable.
 //!
 //! Lives in its own test binary because it caps the whole process's address space
-//! (`RLIMIT_AS`) to make `mmap` fail; no other test may run alongside it.
+//! (`RLIMIT_AS`) to make `mmap` fail; no other test may run alongside it. Linux only:
+//! it reads `/proc/self/status`, and other systems do not enforce `RLIMIT_AS` on `mmap`.
+#![cfg(target_os = "linux")]
 
 use xchannel::{ReaderBuilder, WriterBuilder, cleanup_channel_files, page_size};
 

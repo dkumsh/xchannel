@@ -213,21 +213,36 @@ The order of a roll is part of the contract:
 4. Store `committed = 1` on the `Roll` (release).
 5. Advance the old file's `write_position` one slot **past** the `Roll`.
 
-A writer that dies between steps 3 and 4 leaves the old file ending in a
-staged `Roll` that nothing will commit. The next writer opens the new file
-(it is the newest), so it must finish the roll. When it opens segment
-`seq`, it checks segment `seq-1`. If the slot at that file's
-`write_position - 16` is where the record chain ends, uncommitted, and holds
-a `Roll` header with length 0, the writer commits it and advances
-`write_position` past it (steps 4 and 5). It walks the chain from the start
-of that slot's region to be sure; leftover payload bytes must never be taken
-for a `Roll`.
-
 A reader that sees the `Roll` committed can therefore always open the next
 file. A reader that finds the next file present knows a `Roll` is at least
 staged in the old one. After step 5, the old file's `write_position - 16` is
 not a record slot at all, and when the `Roll` took the file's last slot it
 lies beyond the end of the file.
+
+**A writer that crashes mid-roll.**
+
+- **Before step 3:** the new file is still a temporary; the old file is
+  still the newest, and the next writer resumes in it (and removes the
+  temporary).
+- **Between steps 3 and 4:** the old file ends in a staged `Roll` that
+  nothing will commit, and the next writer opens the new file, since it is
+  the newest. So that writer must finish the roll. When it opens segment
+  `seq`, it checks segment `seq-1`, and acts only if all of these hold:
+  - `seq-1` has the same `generation`;
+  - its `base_record_index + message_count` equals `seq`'s
+    `base_record_index`, so it really is the predecessor;
+  - the slot at its `write_position - 16` is where the record chain ends,
+    uncommitted, holding a `Roll` header with length 0. The writer walks the
+    chain from the start of that slot's region to be sure, so leftover
+    payload bytes are never taken for a `Roll`.
+
+  It then commits the `Roll` and advances `write_position` past it (steps 4
+  and 5). The advance is conditional on `write_position` still pointing at
+  the staged slot, so doing this twice advances it once. A file shorter than
+  one region is not a predecessor and is never extended.
+- **Between steps 4 and 5:** `write_position - 16` is the committed `Roll`.
+  That is a valid state: readers follow the `Roll` (§7), and the recovery
+  above leaves it alone.
 
 ---
 

@@ -5,7 +5,7 @@
 ### Added
 - **`IndexPruned`** — the `NotFound` from `start_at` / `ReaderMode::At` / `seek` for an index
   retention has removed now carries `IndexPruned { index, earliest }`, recovered with
-  `IndexPruned::of(&err)`. A missing channel stays a plain `NotFound`, so the two can be told
+  `IndexPruned::of(&err)`. It is `#[non_exhaustive]`, so it can gain fields later. A missing channel stays a plain `NotFound`, so the two can be told
   apart without parsing the message, and `earliest` says where to resume.
 
 ### Changed
@@ -32,8 +32,11 @@
 - **A writer that dies mid-roll no longer strands readers on the old segment.** A roll renames
   the next segment in before it commits the old segment's `Roll` marker. A writer that died in
   between left that `Roll` staged forever, and every reader still on the old segment waited on
-  it indefinitely. The next writer's open now finishes such a roll (FORMAT.md §6.2), after
-  confirming the slot by walking at most one region.
+  it indefinitely. The next writer's open now finishes such a roll (FORMAT.md §6.2). It acts
+  only on a real predecessor: same generation, numbering that continues into the new segment,
+  and a staged `Roll` confirmed by walking at most one region. It never extends a file, and its
+  `write_position` advance is idempotent. It is attempted once per writer open, and its errors
+  are ignored, like retention's.
 
 ## 6.0.0 (2026-10-01)
 
