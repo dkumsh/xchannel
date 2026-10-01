@@ -992,12 +992,16 @@ impl Writer {
     /// it sees at least the count published with it, and a count that ran ahead of that position
     /// implies the record at the position is already visibly committed — which the reader checks.
     ///
-    /// There is a single writer, so the count is a plain load + store rather than a locked RMW.
+    /// The count stays a `fetch_add` even though there is a single writer and a plain load +
+    /// store would be enough for the protocol. On x86 the `fetch_add` is a `lock xadd`, which is
+    /// also a full fence: it pushes the just-committed record out to readers at once. Replacing
+    /// it raised writer throughput when saturated but cost readers 30–90 ns of p50/p90 latency at
+    /// equal publish rates (`lse`, 2026-10-01). Release compiles to the same instructions as the
+    /// Relaxed this replaced, so the commit path is unchanged from 5.x.
     #[inline]
     fn publish_wp(&self, pos: usize) {
         let ch = self.channel_header();
-        let count = ch.message_count.load(Ordering::Relaxed);
-        ch.message_count.store(count + 1, Ordering::Release);
+        ch.message_count.fetch_add(1, Ordering::Release);
         ch.write_position.store(pos as u64, Ordering::Release);
     }
 

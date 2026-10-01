@@ -33,9 +33,9 @@
 - **The writer's `message_count` / `write_position` stores are now Release** (previously a
   Relaxed `fetch_add` and a Relaxed store). The order (count first) is unchanged but is now part
   of the format contract (FORMAT.md §1, §6 step 7): together with Release it is what lets a
-  `Live` reader read the pair consistently and so know the index it starts at. The count is a
-  plain load + store — there is one writer — so the locked RMW on the commit path is gone. All
-  other `write_position` updates are Release too.
+  `Live` reader read the pair consistently and so know the index it starts at. On x86 Release
+  compiles to the same instructions as Relaxed, so the commit path is unchanged. All other
+  `write_position` updates are Release too.
 - A `Live` open checks that the slot at `write_position` is uncommitted before trusting
   `message_count`; if a writer died between commit and publish, it counts by walking the
   segment after a 1 ms wait instead of starting with a wrong index. Before reading that slot
