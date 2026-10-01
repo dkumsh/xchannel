@@ -232,31 +232,32 @@ once, start scanning from the header slot at `write_position - 16`, follow
 records as above. Subsequent reads do not need `write_position`.
 
 A Live reader that also wants the absolute index of the record it starts at
-reads the pair as: acquire `write_position` (`w`), acquire `message_count`
-(`c`), then acquire `committed` of the slot at `w - 16`. If that slot is
-uncommitted, the record there has index `base_record_index + c` exactly: the
-acquire of `w` guarantees `c` is at least as new as `w`, and had `c` already
-counted the record at `w - 16`, its commit would be visible.
+reads the pair as follows:
 
-- **Slot committed, a `User` or `Skip`:** the writer is between steps 6 and
-  7, or between a `Skip` and its `write_position` update. Retry. A writer
-  that died in that window leaves the slot committed for good, so after a
-  bounded wait the reader counts the user records before `w - 16` by walking
-  the segment instead.
-- **Slot committed, a `Roll`:** this is terminal, not transient. Start on the
-  `Roll` with index `base_record_index + c`; `c` is final, since no user
-  record follows a `Roll`. Do not retry: the writer is about to move
-  `write_position` past the `Roll` (§6.2 step 5).
-- **Slot uncommitted, or `w - 16` past the end of the file:** check whether
-  `<base>.<seq+1>` exists, and check only *after* acquiring `w`. If it does
-  not, start at `w - 16` as above. If it does, a roll is at least staged
-  here, and the reader must not start past it. It may have opened this file
-  from a directory listing taken just before the rename. Walk the segment
-  from offset 0 and start on its `Roll`, with index `base_record_index` plus
-  the user records walked. If the walk stops at an uncommitted slot exactly
-  at `w - 16`, the `Roll` is staged there but not yet committed; start on
-  that slot. A roll that finished before `w` was acquired renamed the next
-  file earlier still, so the existence check cannot miss it.
+1. Acquire `write_position` (`w`), then acquire `message_count` (`c`).
+2. **Check that this segment is still the tail.** If `<base>.<seq+1>`
+   exists, or this segment's own path no longer does, a roll has happened.
+   (Retention unlinks oldest first, so a pruned successor means this segment
+   was pruned before it.) After a roll, `w - 16` is not a record slot (§6.2
+   step 5): it may hold leftovers of an earlier payload, or lie past the end
+   of the file. Do not read it; open the newest segment instead and start
+   over. The check must come after the acquire of `w`: a roll that finished
+   before that load renamed its next segment in earlier still, so the check
+   cannot miss it.
+3. Acquire `committed` of the slot at `w - 16`.
+   - **Uncommitted:** start there, at index `base_record_index + c` exactly.
+     The acquire of `w` guarantees `c` is at least as new as `w`, and had
+     `c` already counted the record at `w - 16`, its commit would be visible.
+   - **Committed `Roll`:** the rename and the commit both landed after the
+     check in step 2. This is terminal, not transient. Start on the `Roll`
+     with index `base_record_index + c`; `c` is final, since no user record
+     follows a `Roll`. Do not retry: the writer is about to move
+     `write_position` past it.
+   - **Committed `User` or `Skip`:** the writer is between steps 6 and 7, or
+     between a `Skip` and its `write_position` update. Retry from step 1. A
+     writer that died in that window leaves the slot committed for good, so
+     after a bounded wait the reader counts the user records before `w - 16`
+     by walking the segment instead.
 
 **Start at index `i`:** list the segments; the earliest one's
 `base_record_index` is the oldest index still retained, and the latest one's

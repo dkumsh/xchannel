@@ -38,17 +38,19 @@
   other `write_position` updates are Release too.
 - A `Live` open checks that the slot at `write_position` is uncommitted before trusting
   `message_count`; if a writer died between commit and publish, it counts by walking the
-  segment after a 1 ms wait instead of starting with a wrong index. A committed `Roll` there
-  is a valid start, and if the next segment already exists the open walks to the `Roll`
-  (FORMAT.md §6.2, §7).
+  segment after a 1 ms wait instead of starting with a wrong index. Before reading that slot
+  it checks that the segment is still the newest (FORMAT.md §6.2, §7), and if not it retries on
+  the newest one; a `Live` open now retries the way `LateJoin` does.
 
 ### Fixed
 - **A `Live` open could be stranded on a segment that had just rolled.** If the directory
   listing ran just before the writer renamed the next segment in, the reader opened the old
   segment and started one slot past its `Roll` marker, where nothing is ever written: `try_read`
-  returned `None` forever, with no error. When the `Roll` took the file's last slot, that start
-  lay past the end of the file and the first read raised SIGBUS. A `Live` open now starts on
-  the `Roll` and follows it.
+  returned `None` forever, with no error. Variants of the same race read leftover payload bytes
+  there as a header, raised SIGBUS when the `Roll` had taken the file's last slot (that start lay
+  past the end of the file), or failed with `ENOENT` when retention unlinked the segment first.
+  A `Live` open now notices the segment is no longer the newest and joins the tail in the newest
+  one.
 - **Crash recovery now counts the orphaned record.** A writer reopening after a crash between
   commit and publish stepped over the committed record but never counted it, so
   `message_count`, `head_record_index`, `next_record_index` and every later segment's

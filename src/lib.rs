@@ -195,6 +195,29 @@ impl std::fmt::Display for GenerationMismatch {
 
 impl std::error::Error for GenerationMismatch {}
 
+/// Internal: a `Live` open found a newer segment than the one it opened, so the file it holds
+/// is no longer the tail. `Reader::open` retries on the newest segment; never surfaces.
+#[derive(Debug)]
+struct StaleSegment;
+
+impl StaleSegment {
+    fn is(err: &io::Error) -> bool {
+        err.get_ref().is_some_and(|e| e.is::<Self>())
+    }
+
+    fn into_io(self) -> io::Error {
+        io::Error::other(self)
+    }
+}
+
+impl std::fmt::Display for StaleSegment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a newer segment exists; the opened segment is no longer the tail")
+    }
+}
+
+impl std::error::Error for StaleSegment {}
+
 // -------- Small internal helpers (low-level ops) --------
 #[inline]
 fn with_ch_mut<F>(file: &File, region_size: usize, f: F) -> io::Result<()>
@@ -1846,8 +1869,9 @@ impl Reader {
     /// still present, so we re-scan and try again up to
     /// `MAX_OPEN_RETRIES` times. A genuinely missing channel still fails
     /// fast — after the retries are exhausted the `ENOENT` propagates.
-    /// Live mode does not retry: it targets the *latest* sequence, which
-    /// the writer is actively writing to and will not unlink.
+    /// Live retries too: the latest sequence can roll, or under fast rolls
+    /// be unlinked, between the scan and the open, and the reader then joins
+    /// the tail in the newest segment instead.
     pub fn open<P: AsRef<Path>>(path: P, mode: ReaderMode) -> io::Result<Self> {
         Self::open_with(path, mode, None)
     }
@@ -1862,12 +1886,26 @@ impl Reader {
         let base_path = path.as_ref().to_path_buf();
         let reader = match mode {
             ReaderMode::Live => {
-                let seq = find_latest_sequence(&base_path)?;
-                let file = OpenOptions::new()
-                    .read(true)
-                    .write(false)
-                    .open(make_channel_file_path(&base_path, seq)?)?;
-                Self::from_segment(base_path, seq, file, SegmentStart::Head)?
+                // The newest segment can stop being the newest while we open it: the writer
+                // rolls (`live_start` notices and reports it stale), or rolls often enough
+                // under retention that the file is unlinked before the open. Either way the
+                // tail has moved on; list again and join it there.
+                let mut opened = None;
+                for _ in 0..MAX_OPEN_RETRIES {
+                    let seq = find_latest_sequence(&base_path)?;
+                    let Some(file) = open_segment_if_present(&base_path, seq)? else {
+                        continue;
+                    };
+                    match Self::from_segment(base_path.clone(), seq, file, SegmentStart::Head) {
+                        Ok(reader) => {
+                            opened = Some(reader);
+                            break;
+                        }
+                        Err(e) if StaleSegment::is(&e) => continue,
+                        Err(e) => return Err(e),
+                    }
+                }
+                opened.ok_or_else(|| Self::retries_exhausted(&base_path))?
             }
             ReaderMode::LateJoin => {
                 let mut opened = None;
@@ -1912,7 +1950,8 @@ impl Reader {
         io::Error::new(
             ErrorKind::NotFound,
             format!(
-                "Reader::open: segments of {:?} kept disappearing under retention (or none exist)",
+                "Reader::open: the segments of {:?} kept rolling or disappearing under retention \
+                 while opening (or none exist)",
                 base_path
             ),
         )
@@ -2033,19 +2072,15 @@ impl Reader {
     /// A committed User or Skip there means the writer is mid-publish, and a moment later the
     /// pair has moved on.
     ///
-    /// A `Roll` is different: it is the segment's last record, never followed by another, so
-    /// it is terminal rather than transient.
-    /// - A committed Roll at the slot is a valid start: the reader follows it into the next
-    ///   segment. The count is final, since no user record is published after a Roll.
-    /// - Once a roll has finished, the writer has moved `write_position` one slot *past* the
-    ///   Roll, onto bytes nothing will ever commit. A reader that opened this segment from a
-    ///   directory listing taken just before the rename would start there and wait forever. So
-    ///   when the slot is uncommitted, check whether the next segment exists. If it does, a
-    ///   roll has at least been staged here (the writer renames the next segment in before it
-    ///   commits the Roll), so walk the segment to the Roll and start on it. If the Roll is
-    ///   staged but not yet committed, the walk stops at the slot itself, which is also a
-    ///   valid start. The existence check comes after the `write_position` load: a roll that
-    ///   finished before that load renamed its segment in earlier still.
+    /// Rolls need care, because after one the old segment's `write_position` points one slot
+    /// *past* its `Roll` marker: at bytes nothing will ever commit, which may hold leftovers of
+    /// an earlier payload or lie beyond the end of the file. So before the slot is looked at,
+    /// and after `write_position` was acquired, `newer_segment_exists` is asked; if a newer
+    /// segment exists this one is no longer the tail and the open is reported stale
+    /// ([`StaleSegment`]), for the caller to retry on the newest segment. A roll that finished
+    /// before the load renamed its segment in earlier still, so this cannot miss it. A `Roll`
+    /// committed after the check is terminal rather than transient: start on it; the count is
+    /// final, since no user record follows a `Roll`.
     ///
     /// A writer that died between commit and publish leaves the slot committed for good; past
     /// a short budget the count is taken by walking the segment instead.
@@ -2053,7 +2088,7 @@ impl Reader {
         file: &File,
         ch: &ChannelHeader,
         region_size: usize,
-        successor: &Path,
+        newer_segment_exists: &dyn Fn() -> io::Result<bool>,
     ) -> io::Result<(usize, u64)> {
         const SPIN_BUDGET: Duration = Duration::from_millis(1);
         let started = Instant::now();
@@ -2061,15 +2096,21 @@ impl Reader {
         loop {
             let wp = ch.write_position.load(Ordering::Acquire) as usize;
             let count = ch.message_count.load(Ordering::Acquire);
+            if newer_segment_exists()? {
+                return Err(StaleSegment.into_io());
+            }
             let read_pos = wp.saturating_sub(HEADER_SLOT);
             let region_idx = read_pos / region_size;
             let region = match &map {
                 Some((idx, region)) if *idx == region_idx => region,
                 _ => {
-                    // A Roll in the file's last slot leaves `write_position` past the end of the
-                    // file. Touching that slot would raise SIGBUS; it can only mean a roll.
+                    // Only a finished roll leaves `write_position` past the end of the file,
+                    // and that was ruled out above.
                     if ((region_idx + 1) * region_size) as u64 > file.metadata()?.len() {
-                        return Self::start_at_roll(file, ch, region_size, read_pos);
+                        return Err(err_invalid_data(format!(
+                            "Live open: write_position slot {read_pos} is past the end of the \
+                             segment, but no newer segment exists"
+                        )));
                     }
                     let region = RegionMapping::create_read_only(
                         file,
@@ -2082,9 +2123,6 @@ impl Reader {
             let mh =
                 unsafe { &*(region.as_ptr().add(read_pos % region_size) as *const MessageHeader) };
             if !mh.is_committed()? {
-                if successor.try_exists()? {
-                    return Self::start_at_roll(file, ch, region_size, read_pos);
-                }
                 return Ok((read_pos, ch.base_record_index + count));
             }
             if mh.parsed_header_type()? == HeaderType::Roll {
@@ -2103,28 +2141,6 @@ impl Reader {
             }
             std::hint::spin_loop();
         }
-    }
-
-    /// The start for a `Live` open of a segment whose successor already exists: its `Roll`
-    /// marker, found by walking. `read_pos` is the slot `write_position` pointed at.
-    fn start_at_roll(
-        file: &File,
-        ch: &ChannelHeader,
-        region_size: usize,
-        read_pos: usize,
-    ) -> io::Result<(usize, u64)> {
-        let walked = walk_segment(file, region_size, |_, _, _| false)?;
-        let at_roll = walked.stop == WalkStop::Roll && walked.pos <= read_pos;
-        // The Roll is staged at `read_pos` but not committed yet: start on it all the same.
-        let at_staged_roll = walked.stop == WalkStop::Uncommitted && walked.pos == read_pos;
-        if !(at_roll || at_staged_roll) {
-            return Err(err_invalid_data(format!(
-                "Live open: the next segment exists but this one has no Roll marker at or \
-                 before write_position slot {read_pos} (walk stopped at {}, {:?})",
-                walked.pos, walked.stop
-            )));
-        }
-        Ok((walked.pos, ch.base_record_index + walked.users))
     }
 
     /// Build a Reader over an already-open segment: validate its header, work out where to
@@ -2151,8 +2167,13 @@ impl Reader {
         let (read_pos, position) = match start {
             SegmentStart::Beginning => (0, ch.base_record_index),
             SegmentStart::Head => {
-                let successor = make_channel_file_path(&base_path, sequence + 1)?;
-                Self::live_start(&file, ch, region_size, &successor)?
+                // Two `stat`s rather than a directory listing. A newer segment exists if the
+                // next one does — or if this one's own path is gone: retention unlinks oldest
+                // first, so a pruned successor means this segment was pruned before it.
+                let next = make_channel_file_path(&base_path, sequence + 1)?;
+                let this = make_channel_file_path(&base_path, sequence)?;
+                let newer_segment_exists = || Ok(next.try_exists()? || !this.try_exists()?);
+                Self::live_start(&file, ch, region_size, &newer_segment_exists)?
             }
             SegmentStart::At { read_pos, position } => (read_pos, position),
         };
@@ -6216,90 +6237,117 @@ mod tests {
 
     /// Open segment 0 the way `Live` would after a directory listing that still showed it as
     /// the newest segment.
-    fn live_open_segment_0(base: &str) -> anyhow::Result<Reader> {
+    fn live_open_segment_0(base: &str) -> io::Result<Reader> {
         let file = File::open(make_channel_file_path(Path::new(base), 0)?)?;
-        Ok(Reader::from_segment(
-            PathBuf::from(base),
-            0,
-            file,
-            SegmentStart::Head,
-        )?)
+        Reader::from_segment(PathBuf::from(base), 0, file, SegmentStart::Head)
     }
 
-    /// The Live reader must start on segment 0's Roll and follow it to record 3.
-    fn assert_follows_the_roll(r: &mut Reader) -> anyhow::Result<()> {
-        assert_eq!(r.position(), 3);
-        let m = r
-            .try_read()?
-            .expect("the roll is followed, not stranded past");
-        assert_eq!(m.header().user_meta_u64, 3);
-        assert_eq!(r.file_sequence(), 1);
-        assert_eq!(r.position(), 4);
+    /// Segment 0 is no longer the tail, whatever state its roll is in: an open of it must say
+    /// so (never start past the Roll, never touch bytes there), and a real `Live` open joins
+    /// the newest segment at `expected` instead.
+    fn assert_stale_then_joins_tail(base: &str, expected: u64) -> anyhow::Result<()> {
+        let err = live_open_segment_0(base).err().expect("segment 0 is stale");
+        assert!(StaleSegment::is(&err), "{err}");
+        let mut r = ReaderBuilder::new(base).live().build()?;
+        assert_eq!(r.position(), expected);
+        assert!(r.file_sequence() > 0);
+        assert!(r.try_read()?.is_none(), "joined at the tail");
         Ok(())
     }
 
-    /// The roll finished before the open: `write_position` already sits past the Roll marker.
+    /// Every state a rolled segment can be seen in: roll finished (`write_position` past the
+    /// Roll), Roll committed but `write_position` not yet bumped, Roll staged but not committed.
     #[test]
-    fn live_open_after_a_finished_roll_follows_it() -> anyhow::Result<()> {
-        let base = "test_live_open_finished_roll";
-        rolled_once(base)?;
-        assert_follows_the_roll(&mut live_open_segment_0(base)?)?;
+    fn live_open_of_a_rolled_segment_joins_the_newest() -> anyhow::Result<()> {
+        let base = "test_live_open_rolled_segment";
+        for state in ["finished", "committed", "staged"] {
+            let roll_at = rolled_once(base)?;
+            if state != "finished" {
+                poke_on_disk(
+                    base,
+                    0,
+                    WP_AT,
+                    &(roll_at + HEADER_SLOT as u64).to_le_bytes(),
+                )?;
+            }
+            if state == "staged" {
+                poke_on_disk(base, 0, roll_at, &[0])?;
+            }
+            assert_stale_then_joins_tail(base, 5).map_err(|e| e.context(state))?;
+        }
         cleanup_channel_files(base);
         Ok(())
     }
 
-    /// The open lands between the Roll commit and the writer's `write_position` bump, and the
-    /// bump happens while it is looking. Retrying there used to read the bumped position and
-    /// start past the Roll, stranded for good. (Starting on a committed Roll at once is the fast
-    /// path; were it missing, the bumped position would still be caught by the successor check,
-    /// at the cost of a walk — so this guards the outcome, not that shortcut.)
+    /// The Roll is committed but the newer segment was not visible yet when the open checked
+    /// (the rename and the commit both landed after that check): start on the Roll and follow it.
     #[test]
     fn live_open_on_a_committed_roll_starts_there() -> anyhow::Result<()> {
         let base = "test_live_open_committed_roll";
         let roll_at = rolled_once(base)?;
-        let bumped = peek_u64_on_disk(base, 0, WP_AT)?;
         poke_on_disk(
             base,
             0,
             WP_AT,
             &(roll_at + HEADER_SLOT as u64).to_le_bytes(),
         )?;
-        let bump_base = base.to_string();
-        let bump = thread::spawn(move || -> anyhow::Result<()> {
-            thread::sleep(Duration::from_micros(200));
-            poke_on_disk(&bump_base, 0, WP_AT, &bumped.to_le_bytes())
-        });
+        let seg1 = make_channel_file_path(Path::new(base), 1)?;
+        let hidden = PathBuf::from(format!("{base}.hidden"));
+        std::fs::rename(&seg1, &hidden)?;
         let mut r = live_open_segment_0(base)?;
-        bump.join().expect("bump thread")?;
-        assert_follows_the_roll(&mut r)?;
+        std::fs::rename(&hidden, &seg1)?;
+        assert_eq!(r.position(), 3);
+        let m = r.try_read()?.expect("the roll is followed");
+        assert_eq!(m.header().user_meta_u64, 3);
+        assert_eq!((r.file_sequence(), r.position()), (1, 4));
         cleanup_channel_files(base);
         Ok(())
     }
 
-    /// The next segment is renamed in but the Roll is not committed yet: start on the staged
-    /// Roll and follow it once it commits.
+    /// A short commit leaves the rest of its reservation behind; after a roll the slot past the
+    /// Roll holds those leftover payload bytes, not a header. They must never be read as one.
     #[test]
-    fn live_open_on_a_staged_roll_waits_on_it() -> anyhow::Result<()> {
-        let base = "test_live_open_staged_roll";
-        let roll_at = rolled_once(base)?;
-        poke_on_disk(
-            base,
-            0,
-            WP_AT,
-            &(roll_at + HEADER_SLOT as u64).to_le_bytes(),
-        )?;
-        poke_on_disk(base, 0, roll_at, &[0])?;
-        let mut r = live_open_segment_0(base)?;
-        assert_eq!(r.position(), 3);
-        assert!(r.try_read()?.is_none(), "roll not committed yet");
-        poke_on_disk(base, 0, roll_at, &[1])?;
-        assert_follows_the_roll(&mut r)?;
+    fn live_open_ignores_leftover_bytes_past_a_roll() -> anyhow::Result<()> {
+        let base = "test_live_open_leftover_bytes";
+        cleanup_channel_files(base);
+        let mut w = WriterBuilder::new(base).build()?;
+        write_indexed(&mut w, 0..2)?;
+        w.try_reserve(256)?.fill(0xFF);
+        w.commit(0, 8, 2)?; // short commit: 248 bytes of 0xFF stay behind
+        w.roll_file()?;
+        write_indexed(&mut w, 3..4)?;
+        assert_stale_then_joins_tail(base, 4)?;
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// The open picked segment 0, then retention removed it and the segment after it (oldest
+    /// first, as `keep_files` does) before the open looked: it must still notice segment 0 is
+    /// stale, not wait past its Roll forever.
+    #[test]
+    fn live_open_when_retention_removed_the_next_segment() -> anyhow::Result<()> {
+        let base = "test_live_open_next_pruned";
+        rolled_once(base)?;
+        let mut w = WriterBuilder::new(base).build()?;
+        w.roll_file()?;
+        write_indexed(&mut w, 5..6)?;
+        let held = File::open(make_channel_file_path(Path::new(base), 0)?)?;
+        for seq in [0, 1] {
+            std::fs::remove_file(make_channel_file_path(Path::new(base), seq)?)?;
+        }
+        let err = Reader::from_segment(PathBuf::from(base), 0, held, SegmentStart::Head)
+            .err()
+            .expect("segment 0 is stale");
+        assert!(StaleSegment::is(&err), "{err}");
+        let mut r = ReaderBuilder::new(base).live().build()?;
+        assert_eq!((r.file_sequence(), r.position()), (2, 6));
+        assert!(r.try_read()?.is_none());
         cleanup_channel_files(base);
         Ok(())
     }
 
     /// A Roll in the file's very last slot leaves `write_position` past the end of the file; a
-    /// Live open must start on the Roll, not touch the bytes beyond EOF (SIGBUS).
+    /// Live open must not touch the bytes beyond EOF (SIGBUS).
     #[test]
     fn live_open_when_the_roll_took_the_last_slot() -> anyhow::Result<()> {
         let base = "test_live_open_roll_last_slot";
@@ -6323,11 +6371,7 @@ mod tests {
             file_roll_size + HEADER_SLOT as u64,
             "write_position is past the end of segment 0"
         );
-
-        let mut r = live_open_segment_0(base)?;
-        assert_eq!(r.position(), 2);
-        assert_eq!(r.try_read()?.expect("record 2").header().user_meta_u64, 2);
-        assert_eq!(r.file_sequence(), 1);
+        assert_stale_then_joins_tail(base, 3)?;
         cleanup_channel_files(base);
         Ok(())
     }

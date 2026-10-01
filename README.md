@@ -397,10 +397,11 @@ they shape what the library is and isn't suited for.
   already been pruned. There is no automatic "skip ahead" — the reader
   decides: `Reader::rewind()` jumps to the oldest retained record, and
   `position()` before and `tail_record_index()` after tell it how many
-  records it lost. `Reader::open` in `LateJoin`
-  mode retries internally on the narrow start-up race where the
-  earliest sequence is unlinked between the directory scan and the
-  open syscall; a truly missing channel still fails fast with
+  records it lost. `Reader::open` retries internally on the narrow
+  start-up races: in `LateJoin` mode when the earliest sequence is
+  unlinked between the directory scan and the open syscall, and in
+  `Live` mode when the newest segment rolls (or is unlinked) while it
+  is being opened. A truly missing channel still fails fast with
   `ErrorKind::NotFound`.
 
 - **No kernel-mediated wake-up.** `try_read` is strictly non-blocking;
