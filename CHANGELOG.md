@@ -1,6 +1,17 @@
 # Changelog
 
-## Unreleased
+## 6.1.0 (2026-10-01)
+
+Recovery and error-path fixes, plus a typed error for pruned indices. **No format change and no
+API break:** files stay `format_version = 3`, and code built against 6.0 compiles unchanged.
+The read and commit paths cost the same as 6.0.0, measured on `lse` at saturation, 2.5–5 M/s and
+100K msg/s.
+
+Two behaviour changes, both on error paths:
+- a batch that reaches a roll it cannot follow now returns the records before the `Roll`
+  first, and reports the error on the following call;
+- `tail_record_index` fails with `GenerationMismatch` on a recreated channel instead of
+  returning its tail.
 
 ### Added
 - **`IndexPruned`** — the `NotFound` from `start_at` / `ReaderMode::At` / `seek` for an index
