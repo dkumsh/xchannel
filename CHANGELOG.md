@@ -1,6 +1,28 @@
 # Changelog
 
-## Unreleased
+## 6.0.0 (2026-10-01)
+
+Readers can now open at, and move to, an absolute record index. **No format change:** files stay
+`format_version = 3` and are interchangeable with 5.x. The major bump is for the API: `ReaderMode`
+gained a variant and is now `#[non_exhaustive]`.
+
+### Compatibility
+- **Mixing versions on one channel.** A 5.x writer publishes `message_count` and
+  `write_position` with Relaxed stores. On weakly ordered CPUs (ARM), a 6.0 `Live` reader
+  opening against it in a narrow window can get a `position()` off by one in either direction,
+  and stays off until it crosses its next roll. On x86 the stores are ordered anyway, so in
+  practice it is exact. Indices are exact once both sides are on 6.0. Every other reader path
+  counts from on-disk `base_record_index` and is unaffected.
+- **Channels a 5.x writer crash-recovered.** Such a segment has a `message_count` one short,
+  and so does the `base_record_index` of every segment after it. In that segment two records
+  share one index: the last one, and the first record of the next segment. A 6.0 reader
+  resynchronises `position()` from `base_record_index` at each roll, so past that roll its
+  indices match the on-disk numbering, which simply runs one behind the true count from genesis.
+  Inside the affected segment, after the orphan has been read, `position()` runs one *ahead* of
+  the next segment's base; a cursor saved there and passed to `start_at` skips one record.
+  Channels written only by 6.0 writers are exact.
+- **`rust-version = "1.88"`** is now declared in `Cargo.toml`. That is not a raise: 5.x already
+  used let-chains and needed 1.88; it was just never stated.
 
 ### Added
 - **`Reader::position`** — the absolute index of the next user record the reader will return,

@@ -1,7 +1,8 @@
 [package]
 name = "xchannel"
-version = "5.2.0"
+version = "6.0.0"
 edition = "2024"
+rust-version = "1.88"
 description = "mmap-backed IPC channels with regionized layout, alignment-safe headers, and file rolling."
 license = "MIT"
 readme = "README.md"
