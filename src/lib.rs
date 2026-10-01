@@ -1811,9 +1811,10 @@ impl Reader {
     }
 
     /// Absolute index (from channel genesis) of the first user record in the file
-    /// the reader currently has open. Updated as the reader follows rolls. Combine
-    /// with the number of user records read so far in this file to get the absolute
-    /// index of any record. Genesis files report 0.
+    /// the reader currently has open. Updated as the reader follows rolls, including rolls
+    /// crossed inside a [`try_read_batch`](Self::try_read_batch). Combine with the number of
+    /// user records read so far in this file to get the absolute index of any record.
+    /// Genesis files report 0.
     #[inline]
     pub fn base_record_index(&self) -> u64 {
         self.base_record_index_cached
@@ -1973,9 +1974,53 @@ impl Reader {
 
         self.prune_to_current();
 
+        let end = match self.scan_batch(max_batch) {
+            Ok(end) => end,
+            Err(e) => {
+                // Nothing was committed; drop what the scan mapped so the current region is
+                // `maps.last()` again, as every read path expects.
+                self.maps.truncate(1);
+                self.batch_segs.clear();
+                self.batch_pos.clear();
+                return Err(e);
+            }
+        };
+
+        let Some(end) = end else {
+            self.batch_segs.clear();
+            self.batch_pos.clear();
+            return Ok(None);
+        };
+
+        self.read_position = end.cursor;
+        self.file_sequence = end.file_sequence;
+        if let Some(rolled) = end.rolled {
+            self.file = rolled.file;
+            self.channel_name_cached = rolled.channel_name;
+            self.base_record_index_cached = rolled.base_record_index;
+        }
+
+        if self.batch_pos.is_empty() {
+            self.batch_segs.clear();
+            self.batch_pos.clear();
+            self.prune_to_current();
+            return Ok(None);
+        }
+
+        Ok(Some(MessageBatch {
+            segs: &self.batch_segs,
+            pos: &self.batch_pos,
+            maps: &self.maps,
+        }))
+    }
+
+    /// The scan behind `try_read_batch`: fills `batch_segs` / `batch_pos` and maps regions,
+    /// but leaves the cursor alone and returns where it should move to. `Ok(None)` means no
+    /// progress at all.
+    fn scan_batch(&mut self, max_batch: usize) -> io::Result<Option<BatchEnd>> {
         let region_size = self.region_size();
         let mut scan_file_sequence = self.file_sequence;
-        let mut scan_file: Option<File> = None;
+        let mut rolled: Option<BatchRoll> = None;
         let mut cursor = self.read_position;
         let mut progressed = false;
 
@@ -1985,7 +2030,8 @@ impl Reader {
             let region_start = region_index as usize * region_size;
             let mut cursor_off = cursor - region_start;
 
-            self.ensure_scan_region_mapped(scan_file.as_ref(), scan_file_sequence, region_index)?;
+            let scan_file = rolled.as_ref().map(|r| &r.file);
+            self.ensure_scan_region_mapped(scan_file, scan_file_sequence, region_index)?;
             let map_idx = self.maps.len() - 1;
 
             if self.batch_segs.len() > u16::MAX as usize {
@@ -2041,17 +2087,24 @@ impl Reader {
                     }
                     HeaderType::Channel | HeaderType::Skip => {}
                     HeaderType::Roll => {
-                        // Switch to the next file and continue scanning from its start.
-                        let next_seq = scan_file_sequence + 1;
-                        let file_path = make_channel_file_path(&self.base_path, next_seq)?;
-                        let next_file = OpenOptions::new()
-                            .read(true)
-                            .write(false)
-                            .open(&file_path)?;
+                        // Switch to the next file and continue scanning from its start, with
+                        // the same continuity checks a single-record roll makes.
+                        let prev = rolled.as_ref().map_or(&self.file, |r| &r.file);
+                        let next = self.open_successor(prev, scan_file_sequence + 1)?;
                         progressed = true;
                         self.batch_segs[seg_idx].end = next_off as u32;
-                        scan_file_sequence = next_seq;
-                        scan_file = Some(next_file);
+                        scan_file_sequence = next.sequence;
+                        // Its region 0 is already mapped; hand it to the next segment's scan.
+                        self.maps.push(Arc::new(MappedRegion {
+                            file_sequence: next.sequence,
+                            region_idx: 0,
+                            mapping: next.region0,
+                        }));
+                        rolled = Some(BatchRoll {
+                            file: next.file,
+                            channel_name: next.channel_name,
+                            base_record_index: next.base_record_index,
+                        });
                         cursor = 0;
                         continue 'scan;
                     }
@@ -2067,29 +2120,10 @@ impl Reader {
             }
         }
 
-        if !progressed {
-            self.batch_segs.clear();
-            self.batch_pos.clear();
-            return Ok(None);
-        }
-
-        self.read_position = cursor;
-        self.file_sequence = scan_file_sequence;
-        if let Some(file) = scan_file {
-            self.file = file;
-        }
-
-        if self.batch_pos.is_empty() {
-            self.batch_segs.clear();
-            self.batch_pos.clear();
-            self.prune_to_current();
-            return Ok(None);
-        }
-
-        Ok(Some(MessageBatch {
-            segs: &self.batch_segs,
-            pos: &self.batch_pos,
-            maps: &self.maps,
+        Ok(progressed.then_some(BatchEnd {
+            cursor,
+            file_sequence: scan_file_sequence,
+            rolled,
         }))
     }
 
@@ -2551,20 +2585,43 @@ impl Reader {
     /// Roll into the next segment.
     ///
     /// Nothing on `self` moves until the new segment is open and validated. A failure — the
-    /// segment not visible yet, retention having removed it, or one of the checks below
-    /// refusing it — leaves the reader exactly where it was, so the error can be returned
-    /// again, or the same call retried once the segment appears.
+    /// segment not visible yet, retention having removed it, or one of the checks in
+    /// `open_successor` refusing it — leaves the reader exactly where it was, so the error can
+    /// be returned again, or the same call retried once the segment appears.
     fn open_next_file(&mut self) -> io::Result<()> {
+        let next = self.open_successor(&self.file, self.file_sequence + 1)?;
+
+        // Past the last fallible step: commit the new segment in one go.
+        self.file_sequence = next.sequence;
+        // Refresh cached channel_name from the new file (the bytes are authoritative
+        // even though in practice the name carries across rolls).
+        self.channel_name_cached = next.channel_name;
+        // Each rolled file has its own base; refresh so `base_record_index()` tracks it.
+        self.base_record_index_cached = next.base_record_index;
+        self.file = next.file;
+        self.read_position = 0;
+        self.maps.clear();
+        self.maps.push(Arc::new(MappedRegion {
+            file_sequence: next.sequence,
+            region_idx: 0,
+            mapping: next.region0,
+        }));
+        Ok(())
+    }
+
+    /// Open and validate segment `next_sequence`, the successor of the segment open as `prev`.
+    /// Touches nothing on `self`; both the single-record roll and the batch scan commit the
+    /// result themselves.
+    fn open_successor(&self, prev: &File, next_sequence: u64) -> io::Result<Successor> {
         // The absolute index the next segment must begin at, computed from the one we are
         // leaving: a roll stamps the new file's base as the old file's `base + message_count`.
         // Read from the file we still hold open, so this works even after retention unlinked
         // it (readers finish a pruned file through their inode reference).
         let expected_base = {
-            let map = RegionMapping::create_read_only(&self.file, 0, region::page_size())?;
+            let map = RegionMapping::create_read_only(prev, 0, region::page_size())?;
             let ch = get_channel_header(map.as_ptr());
-            ch.base_record_index + ch.message_count.load(Ordering::Relaxed)
+            ch.base_record_index + ch.message_count.load(Ordering::Acquire)
         };
-        let next_sequence = self.file_sequence + 1;
         let file_path = make_channel_file_path(&self.base_path, next_sequence)?;
         let file = OpenOptions::new()
             .read(true)
@@ -2603,24 +2660,39 @@ impl Reader {
                 next_sequence, ch.generation, self.generation_cached
             )));
         }
-
-        // Past the last fallible step: commit the new segment in one go.
-        self.file_sequence = next_sequence;
-        // Refresh cached channel_name from the new file (the bytes are authoritative
-        // even though in practice the name carries across rolls).
-        self.channel_name_cached = ch.channel_name;
-        // Each rolled file has its own base; refresh so `base_record_index()` tracks it.
-        self.base_record_index_cached = ch.base_record_index;
-        self.file = file;
-        self.read_position = 0;
-        self.maps.clear();
-        self.maps.push(Arc::new(MappedRegion {
-            file_sequence: next_sequence,
-            region_idx: 0,
-            mapping: region0,
-        }));
-        Ok(())
+        let channel_name = ch.channel_name;
+        let base_record_index = ch.base_record_index;
+        Ok(Successor {
+            sequence: next_sequence,
+            file,
+            region0,
+            channel_name,
+            base_record_index,
+        })
     }
+}
+
+/// Where a batch scan ended, for `try_read_batch` to commit.
+struct BatchEnd {
+    cursor: usize,
+    file_sequence: u64,
+    /// The last segment the scan rolled into, if it crossed a roll.
+    rolled: Option<BatchRoll>,
+}
+
+struct BatchRoll {
+    file: File,
+    channel_name: [u8; CHANNEL_NAME_MAX],
+    base_record_index: u64,
+}
+
+/// A validated next segment, opened but not yet committed to the reader.
+struct Successor {
+    sequence: u64,
+    file: File,
+    region0: RegionMapping<ReadOnly>,
+    channel_name: [u8; CHANNEL_NAME_MAX],
+    base_record_index: u64,
 }
 
 fn now_ns() -> u64 {
@@ -5373,6 +5445,38 @@ mod tests {
             assert_eq!(r.base_record_index(), 2);
             assert_eq!(r.head_record_index()?, 3);
         }
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// A batch that crosses rolls refreshes `base_record_index()` as single reads do.
+    #[test]
+    fn batch_across_rolls_tracks_the_segment_base() -> anyhow::Result<()> {
+        let base = "test_batch_across_rolls_tracks_base";
+        cleanup_channel_files(base);
+        let region_size = page_size();
+        let mut w = WriterBuilder::new(base)
+            .region_size(region_size)
+            .file_roll_size(region_size as u64 * 2)
+            .build()?;
+        write_indexed(&mut w, 0..1000)?;
+
+        let mut r = ReaderBuilder::new(base).build()?;
+        let mut next = 0u64;
+        while let Some(batch) = r.try_read_batch(Some(37))? {
+            for m in batch.iter() {
+                assert_eq!(m.header().user_meta_u64, next);
+                next += 1;
+            }
+            assert!(r.base_record_index() <= next);
+        }
+        assert_eq!(next, 1000);
+        assert_eq!(r.file_sequence(), w.file_sequence);
+        assert!(
+            r.base_record_index() > 0,
+            "base refreshed across batch rolls"
+        );
+
         cleanup_channel_files(base);
         Ok(())
     }

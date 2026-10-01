@@ -8,6 +8,12 @@
   `message_count`, `head_record_index`, `next_record_index` and every later segment's
   `base_record_index` ended up one short of the records readers actually deliver. Recovery now
   recounts the segment, which is right whichever side of the count update the crash landed on.
+- **`try_read_batch` across a roll now validates the next segment** (sequence, numbering
+  continuity, generation) exactly like a single-record read, and refreshes `base_record_index()`
+  and the channel name; it previously opened the next file unchecked and left both stale.
+- **A `try_read_batch` that fails mid-scan no longer poisons the reader.** Regions mapped by the
+  failed scan were left behind, so the next read panicked on the "current map does not match
+  reader position" invariant.
 
 ## 5.2.0 (2026-08-27)
 
