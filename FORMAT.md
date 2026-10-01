@@ -205,6 +205,20 @@ record (length 0) at the current position in the old file, then begins
 record `i` at offset 0 of region 0 of file `<base>.<seq+1>`, after that
 file's `Channel` record and `ChannelHeader`.
 
+The order of a roll is part of the contract:
+
+1. Create and fully initialise `<base>.<seq+1>` under a temporary name.
+2. Stage the `Roll` header in the old file with `committed = 0`.
+3. Rename the new file to its final name.
+4. Store `committed = 1` on the `Roll` (release).
+5. Advance the old file's `write_position` one slot **past** the `Roll`.
+
+A reader that sees the `Roll` committed can therefore always open the next
+file. A reader that finds the next file present knows a `Roll` is at least
+staged in the old one. After step 5, the old file's `write_position - 16` is
+not a record slot at all, and when the `Roll` took the file's last slot it
+lies beyond the end of the file.
+
 ---
 
 ## 7. Reader algorithms (informative)
@@ -222,11 +236,27 @@ reads the pair as: acquire `write_position` (`w`), acquire `message_count`
 (`c`), then acquire `committed` of the slot at `w - 16`. If that slot is
 uncommitted, the record there has index `base_record_index + c` exactly: the
 acquire of `w` guarantees `c` is at least as new as `w`, and had `c` already
-counted the record at `w - 16`, its commit would be visible. If the slot is
-committed the writer is between steps 6 and 7 (or between a `Skip`/`Roll`
-and its `write_position` update); retry. A writer that died in that window
-leaves the slot committed for good, so after a bounded wait the reader
-counts the user records before `w - 16` by walking the segment instead.
+counted the record at `w - 16`, its commit would be visible.
+
+- **Slot committed, a `User` or `Skip`:** the writer is between steps 6 and
+  7, or between a `Skip` and its `write_position` update. Retry. A writer
+  that died in that window leaves the slot committed for good, so after a
+  bounded wait the reader counts the user records before `w - 16` by walking
+  the segment instead.
+- **Slot committed, a `Roll`:** this is terminal, not transient. Start on the
+  `Roll` with index `base_record_index + c`; `c` is final, since no user
+  record follows a `Roll`. Do not retry: the writer is about to move
+  `write_position` past the `Roll` (§6.2 step 5).
+- **Slot uncommitted, or `w - 16` past the end of the file:** check whether
+  `<base>.<seq+1>` exists, and check only *after* acquiring `w`. If it does
+  not, start at `w - 16` as above. If it does, a roll is at least staged
+  here, and the reader must not start past it. It may have opened this file
+  from a directory listing taken just before the rename. Walk the segment
+  from offset 0 and start on its `Roll`, with index `base_record_index` plus
+  the user records walked. If the walk stops at an uncommitted slot exactly
+  at `w - 16`, the `Roll` is staged there but not yet committed; start on
+  that slot. A roll that finished before `w` was acquired renamed the next
+  file earlier still, so the existence check cannot miss it.
 
 **Start at index `i`:** list the segments; the earliest one's
 `base_record_index` is the oldest index still retained, and the latest one's
