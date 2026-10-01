@@ -1001,21 +1001,29 @@ let cursor = (reader.generation(), reader.position());
 
 // resume
 let mut reader = ReaderBuilder::new(path)
-    .expect_generation(cursor.0) // a recreated channel is refused, not misread
+    .expect_generation(cursor.0) // refuses a recreated channel, if writers stamp generations
     .start_at(cursor.1)
     .build()?;
 ```
 
 An open reader can move with `seek(i)`, `rewind()` (oldest retained
 record) and `seek_to_head()`; `tail_record_index()..=head_record_index()`
-is the range they accept. A pruned index is `ErrorKind::NotFound`, one past
-the head is `ErrorKind::InvalidInput`, and a different channel at the path
-is a `GenerationMismatch`.
+is the range they accept. `index == head` is fine: the reader waits for the
+next record. One past the head is `ErrorKind::InvalidInput`. A pruned index
+is `ErrorKind::NotFound`, which is also what a missing channel returns, so
+check the message or `tail_record_index()` if the difference matters.
+
+`GenerationMismatch` means the path holds a channel with a different
+generation. It catches a recreated channel only if its writers set one with
+`WriterBuilder::generation` (a creation timestamp or a random id). The
+default is 0, and two default channels look identical.
 
 Cost: the segment holding `i` is found by binary search over segment
-headers; inside it the reader steps over the records before `i` one header
-at a time without touching payloads — O(records ahead of `i` in its
-segment). Open or seek once, not per message.
+headers. Inside it, the reader steps over the records before `i` one header
+at a time, without touching payloads. That is linear in the segment, not
+O(1): about 14 ns per record skipped (64-byte records on `/dev/shm`), so
+roughly 280 ms to reach the end of a 20M-record segment. Open or seek once,
+not per message; a smaller `file_roll_size` caps the worst case.
 
 ---
 

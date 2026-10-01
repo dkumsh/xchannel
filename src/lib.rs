@@ -159,6 +159,11 @@ fn verify_preinstall_signature(hdr: &MessageHeader) -> io::Result<()> {
 /// A recreated channel restarts at record index 0, so a saved index would silently point into
 /// unrelated data; this is checked before the index is, so it is never misreported as a
 /// pruned or out-of-range index. Recover it from the `io::Error` with [`GenerationMismatch::of`].
+///
+/// The check is only as good as the generations writers stamp. A channel created without
+/// [`WriterBuilder::generation`] has generation 0, so a recreated channel whose writers also
+/// leave it at 0 is indistinguishable from the original and is **not** caught. Stamp a fresh
+/// value per incarnation (a creation timestamp, a random id) if cursors are persisted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GenerationMismatch {
     /// The generation the caller asked for.
@@ -504,6 +509,9 @@ impl ReaderBuilder {
     /// point into unrelated data. With this set, `build` fails with a [`GenerationMismatch`]
     /// (checked before the index, so a recreated channel is never misreported as a pruned or
     /// out-of-range index).
+    ///
+    /// This only distinguishes incarnations whose writers stamp different generations; the
+    /// default is 0 (see [`GenerationMismatch`]).
     #[inline]
     pub fn expect_generation(mut self, generation: u64) -> Self {
         self.expected_generation = Some(generation);
@@ -1475,14 +1483,18 @@ pub enum ReaderMode {
     /// Start so the next user record read is absolute index `i` (see [`Reader::position`]).
     ///
     /// `i` may equal the channel head, in which case the reader waits for the next record like
-    /// `Live`. Opening fails with `ErrorKind::NotFound` if `i` is older than the earliest
-    /// retained segment (pruned by `keep_files`), and with `ErrorKind::InvalidInput` if `i` is
-    /// past the head.
+    /// `Live`. Opening fails with `ErrorKind::InvalidInput` if `i` is past the head, and with
+    /// `ErrorKind::NotFound` if `i` is older than the earliest retained segment (pruned by
+    /// `keep_files`). `NotFound` also means there is no channel at the path, or that its
+    /// segments kept disappearing under retention during the search; the message says which,
+    /// and [`Reader::tail_record_index`] on a live reader tells a pruned index apart.
     ///
     /// Cost: the segment holding `i` is found by binary search over the segments' headers
     /// (one page each); inside it the reader steps over the records before `i` one header at
-    /// a time, without touching payloads. That is O(records ahead of `i` in its segment) —
-    /// milliseconds for millions of records — so open once, not per message.
+    /// a time, without touching payloads. That is linear in the records ahead of `i` *in its
+    /// segment*, not O(1): about 14 ns per record skipped on `/dev/shm` with 64-byte records,
+    /// so roughly 280 ms to reach the end of a 20M-record segment. Open once, not per message;
+    /// a smaller `file_roll_size` caps the worst case.
     At(u64),
 }
 
@@ -2209,9 +2221,11 @@ impl Reader {
     /// Reposition so the next user record read is absolute index `index`.
     ///
     /// Same rules and cost as opening with [`ReaderMode::At`]: `ErrorKind::NotFound` if
-    /// `index` has been pruned, `ErrorKind::InvalidInput` if it is past the head, and a
-    /// [`GenerationMismatch`] if the path now holds a different channel than this reader
-    /// was opened on. On any error the reader is left exactly where it was.
+    /// `index` has been pruned (or the channel is gone), `ErrorKind::InvalidInput` if it is
+    /// past the head, and a [`GenerationMismatch`] if the path now holds a channel with a
+    /// different generation than this reader was opened on — which catches a recreated
+    /// channel only if its writers stamp generations (see [`GenerationMismatch`]). On any
+    /// error the reader is left exactly where it was.
     ///
     /// Messages already taken with `try_read_owned` stay valid; they hold their own share of
     /// their region.
