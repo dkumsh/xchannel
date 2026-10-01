@@ -300,11 +300,23 @@ struct WalkEnd {
 fn walk_segment(
     file: &File,
     region_size: usize,
+    stop: impl FnMut(usize, HeaderType, u64) -> bool,
+) -> io::Result<WalkEnd> {
+    walk_segment_from(file, region_size, 0, stop)
+}
+
+/// [`walk_segment`] starting at `start`, which must be a record boundary: offset 0, or the
+/// start of any region (records never cross a region boundary, so each region begins with
+/// one). `users` then counts the user records from `start`, not from the segment's start.
+fn walk_segment_from(
+    file: &File,
+    region_size: usize,
+    start: usize,
     mut stop: impl FnMut(usize, HeaderType, u64) -> bool,
 ) -> io::Result<WalkEnd> {
     let file_len = file.metadata()?.len();
     let mut map: Option<(usize, RegionMapping<ReadOnly>)> = None;
-    let mut pos = 0usize;
+    let mut pos = start;
     let mut users = 0u64;
     let end = |pos, users, stop| Ok(WalkEnd { pos, users, stop });
     loop {
@@ -695,6 +707,10 @@ impl Writer {
                 base_record_index,
                 generation,
             )?;
+        if sequence > 0 {
+            // Best-effort, like retention: the previous segment does not affect writing.
+            let _ = Self::commit_stranded_roll(&base_path, sequence - 1, region_size);
+        }
 
         Ok(Self {
             base_path,
@@ -712,6 +728,67 @@ impl Writer {
             next_hdr_pos,
             pending_msg_size: None,
         })
+    }
+
+    /// Finish a roll that a crashed writer left half done.
+    ///
+    /// `roll_file` renames the next segment in *before* it commits the old segment's `Roll`
+    /// marker. A writer that dies between the two leaves the next segment in place, so its
+    /// successor writer opens that one, while the old segment ends in a `Roll` that is staged
+    /// but never committed. Every reader still on the old segment would wait on it forever.
+    ///
+    /// The staged `Roll` sits at the slot `write_position` names. To be sure that slot is a
+    /// record slot and not leftover bytes, walk the record chain from the start of its region
+    /// (each region begins with a record) and require the walk to stop, uncommitted, exactly
+    /// there, on a header that is a `Roll` with length 0. Then commit it and advance
+    /// `write_position` past it, as `roll_file` would have. A segment whose roll completed
+    /// stops the walk on its committed `Roll` instead, and is left alone. Costs one walk of at
+    /// most one region, at writer open only.
+    fn commit_stranded_roll(base_path: &Path, sequence: u64, region_size: usize) -> io::Result<()> {
+        let path = make_channel_file_path(base_path, sequence)?;
+        let file = match OpenOptions::new().read(true).write(true).open(&path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()), // pruned by retention
+            Err(e) => return Err(e),
+        };
+        let mut region0 = RegionMapping::create_writable(&file, 0, region_size)?;
+        let ch = get_channel_header(region0.as_ptr());
+        validate_channel_header(ch, region_size, sequence)?;
+        let slot = (ch.write_position.load(Ordering::Acquire) as usize).saturating_sub(HEADER_SLOT);
+        let region_start = slot - slot % region_size;
+        let walked = walk_segment_from(&file, region_size, region_start, |_, _, _| false)?;
+        if walked.stop != WalkStop::Uncommitted || walked.pos != slot {
+            return Ok(());
+        }
+        let mut region = if region_start == 0 {
+            None
+        } else {
+            Some(RegionMapping::create_writable(
+                &file,
+                region_start as u64,
+                region_size,
+            )?)
+        };
+        let base_ptr = match region.as_mut() {
+            Some(r) => r.as_mut_ptr(),
+            None => region0.as_mut_ptr(),
+        };
+        let hdr = unsafe { base_ptr.add(slot - region_start) as *mut MessageHeader };
+        let staged = unsafe { &*hdr };
+        if staged.parsed_header_type()? != HeaderType::Roll || staged.length != 0 {
+            return Ok(());
+        }
+        // The next segment must really be there, or readers following the Roll would fail.
+        if !make_channel_file_path(base_path, sequence + 1)?.try_exists()? {
+            return Ok(());
+        }
+        MessageHeader::commit(hdr);
+        let ch_mut =
+            unsafe { &*(region0.as_mut_ptr().add(MESSAGE_HEADER_SIZE) as *const ChannelHeader) };
+        ch_mut
+            .write_position
+            .fetch_add(HEADER_SLOT as u64, Ordering::Release);
+        Ok(())
     }
 
     /// Open a specific sequence file. If new => init region0's ChannelHeader and **pre-install first user header**.
@@ -6473,6 +6550,54 @@ mod tests {
             "write_position is past the end of segment 0"
         );
         assert_stale_then_joins_tail(base, 3)?;
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// A writer died after renaming the next segment in but before committing the old
+    /// segment's Roll. A reader on the old segment waits on the staged Roll; the next writer's
+    /// open finishes the roll, and the reader moves on.
+    #[test]
+    fn writer_open_finishes_a_roll_its_predecessor_left_staged() -> anyhow::Result<()> {
+        let base = "test_writer_finishes_staged_roll";
+        let roll_at = rolled_once(base)?;
+        poke_on_disk(base, 0, roll_at, &[0])?;
+        poke_on_disk(
+            base,
+            0,
+            WP_AT,
+            &(roll_at + HEADER_SLOT as u64).to_le_bytes(),
+        )?;
+
+        let mut r = ReaderBuilder::new(base).build()?;
+        for i in 0..3 {
+            assert_eq!(r.try_read()?.expect("record").header().user_meta_u64, i);
+        }
+        assert!(r.try_read()?.is_none(), "stuck on the staged Roll");
+
+        let _w = WriterBuilder::new(base).build()?;
+        assert_eq!(
+            r.try_read()?.expect("roll followed").header().user_meta_u64,
+            3
+        );
+        assert_eq!(
+            peek_u64_on_disk(base, 0, WP_AT)?,
+            roll_at + 2 * HEADER_SLOT as u64,
+            "write_position advanced past the Roll, as roll_file does"
+        );
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// A segment whose roll completed is left byte-for-byte alone by the next writer's open.
+    #[test]
+    fn writer_open_leaves_a_completed_roll_alone() -> anyhow::Result<()> {
+        let base = "test_writer_leaves_completed_roll";
+        rolled_once(base)?;
+        let path = make_channel_file_path(Path::new(base), 0)?;
+        let before = std::fs::read(&path)?;
+        let _w = WriterBuilder::new(base).build()?;
+        assert!(std::fs::read(&path)? == before, "segment 0 unchanged");
         cleanup_channel_files(base);
         Ok(())
     }

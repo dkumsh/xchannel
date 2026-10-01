@@ -25,6 +25,11 @@
   `try_read_batch` discarded the records it had collected before the `Roll` and failed on every
   call, while `try_read` delivered them. It now returns those records, stops on the `Roll`, and
   reports the error on the next call.
+- **A writer that dies mid-roll no longer strands readers on the old segment.** A roll renames
+  the next segment in before it commits the old segment's `Roll` marker. A writer that died in
+  between left that `Roll` staged forever, and every reader still on the old segment waited on
+  it indefinitely. The next writer's open now finishes such a roll (FORMAT.md §6.2), after
+  confirming the slot by walking at most one region.
 
 ## 6.0.0 (2026-10-01)
 

@@ -213,6 +213,16 @@ The order of a roll is part of the contract:
 4. Store `committed = 1` on the `Roll` (release).
 5. Advance the old file's `write_position` one slot **past** the `Roll`.
 
+A writer that dies between steps 3 and 4 leaves the old file ending in a
+staged `Roll` that nothing will commit. The next writer opens the new file
+(it is the newest), so it must finish the roll. When it opens segment
+`seq`, it checks segment `seq-1`. If the slot at that file's
+`write_position - 16` is where the record chain ends, uncommitted, and holds
+a `Roll` header with length 0, the writer commits it and advances
+`write_position` past it (steps 4 and 5). It walks the chain from the start
+of that slot's region to be sure; leftover payload bytes must never be taken
+for a `Roll`.
+
 A reader that sees the `Roll` committed can therefore always open the next
 file. A reader that finds the next file present knows a `Roll` is at least
 staged in the old one. After step 5, the old file's `write_position - 16` is
