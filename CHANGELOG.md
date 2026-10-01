@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- **A failed region mapping no longer poisons the reader.** `try_read` (and `peek_header`,
+  `wait_for_message`) moved the cursor before mapping the region it moved into; if that `mmap`
+  failed (ENOMEM, the map-count limit), the error surfaced once and every later call panicked on
+  the "current map does not match reader position" invariant. The region is now mapped first,
+  so the error can be retried and the record is delivered once it succeeds. The batch path had
+  the same bug and was fixed in 6.0.0.
+
 ## 6.0.0 (2026-10-01)
 
 Readers can now open at, and move to, an absolute record index. **No format change:** files stay

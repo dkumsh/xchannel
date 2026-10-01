@@ -2815,11 +2815,13 @@ impl Reader {
                     // so the index stays valid for the record just located.
                     let msg_map_idx = self.maps.len() - 1;
                     if consume {
-                        self.position += 1;
-                        self.read_position = next_pos;
+                        // Map the next region before moving the cursor: if the map fails, the
+                        // cursor still names a mapped region and the record can be read again.
                         if next_pos.is_multiple_of(region_size) {
                             self.switch_region((next_pos / region_size) as u64)?;
                         }
+                        self.position += 1;
+                        self.read_position = next_pos;
                     }
                     return Ok(Some(FoundRecord {
                         loc: RecordLoc {
@@ -2833,10 +2835,12 @@ impl Reader {
                 }
                 HeaderType::Skip | HeaderType::Channel => {
                     let region_size = self.region_size();
-                    self.read_position = next_pos;
                     if next_pos.is_multiple_of(region_size) {
                         self.switch_region((next_pos / region_size) as u64)?;
+                        self.read_position = next_pos;
                         self.prune_to_current();
+                    } else {
+                        self.read_position = next_pos;
                     }
                     continue;
                 }
@@ -2934,10 +2938,12 @@ impl Reader {
                     return Ok(true);
                 }
                 HeaderType::Skip | HeaderType::Channel => {
-                    self.read_position = next_pos;
                     if next_pos.is_multiple_of(region_size) {
                         self.switch_region((next_pos / region_size) as u64)?;
+                        self.read_position = next_pos;
                         self.prune_to_current();
+                    } else {
+                        self.read_position = next_pos;
                     }
                     continue;
                 }
