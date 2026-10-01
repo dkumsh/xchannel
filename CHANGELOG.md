@@ -9,6 +9,11 @@
   the "current map does not match reader position" invariant. The region is now mapped first,
   so the error can be retried and the record is delivered once it succeeds. The batch path had
   the same bug and was fixed in 6.0.0.
+- **A batch no longer withholds the records before a roll it cannot follow.** When the next
+  segment was missing (pruned by retention) or refused (broken numbering, wrong generation),
+  `try_read_batch` discarded the records it had collected before the `Roll` and failed on every
+  call, while `try_read` delivered them. It now returns those records, stops on the `Roll`, and
+  reports the error on the next call.
 
 ## 6.0.0 (2026-10-01)
 

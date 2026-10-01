@@ -2561,7 +2561,18 @@ impl Reader {
                         // Switch to the next file and continue scanning from its start, with
                         // the same continuity checks a single-record roll makes.
                         let prev = rolled.as_ref().map_or(&self.file, |r| &r.file);
-                        let next = self.open_successor(prev, scan_file_sequence + 1)?;
+                        let next = match self.open_successor(prev, scan_file_sequence + 1) {
+                            Ok(next) => next,
+                            // Hand over what was collected before the Roll, as single reads
+                            // would; the cursor stops on the Roll, so the next call meets the
+                            // same refusal and reports it.
+                            Err(_) if !self.batch_pos.is_empty() => {
+                                cursor = roll_pos;
+                                self.batch_segs[seg_idx].end = cursor_off as u32;
+                                break 'scan;
+                            }
+                            Err(e) => return Err(e),
+                        };
                         progressed = true;
                         self.batch_segs[seg_idx].end = next_off as u32;
                         scan_file_sequence = next.sequence;
@@ -6537,9 +6548,10 @@ mod tests {
         Ok(w.next_record_index() - peek_u64_on_disk(base, 1, COUNT_AT)?)
     }
 
-    /// A batch that fails at a roll (here: the next segment is gone) returns the error and leaves
-    /// the reader usable — it used to leave the failed scan's mappings behind, and the next read
-    /// panicked on the "current map does not match reader position" invariant.
+    /// A batch that reaches a roll it cannot follow (here: the next segment is gone) hands over
+    /// the records before the Roll, then reports the error on the next call, as single reads do.
+    /// It used to drop those records and fail on every call; before 6.0.0 it also left the failed
+    /// scan's mappings behind, and the next read panicked.
     #[test]
     fn failed_batch_leaves_the_reader_usable() -> anyhow::Result<()> {
         let base = "test_failed_batch_leaves_reader_usable";
@@ -6547,17 +6559,34 @@ mod tests {
         std::fs::remove_file(make_channel_file_path(Path::new(base), 1)?)?;
 
         let mut r = ReaderBuilder::new(base).build()?;
+        let batch = r.try_read_batch(None)?.expect("records before the roll");
+        assert_eq!(batch.len() as u64, in_first);
+        for (i, m) in batch.iter().enumerate() {
+            assert_eq!(m.header().user_meta_u64, i as u64);
+        }
+        assert_eq!(r.position(), in_first);
         for _ in 0..2 {
             let err = r.try_read_batch(None).err().expect("next segment is gone");
             assert_eq!(err.kind(), ErrorKind::NotFound);
-            assert_eq!(r.position(), 0, "a failed batch consumes nothing");
+            assert_eq!(r.position(), in_first, "a failed batch consumes nothing");
         }
-        for i in 0..in_first {
-            assert_eq!(r.try_read()?.expect("record").header().user_meta_u64, i);
-        }
-        let err = r.try_read().err().expect("roll into the missing segment");
+        let err = r.try_read().err().expect("single reads meet the same roll");
         assert_eq!(err.kind(), ErrorKind::NotFound);
-        assert_eq!(r.position(), in_first);
+
+        // A batch that fails before collecting anything leaves the reader usable too.
+        let mut fresh = ReaderBuilder::new(base).build()?;
+        for i in 0..in_first {
+            assert_eq!(fresh.try_read()?.expect("record").header().user_meta_u64, i);
+        }
+        let err = fresh
+            .try_read_batch(None)
+            .err()
+            .expect("roll into the missing segment");
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+        assert_eq!(
+            fresh.try_read().err().map(|e| e.kind()),
+            Some(ErrorKind::NotFound)
+        );
 
         cleanup_channel_files(base);
         Ok(())
@@ -6572,6 +6601,8 @@ mod tests {
         poke_on_disk(base, 1, BASE_AT, &(in_first + 5).to_le_bytes())?;
 
         let mut r = ReaderBuilder::new(base).build()?;
+        let batch = r.try_read_batch(None)?.expect("records before the roll");
+        assert_eq!(batch.len() as u64, in_first);
         let err = r.try_read_batch(None).err().expect("discontinuity");
         assert_eq!(err.kind(), ErrorKind::InvalidData);
         assert!(err.to_string().contains("discontinuity"), "{err}");
