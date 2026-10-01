@@ -163,6 +163,92 @@ where
     Ok(())
 }
 
+/// Why [`walk_segment`] stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WalkStop {
+    /// The visitor asked to stop at this record.
+    Visitor,
+    /// The slot is not committed yet: the end of what has been written.
+    Uncommitted,
+    /// A `Roll` marker: the segment continues in the next file.
+    Roll,
+    /// The next region lies past the end of the file.
+    EndOfFile,
+}
+
+/// Where [`walk_segment`] stopped, and how many user records it stepped over to get there.
+#[derive(Debug, Clone, Copy)]
+struct WalkEnd {
+    pos: usize,
+    users: u64,
+    stop: WalkStop,
+}
+
+/// Header-only walk over one segment from offset 0, stepping over records by their `length`
+/// and never touching a payload.
+///
+/// `stop(pos, header_type, users_before)` is asked about each committed record before it is
+/// stepped over; returning `true` ends the walk *at* that record. The walk also ends at the
+/// first uncommitted slot, at a `Roll` marker (without stepping over it), or at the end of the
+/// file. Cost is one dependent header load per record plus a mapping per region, so this is
+/// for seeking and recovery, not for a hot path.
+fn walk_segment(
+    file: &File,
+    region_size: usize,
+    mut stop: impl FnMut(usize, HeaderType, u64) -> bool,
+) -> io::Result<WalkEnd> {
+    let file_len = file.metadata()?.len();
+    let mut map: Option<(usize, RegionMapping<ReadOnly>)> = None;
+    let mut pos = 0usize;
+    let mut users = 0u64;
+    let end = |pos, users, stop| Ok(WalkEnd { pos, users, stop });
+    loop {
+        let region_idx = pos / region_size;
+        if ((region_idx + 1) * region_size) as u64 > file_len {
+            return end(pos, users, WalkStop::EndOfFile);
+        }
+        let region = match &map {
+            Some((idx, region)) if *idx == region_idx => region,
+            _ => {
+                let region = RegionMapping::create_read_only(
+                    file,
+                    (region_idx * region_size) as u64,
+                    region_size,
+                )?;
+                &map.insert((region_idx, region)).1
+            }
+        };
+        let off = pos % region_size;
+        let leftover = region_size - off;
+        if leftover < HEADER_SLOT {
+            return Err(err_invalid_data(
+                "segment walk landed in a region's tail hole",
+            ));
+        }
+        let mh = unsafe { &*(region.as_ptr().add(off) as *const MessageHeader) };
+        if !mh.is_committed()? {
+            return end(pos, users, WalkStop::Uncommitted);
+        }
+        let header_type = mh.parsed_header_type()?;
+        if stop(pos, header_type, users) {
+            return end(pos, users, WalkStop::Visitor);
+        }
+        if header_type == HeaderType::Roll {
+            return end(pos, users, WalkStop::Roll);
+        }
+        let total_len = HEADER_SLOT + mh.length as usize;
+        if total_len > leftover {
+            return Err(err_invalid_data(
+                "segment walk: record extends past its region",
+            ));
+        }
+        if header_type == HeaderType::User {
+            users += 1;
+        }
+        pos = align_up(pos + total_len);
+    }
+}
+
 // ========== Builders ==========
 /// Maximum bytes available for a channel name in `ChannelHeader`.
 pub const CHANNEL_NAME_MAX: usize = 48;
@@ -757,6 +843,22 @@ impl Writer {
                         )));
                     }
                 }
+
+                // `message_count` must count every committed user record, the orphan included —
+                // readers deliver it, and the next segment's `base_record_index` is derived from
+                // this count. Whether the crash landed before or after the count was bumped cannot
+                // be told from the header alone, so recount the segment. Recovery only.
+                let walked = walk_segment(&file, region_size, |_, _, _| false)?;
+                if walked.pos != next_hdr {
+                    return Err(err_invalid_data(format!(
+                        "crashed writer: recount stopped at {} ({:?}) but the recovered \
+                         write slot is {}",
+                        walked.pos, walked.stop, next_hdr
+                    )));
+                }
+                with_ch_mut(&file, region_size, |ch| {
+                    ch.message_count.store(walked.users, Ordering::Release);
+                })?;
             }
 
             Ok((
@@ -5215,6 +5317,62 @@ mod tests {
 
         assert_eq!((len, first, msg_type), (64, 0xE5, 31));
 
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// Commit records `range`, each carrying its own absolute index as payload and user meta.
+    fn write_indexed(w: &mut Writer, range: std::ops::Range<u64>) -> io::Result<()> {
+        for i in range {
+            let buf = w.try_reserve(8)?;
+            buf.copy_from_slice(&i.to_le_bytes());
+            w.commit(0, 8, i)?;
+        }
+        Ok(())
+    }
+
+    /// Overwrite `ChannelHeader.message_count` on disk (byte offset 16 + 8).
+    fn set_message_count_on_disk(base: &str, count: u64) -> anyhow::Result<()> {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut f = OpenOptions::new()
+            .write(true)
+            .open(make_channel_file_path(Path::new(base), 0)?)?;
+        f.seek(SeekFrom::Start(MESSAGE_HEADER_SIZE as u64 + 8))?;
+        f.write_all(&count.to_le_bytes())?;
+        f.sync_all()?;
+        Ok(())
+    }
+
+    const RECORD_8: u64 = (HEADER_SLOT + 8).next_multiple_of(ALIGN) as u64;
+
+    /// Crash recovery counts the orphaned record whichever side of the count bump the writer
+    /// died on, so the head and the next segment's base stay true and a reader rolls cleanly.
+    #[test]
+    fn writer_recovery_counts_the_orphan() -> anyhow::Result<()> {
+        let base = "test_writer_recovery_counts_orphan";
+        for count_bumped in [false, true] {
+            cleanup_channel_files(base);
+            {
+                let mut w = WriterBuilder::new(base).build()?;
+                write_indexed(&mut w, 0..1)?;
+            }
+            rewind_write_position_on_disk(base, RECORD_8)?;
+            set_message_count_on_disk(base, if count_bumped { 1 } else { 0 })?;
+
+            let mut w = WriterBuilder::new(base).build()?;
+            assert_eq!(w.next_record_index(), 1, "count_bumped={count_bumped}");
+            write_indexed(&mut w, 1..2)?;
+            w.roll_file()?;
+            write_indexed(&mut w, 2..3)?;
+            assert_eq!(w.next_record_index(), 3);
+
+            let mut r = ReaderBuilder::new(base).build()?;
+            for i in 0..3 {
+                assert_eq!(r.try_read()?.expect("record").header().user_meta_u64, i);
+            }
+            assert_eq!(r.base_record_index(), 2);
+            assert_eq!(r.head_record_index()?, 3);
+        }
         cleanup_channel_files(base);
         Ok(())
     }

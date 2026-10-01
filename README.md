@@ -422,7 +422,8 @@ they shape what the library is and isn't suited for.
   pre-installed header, `build` returns `ErrorKind::InvalidData` and
   the supported recovery is `cleanup_channel_files` + a fresh
   channel. Readers can always drain whatever was already committed —
-  the recovery touches only `write_position`, never record bytes.
+  the recovery touches only `write_position` and `message_count`
+  (recounted so the orphan keeps its index), never record bytes.
 
 - **Local filesystems only.** `mmap` cross-process coherence relies
   on the OS keeping `MAP_SHARED` pages coherent across cores via the

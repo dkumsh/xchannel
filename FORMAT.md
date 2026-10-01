@@ -166,6 +166,13 @@ For each user record `i`:
    `ChannelHeader.message_count` (relaxed; advisory). `message_count` counts
    **user** records only — see §6.1 for why `Skip` does not increment it.
 
+   A writer that reopens a file and finds the slot at `write_position - 16`
+   already committed (it crashed between steps 6 and 7) steps over that
+   record and must then **recount** `message_count` from the segment's
+   records: the crash may have landed on either side of the increment, and
+   the orphaned record is delivered to readers, so it must be counted. The
+   next segment's `base_record_index` is derived from this count.
+
 Readers observe `committed = 1` with acquire semantics and then read the
 header fields and payload. The pre-installed header at slot `i+1`
 guarantees that a reader scanning past record `i` will land on a

@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+- **Crash recovery now counts the orphaned record.** A writer reopening after a crash between
+  commit and publish stepped over the committed record but never counted it, so
+  `message_count`, `head_record_index`, `next_record_index` and every later segment's
+  `base_record_index` ended up one short of the records readers actually deliver. Recovery now
+  recounts the segment, which is right whichever side of the count update the crash landed on.
+
 ## 5.2.0 (2026-08-27)
 
 ### Added
