@@ -118,9 +118,20 @@ Each cell runs:
 - 3 s warmup + 30 s measurement window per cell.
 - File rolling on (`--region-size 16m --roll-size 1g`), retention
   `--keep-files 2` so the working set stays bounded.
-- Reader does an **XOR-fold over the whole payload** before recording
-  the timestamp — this prevents dead-store elimination and is a
-  realistic proxy for downstream processing.
+- Latency is one-way, writer to reader: the writer reads
+  `CLOCK_MONOTONIC` just before `try_reserve` and stamps it into the
+  payload; the reader reads the clock right after `try_read` returns the
+  record. Reserve, payload copy, commit and cross-core visibility are
+  included; the reader's own processing is not.
+- The reader then does an **XOR-fold over the whole payload**, to defeat
+  dead-store elimination and as a proxy for downstream processing. It is
+  not part of the measured latency.
+
+The result tables below were measured with an earlier harness, in which
+the reader read the clock at the top of its poll iteration, before
+`try_read`. That undercounts by up to one poll
+iteration (tens of ns) and excludes the read itself, so new runs read
+slightly higher than these tables for the same code.
 
 Latency is recorded into HdrHistogram (3 sig figs, 1 ns – 60 s) on the
 reader side, post-warmup. p50 / p99 / p99.9 in the tables below.

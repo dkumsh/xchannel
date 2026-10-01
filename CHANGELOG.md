@@ -9,6 +9,10 @@
   apart without parsing the message, and `earliest` says where to resume.
 
 ### Changed
+- **`xch-bench` measures to the moment the record is received.** The reader used to read its
+  clock at the top of the poll iteration, before `try_read`, which undercounts by up to one poll
+  iteration and leaves out the read; it now reads it right after `try_read` returns. New runs
+  read slightly higher than the README's published tables for the same code.
 - **`Reader::tail_record_index` checks the generation**, like `seek`: on a path that now holds a
   channel with a different generation it fails with `GenerationMismatch` instead of reporting
   the new channel's tail.

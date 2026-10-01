@@ -370,6 +370,8 @@ mod bench {
             let Some(msg) = reader.try_read()? else {
                 continue;
             };
+            // Received: the record is in hand, its payload not yet touched.
+            let received_ns = mono_time_ns();
             if msg.len() < FIXED_HEADER_BYTES {
                 continue;
             }
@@ -396,13 +398,13 @@ mod bench {
 
             // During warmup we track sequence (so post-warmup gap detection is
             // accurate) but discard latency samples.
-            if now < warmup_end_ns {
+            if received_ns < warmup_end_ns {
                 last_seq = Some(seq);
                 seen_any = true;
                 continue;
             }
 
-            let mut delta = now.saturating_sub(sent_ns);
+            let mut delta = received_ns.saturating_sub(sent_ns);
             if delta == 0 {
                 delta = 1;
             }
@@ -480,6 +482,8 @@ mod bench {
 
         loop {
             if let Some(msg) = reader.try_read()? {
+                // Received: the record is in hand, its payload not yet touched.
+                let received_ns = mono_time_ns();
                 if msg.len() < FIXED_HEADER_BYTES {
                     continue;
                 }
@@ -502,8 +506,7 @@ mod bench {
                     black_box(acc);
                 }
 
-                let now_ns = mono_time_ns();
-                let mut delta = now_ns.saturating_sub(sent_ns);
+                let mut delta = received_ns.saturating_sub(sent_ns);
                 if delta == 0 {
                     delta = 1;
                 }
