@@ -275,8 +275,12 @@ reads the pair as follows:
 `[oldest, head]` are refused. Otherwise binary-search the segments for the
 last one whose `base_record_index <= i`, then scan it from offset 0 stepping
 over records by `length` (headers only), counting `User` records, and start
-at the header slot of the `(i - base_record_index)`-th one. There is no
-per-record index in the format, so the in-segment step is linear.
+at the first `User` record with exactly `i - base_record_index` user records
+before it in the segment. (When `i == base_record_index`, that is the
+segment's first user record.) If the scan reaches an uncommitted slot or the
+`Roll` with that many behind it, start there: `i` is the head, or the first
+record of the next segment. There is no per-record index in the format, so
+the in-segment step is linear.
 
 A reader that observes `committed = 0` on a header slot must not advance;
 it must retry (busy/backoff is implementation-defined) until `committed`
