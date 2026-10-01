@@ -6149,6 +6149,7 @@ mod tests {
     /// record's header (right after the Channel record).
     const WP_AT: u64 = MESSAGE_HEADER_SIZE as u64;
     const COUNT_AT: u64 = MESSAGE_HEADER_SIZE as u64 + 8;
+    const BASE_AT: u64 = MESSAGE_HEADER_SIZE as u64 + 16;
     const FIRST_RECORD_AT: u64 = (MESSAGE_HEADER_SIZE + CHANNEL_HEADER_SIZE) as u64;
 
     /// A recovery that fails partway writes nothing: the orphan is still at `write_position` and
@@ -6454,6 +6455,65 @@ mod tests {
         }
         writer.join().expect("writer thread")?;
         assert!(opens > 0);
+
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// Records 0..n across a rolled pair of segments; returns how many landed in segment 0.
+    fn two_segments(base: &str, n: u64) -> anyhow::Result<u64> {
+        cleanup_channel_files(base);
+        let mut w = rolling_writer(base)?.build()?;
+        write_indexed(&mut w, 0..n)?;
+        assert_eq!(w.file_sequence, 1, "expected exactly one roll");
+        Ok(w.next_record_index() - peek_u64_on_disk(base, 1, COUNT_AT)?)
+    }
+
+    /// A batch that fails at a roll (here: the next segment is gone) returns the error and leaves
+    /// the reader usable — it used to leave the failed scan's mappings behind, and the next read
+    /// panicked on the "current map does not match reader position" invariant.
+    #[test]
+    fn failed_batch_leaves_the_reader_usable() -> anyhow::Result<()> {
+        let base = "test_failed_batch_leaves_reader_usable";
+        let in_first = two_segments(base, 400)?;
+        std::fs::remove_file(make_channel_file_path(Path::new(base), 1)?)?;
+
+        let mut r = ReaderBuilder::new(base).build()?;
+        for _ in 0..2 {
+            let err = r.try_read_batch(None).err().expect("next segment is gone");
+            assert_eq!(err.kind(), ErrorKind::NotFound);
+            assert_eq!(r.position(), 0, "a failed batch consumes nothing");
+        }
+        for i in 0..in_first {
+            assert_eq!(r.try_read()?.expect("record").header().user_meta_u64, i);
+        }
+        let err = r.try_read().err().expect("roll into the missing segment");
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+        assert_eq!(r.position(), in_first);
+
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// A batch that crosses into a segment breaking the absolute numbering refuses it, as a
+    /// single read does — it used to open the next file unchecked.
+    #[test]
+    fn batch_refuses_a_discontinuous_next_segment() -> anyhow::Result<()> {
+        let base = "test_batch_refuses_discontinuous";
+        let in_first = two_segments(base, 400)?;
+        poke_on_disk(base, 1, BASE_AT, &(in_first + 5).to_le_bytes())?;
+
+        let mut r = ReaderBuilder::new(base).build()?;
+        let err = r.try_read_batch(None).err().expect("discontinuity");
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert!(err.to_string().contains("discontinuity"), "{err}");
+
+        let mut single = ReaderBuilder::new(base).build()?;
+        for _ in 0..in_first {
+            single.try_read()?.expect("record before the roll");
+        }
+        let err = single.try_read().err().expect("same refusal");
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
 
         cleanup_channel_files(base);
         Ok(())
