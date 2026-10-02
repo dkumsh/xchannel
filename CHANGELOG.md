@@ -1,6 +1,17 @@
 # Changelog
 
-## Unreleased
+## 6.2.0 (2026-10-03)
+
+Readers can now sleep until the writer commits, instead of polling, on channels whose writer opts
+in. **No format break and no API break:** the new header fields are additive and zero-default,
+so files stay `format_version = 3`, older readers ignore the fields, and newer readers on older
+files keep the backoff. Code built against 6.1 compiles unchanged. A channel that does not opt in
+costs the same as in 6.1.0 on the commit and read paths, measured on the latency-tuned server at
+saturation, 5 M/s and 100K msg/s. The `libc` floor rises to 0.2.183.
+
+One behaviour change for every reader that waits: the backoff is now 50 µs to 500 µs instead of
+1 µs to 10 ms, so the first record after a quiet spell waits at most about half a millisecond
+instead of 10 ms, at the cost of about 2,000 wake-ups a second per idle reader instead of 100.
 
 ### Added
 - **`WriterBuilder::wake_readers(true)`** — the writer wakes readers that wait for the channel,
