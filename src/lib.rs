@@ -20,10 +20,11 @@
 
 mod channel;
 mod region;
+mod wake;
 
 use channel::{
     ChannelHeader, ENDIANNESS_LE, FORMAT_VERSION, HeaderType, MessageHeader, SYSTEM_HEADER_SIZE,
-    USER_HEADER_KIND_DEFAULT, USER_HEADER_SIZE,
+    USER_HEADER_KIND_DEFAULT, USER_HEADER_SIZE, WAKE_FLAG_WAKES,
 };
 pub use region::{ReadOnly, RegionMapping, Writable, page_size};
 
@@ -33,7 +34,7 @@ use std::mem::{align_of, size_of};
 use std::path::{Path, PathBuf};
 use std::slice;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -367,6 +368,18 @@ fn walk_segment_from(
     }
 }
 
+/// Set or clear a segment's `wake_flags` bit 0 through the writer's mapping of its region 0.
+/// Readers load the byte on every wait, so a change applies from their next wait.
+fn set_wake_flag(region0: &RegionMapping<Writable>, wake: bool) {
+    let ch = get_channel_header(region0.as_ptr());
+    let flags = unsafe { &*(std::ptr::addr_of!(ch.wake_flags) as *const AtomicU8) };
+    if wake {
+        flags.fetch_or(WAKE_FLAG_WAKES, Ordering::Release);
+    } else {
+        flags.fetch_and(!WAKE_FLAG_WAKES, Ordering::Release);
+    }
+}
+
 // ========== Builders ==========
 /// Maximum bytes available for a channel name in `ChannelHeader`.
 pub const CHANNEL_NAME_MAX: usize = 48;
@@ -381,6 +394,7 @@ pub struct WriterBuilder {
     channel_name: [u8; CHANNEL_NAME_MAX],
     base_record_index: u64,
     generation: u64,
+    wake_readers: bool,
 }
 
 impl WriterBuilder {
@@ -394,7 +408,32 @@ impl WriterBuilder {
             channel_name: [0; CHANNEL_NAME_MAX],
             base_record_index: 0, // default: genesis channel starts at index 0
             generation: 0,        // default: unset incarnation id
+            wake_readers: false,  // default: readers poll with backoff
         }
+    }
+
+    /// Wake readers that wait for this channel, instead of leaving them to poll.
+    ///
+    /// After every commit, and after committing a segment's `Roll`, the writer bumps the
+    /// segment's wake word and `futex_wake`s anyone sleeping on it.
+    /// [`Reader::wait_for_message`] and [`Reader::read_blocking`] then sleep on
+    /// that word and wake within microseconds of a commit, instead of on a backoff timer that
+    /// grows to 10 ms. Readers stay read-only; nothing about them is in shared memory.
+    ///
+    /// The cost is one futex syscall on **every** commit, whether or not anyone is waiting:
+    /// measured at about 165 ns on a recent laptop CPU and 730 ns on an older,
+    /// heavily mitigated server CPU, plus 1–2.5 µs on a commit that actually wakes a sleeper.
+    /// So it suits a channel that is often idle, not one that runs at millions of records a
+    /// second. How fast a sleeping reader runs again depends on its CPU's idle states: about
+    /// 3 µs on a host with deep C-states disabled, around 80 µs on an untuned laptop.
+    ///
+    /// Off by default. A channel that does not opt in is unchanged: no load, no store, no
+    /// syscall. The setting is stamped into every segment this writer creates or reopens
+    /// (FORMAT.md §3), so readers know to sleep on the word. Linux only; elsewhere it is
+    /// accepted and does nothing, and readers keep the backoff.
+    pub fn wake_readers(mut self, wake: bool) -> Self {
+        self.wake_readers = wake;
+        self
     }
 
     /// Stamp an opaque **incarnation id** into every segment of this channel, used only
@@ -524,6 +563,7 @@ impl WriterBuilder {
             self.channel_name,
             self.base_record_index,
             self.generation,
+            self.wake_readers,
         )
     }
 
@@ -638,6 +678,9 @@ pub struct Writer {
     /// `length > pending_msg_size` is rejected. `None` means no
     /// pending reservation.
     pending_msg_size: Option<usize>,
+    /// Wake readers after every commit (`WriterBuilder::wake_readers`). Branched on alone,
+    /// never on shared state, so a writer that does not wake pays nothing else.
+    wake: bool,
 }
 
 impl Writer {
@@ -656,6 +699,7 @@ impl Writer {
         channel_name: [u8; CHANNEL_NAME_MAX],
         base_record_index: u64,
         generation: u64,
+        wake: bool,
     ) -> io::Result<Self> {
         // Validate region invariants
         let ps = region::page_size();
@@ -708,6 +752,9 @@ impl Writer {
                 base_record_index,
                 generation,
             )?;
+        // Readers trust the flag of the segment they read, so it follows this writer's
+        // setting, set or cleared, whoever created the segment.
+        set_wake_flag(&channel_region, wake);
         if sequence > 0 {
             // Best-effort, like retention: the previous segment does not affect writing.
             let ch = get_channel_header(channel_region.as_ptr());
@@ -731,6 +778,7 @@ impl Writer {
             channel_name,
             next_hdr_pos,
             pending_msg_size: None,
+            wake,
         })
     }
 
@@ -818,6 +866,9 @@ impl Writer {
             Ordering::Release,
             Ordering::Relaxed,
         );
+        // Readers asleep on this segment's word (its writer woke readers) must wake to
+        // follow the Roll. Unconditional: this writer's own setting is irrelevant here.
+        wake::wake_all(&ch_mut.wake_word);
         Ok(())
     }
 
@@ -1151,6 +1202,9 @@ impl Writer {
         let ch = self.channel_header();
         ch.message_count.fetch_add(1, Ordering::Release);
         ch.write_position.store(pos as u64, Ordering::Release);
+        if self.wake {
+            wake::wake_all(&ch.wake_word);
+        }
     }
 
     /// Store `val` to the channel header's `write_position` through
@@ -1487,6 +1541,8 @@ impl Writer {
         // If this fails, OLD's Roll is still committed=0, no reader
         // observes anything; cleanup unlinks the orphan partial on
         // the next `WriterBuilder::build` or via `cleanup_channel_files`.
+        // NEW carries this writer's wake flag from the moment readers can find it.
+        set_wake_flag(&new_channel_region, self.wake);
         std::fs::rename(&new_partial_path, &new_final_path)?;
 
         // Release-commit the Roll marker through the already-held
@@ -1495,6 +1551,12 @@ impl Writer {
 
         // Advance OLD's `wp` past the Roll slot. Infallible.
         self.fetch_add_wp_local(HEADER_SLOT as u64);
+
+        // Readers asleep on OLD's word must wake to follow the Roll: from here on this
+        // writer bumps NEW's word only. `self` is still on OLD.
+        if self.wake {
+            wake::wake_all(&self.channel_header().wake_word);
+        }
 
         // The OLD Roll mapping is no longer needed; let it drop
         // before we overwrite `self` fields so there's no aliasing
@@ -4366,8 +4428,9 @@ mod tests {
             mtu,
             None,
             [0; CHANNEL_NAME_MAX],
-            0, // base_record_index: genesis
-            0, // generation: unset
+            0,     // base_record_index: genesis
+            0,     // generation: unset
+            false, // wake_readers
         )?;
 
         let msg1: Vec<u8> = (0..100).map(|i| i as u8).collect();
@@ -4431,8 +4494,9 @@ mod tests {
             0,
             None,
             [0; CHANNEL_NAME_MAX],
-            0, // base_record_index: genesis
-            0, // generation: unset
+            0,     // base_record_index: genesis
+            0,     // generation: unset
+            false, // wake_readers
         )?;
 
         let payload0 = vec![0x10; 16];
@@ -4484,7 +4548,8 @@ mod tests {
             None,
             [0; CHANNEL_NAME_MAX],
             0,
-            0, // generation: unset
+            0,     // generation: unset
+            false, // wake_readers
         )?;
 
         // Choose len so that after header + payload the aligned end is region - header_size.
@@ -4535,8 +4600,9 @@ mod tests {
             0,
             None,
             [0; CHANNEL_NAME_MAX],
-            0, // base_record_index: genesis
-            0, // generation: unset
+            0,     // base_record_index: genesis
+            0,     // generation: unset
+            false, // wake_readers
         )?;
 
         let payload1 = vec![0xA1; 32];
@@ -4585,8 +4651,9 @@ mod tests {
             0,
             None,
             [0; CHANNEL_NAME_MAX],
-            0, // base_record_index: genesis
-            0, // generation: unset
+            0,     // base_record_index: genesis
+            0,     // generation: unset
+            false, // wake_readers
         )?;
 
         let start = align_up(MESSAGE_HEADER_SIZE + CHANNEL_HEADER_SIZE);
@@ -4638,8 +4705,9 @@ mod tests {
             0,
             None,
             [0; CHANNEL_NAME_MAX],
-            0, // base_record_index: genesis
-            0, // generation: unset
+            0,     // base_record_index: genesis
+            0,     // generation: unset
+            false, // wake_readers
         )?;
 
         let payload1 = vec![0x3A; 64];
@@ -4687,8 +4755,9 @@ mod tests {
             0,
             None,
             [0; CHANNEL_NAME_MAX],
-            0, // base_record_index: genesis
-            0, // generation: unset
+            0,     // base_record_index: genesis
+            0,     // generation: unset
+            false, // wake_readers
         )?;
 
         let mut reader = Reader::open(base, ReaderMode::Live)?;
@@ -4714,8 +4783,9 @@ mod tests {
             0,
             None,
             [0; CHANNEL_NAME_MAX],
-            0, // base_record_index: genesis
-            0, // generation: unset
+            0,     // base_record_index: genesis
+            0,     // generation: unset
+            false, // wake_readers
         )?;
 
         let mut reader = Reader::open(base, ReaderMode::LateJoin)?;
@@ -6608,7 +6678,13 @@ mod tests {
         }
         assert!(r.try_read()?.is_none(), "stuck on the staged Roll");
 
+        let word_before = wake_word_on_disk(base, 0)?;
         let _w = WriterBuilder::new(base).build()?;
+        assert_eq!(
+            wake_word_on_disk(base, 0)?,
+            word_before + 1,
+            "the repair wakes readers asleep on the old segment"
+        );
         assert_eq!(
             r.try_read()?.expect("roll followed").header().user_meta_u64,
             3
@@ -6918,6 +6994,64 @@ mod tests {
             "base refreshed across batch rolls"
         );
 
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    // ---------- waking readers ----------
+
+    /// File offsets of `wake_flags` and `wake_word` in a segment.
+    const WAKE_FLAGS_AT: u64 = MESSAGE_HEADER_SIZE as u64 + 97;
+    const WAKE_WORD_AT: u64 = MESSAGE_HEADER_SIZE as u64 + 100;
+
+    fn wake_flag_on_disk(base: &str, seq: u64) -> anyhow::Result<u8> {
+        let bytes = std::fs::read(make_channel_file_path(Path::new(base), seq)?)?;
+        Ok(bytes[WAKE_FLAGS_AT as usize])
+    }
+
+    fn wake_word_on_disk(base: &str, seq: u64) -> anyhow::Result<u32> {
+        Ok(peek_u64_on_disk(base, seq, WAKE_WORD_AT)? as u32)
+    }
+
+    /// The flag follows the writer's setting in every segment it creates or reopens, and a
+    /// writer that does not wake never touches the word.
+    #[test]
+    fn wake_flag_follows_the_writers_setting() -> anyhow::Result<()> {
+        let base = "test_wake_flag_follows_writer";
+        cleanup_channel_files(base);
+        {
+            let mut w = WriterBuilder::new(base).build()?;
+            write_indexed(&mut w, 0..5)?;
+        }
+        assert_eq!(wake_flag_on_disk(base, 0)?, 0);
+        assert_eq!(
+            wake_word_on_disk(base, 0)?,
+            0,
+            "a writer that does not wake leaves it"
+        );
+        {
+            let mut w = WriterBuilder::new(base).wake_readers(true).build()?;
+            assert_eq!(
+                wake_flag_on_disk(base, 0)?,
+                1,
+                "a waking writer stamps a reopened segment"
+            );
+            write_indexed(&mut w, 5..8)?;
+            assert_eq!(wake_word_on_disk(base, 0)?, 3, "bumped once per commit");
+            w.roll_file()?;
+            assert_eq!(wake_word_on_disk(base, 0)?, 4, "and once more for the Roll");
+            assert_eq!(
+                wake_flag_on_disk(base, 1)?,
+                1,
+                "new segments carry the flag"
+            );
+        }
+        let _w = WriterBuilder::new(base).build()?;
+        assert_eq!(
+            wake_flag_on_disk(base, 1)?,
+            0,
+            "a writer that does not wake clears it"
+        );
         cleanup_channel_files(base);
         Ok(())
     }

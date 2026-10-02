@@ -156,7 +156,8 @@ pub(crate) struct ChannelHeader {
     /// field can never drift apart — widening one widens the other, and the
     /// `size_of::<ChannelHeader>() == 128` assertion below catches an overrun.
     pub channel_name: [u8; crate::CHANNEL_NAME_MAX], // 49..97
-    /// Wake flags (additive, zero-default, so no format bump). Bit 0: the writer of this segment bumps `wake_word` and
+    /// Wake flags (additive, zero-default, so no format bump). Bit 0
+    /// ([`WAKE_FLAG_WAKES`]): the writer of this segment bumps `wake_word` and
     /// futex-wakes readers after every commit, so readers may sleep on the word
     /// instead of polling. Set when a waking writer creates or reopens the segment,
     /// cleared when a non-waking one reopens it.
@@ -190,6 +191,9 @@ pub(crate) struct ChannelHeader {
     /// stays put no matter what else is added or widened.
     pub generation: u64, // 120..128
 }
+
+/// `ChannelHeader::wake_flags` bit 0: this segment's writer wakes readers.
+pub(crate) const WAKE_FLAG_WAKES: u8 = 1;
 
 const _: () = {
     assert!(size_of::<MessageHeader>() == 16);
