@@ -1,5 +1,5 @@
 use std::io::{self, ErrorKind};
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 /// Header written before every record.
 ///
@@ -156,10 +156,21 @@ pub(crate) struct ChannelHeader {
     /// field can never drift apart — widening one widens the other, and the
     /// `size_of::<ChannelHeader>() == 128` assertion below catches an overrun.
     pub channel_name: [u8; crate::CHANNEL_NAME_MAX], // 49..97
+    /// Wake flags (additive, zero-default, so no format bump). Bit 0: the writer of this segment bumps `wake_word` and
+    /// futex-wakes readers after every commit, so readers may sleep on the word
+    /// instead of polling. Set when a waking writer creates or reopens the segment,
+    /// cleared when a non-waking one reopens it.
+    pub wake_flags: u8, // 97
+    /// Zero-filled padding to the 4-aligned `wake_word`.
+    pub _reserved_pad: [u8; 2], // 98..100
+    /// Bumped by a waking writer after every commit, and after committing the
+    /// segment's `Roll`; readers `futex_wait` on it. Written only by the writer.
+    /// Zero and untouched in a segment whose writer does not wake.
+    pub wake_word: AtomicU32, // 100..104
     /// Reserved for future additive fields. Zero-filled; must be ignored on read.
     /// Additive, optional, zero-default fields may consume this without a
     /// `format_version` bump; anything that changes existing semantics must bump.
-    pub _reserved2: [u8; 23], // 97..120
+    pub _reserved2: [u8; 16], // 104..120
     /// Opaque **incarnation id** for this channel, chosen by whoever created it
     /// (`WriterBuilder::generation`, default 0) and stamped into every segment of
     /// the channel — immutable for its life, carried across rolls, and preserved
@@ -183,6 +194,9 @@ pub(crate) struct ChannelHeader {
 const _: () = {
     assert!(size_of::<MessageHeader>() == 16);
     assert!(size_of::<ChannelHeader>() == 128);
+    assert!(std::mem::offset_of!(ChannelHeader, wake_flags) == 97);
+    assert!(std::mem::offset_of!(ChannelHeader, wake_word) == 100);
+    assert!(std::mem::offset_of!(ChannelHeader, generation) == 120);
     assert!(align_of::<MessageHeader>() == 8);
     assert!(align_of::<ChannelHeader>() == 8);
 };

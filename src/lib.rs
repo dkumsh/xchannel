@@ -33,7 +33,7 @@ use std::mem::{align_of, size_of};
 use std::path::{Path, PathBuf};
 use std::slice;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -892,7 +892,10 @@ impl Writer {
             (*ch_ptr).user_header_kind = USER_HEADER_KIND_DEFAULT;
             (*ch_ptr).user_header_size = USER_HEADER_SIZE;
             (*ch_ptr).channel_name = *channel_name;
-            (*ch_ptr)._reserved2 = [0; 23];
+            (*ch_ptr).wake_flags = 0; // stamped by the writer that opens the segment
+            (*ch_ptr)._reserved_pad = [0; 2];
+            (*ch_ptr).wake_word = AtomicU32::new(0);
+            (*ch_ptr)._reserved2 = [0; 16];
             (*ch_ptr).generation = generation;
         }
 
