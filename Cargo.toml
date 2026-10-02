@@ -24,7 +24,7 @@ path = "src/lib.rs"
 
 [dependencies]
 memmap2 = "0.9.5"
-libc = "0.2.170"
+libc = "0.2.183"
 
 [dev-dependencies]
 anyhow = "1.0.96"

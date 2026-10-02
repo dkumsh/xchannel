@@ -416,7 +416,7 @@ impl WriterBuilder {
     ///
     /// After every commit, and after committing a segment's `Roll`, the writer bumps the
     /// segment's wake word and `futex_wake`s anyone sleeping on it.
-    /// [`Reader::wait_for_message`] and [`Reader::read_blocking`] then sleep on
+    /// [`Reader::wait_for_message`], [`Reader::read_blocking`] and [`wait_any`] then sleep on
     /// that word and wake within microseconds of a commit, instead of on a backoff timer that
     /// grows to 10 ms. Readers stay read-only; nothing about them is in shared memory.
     ///
@@ -2016,6 +2016,13 @@ pub struct Reader {
     // Refcounted so an `OwnedMessage` can keep its region mapped after the
     // Reader has pruned it, rolled past it, or been dropped entirely.
     maps: Vec<Arc<MappedRegion>>, // last entry is current; older entries kept for batch segments
+    /// Page 0 of the segment being read, for its wake flag and wake word wherever the cursor
+    /// is. Replaced at every roll.
+    header: RegionMapping<ReadOnly>,
+    /// This segment's wake flag proved wrong: a capped sleep ran out with a record waiting,
+    /// so nobody is waking us (an older writer reopened the channel). Back off instead for
+    /// the rest of the segment. Reset at every roll.
+    wake_untrusted: bool,
 }
 
 /// Where in a segment a new Reader starts.
@@ -2393,7 +2400,6 @@ impl Reader {
         let base_record_index = ch.base_record_index;
         let mtu = ch.mtu;
         let generation = ch.generation;
-        drop(page0);
 
         let region_index = (read_pos / region_size) as u64;
         let current_region =
@@ -2420,6 +2426,8 @@ impl Reader {
             batch_segs: Vec::with_capacity(DEFAULT_BATCH_SEGS_CAP),
             batch_pos: Vec::with_capacity(DEFAULT_BATCH_POS_CAP),
             maps,
+            header: page0,
+            wake_untrusted: false,
         })
     }
 
@@ -2687,6 +2695,8 @@ impl Reader {
         self.file_sequence = end.file_sequence;
         if let Some(rolled) = end.rolled {
             self.file = rolled.file;
+            self.header = rolled.header;
+            self.wake_untrusted = false;
             self.channel_name_cached = rolled.channel_name;
             self.base_record_index_cached = rolled.base_record_index;
         }
@@ -2807,6 +2817,7 @@ impl Reader {
                         }));
                         rolled = Some(BatchRoll {
                             file: next.file,
+                            header: next.header,
                             channel_name: next.channel_name,
                             base_record_index: next.base_record_index,
                         });
@@ -3096,46 +3107,80 @@ impl Reader {
     /// Roll / Channel service records encountered while polling are
     /// transparently consumed; only User records gate the return.
     ///
-    /// Uses adaptive sleep-based backoff (1 µs → 2 → 4 → ... up to 10 ms
-    /// cap). At high publish rates the loop catches the next message in
-    /// the spinning regime; when the channel is idle the thread sleeps
-    /// and worst-case wake-up latency is bounded by the cap.
+    /// **On a channel whose writer wakes readers** ([`WriterBuilder::wake_readers`],
+    /// Linux) it sleeps on the segment's wake word and runs again within microseconds of
+    /// the next commit. Each sleep is capped at 10 ms, so a writer that stops waking (an
+    /// older one reopening the channel) costs slow polling, never a hang; once a capped sleep
+    /// runs out with a record waiting, it backs off instead for the rest of that segment.
+    ///
+    /// **Otherwise** it uses adaptive sleep-based backoff (1 µs → 2 → 4 → ... up
+    /// to a 10 ms cap). At high publish rates the loop catches the next message
+    /// in the spinning regime; when the channel is idle the thread sleeps and
+    /// worst-case wake-up latency is bounded by the cap.
     ///
     /// This is a synchronous helper. **Do not call from an async runtime
-    /// task** — it uses `std::thread::sleep` and will block the executor
-    /// thread. Async callers should compose `try_read` with their
-    /// runtime's own sleep primitive, or write an equivalent polling
-    /// helper around the runtime's sleep.
+    /// task** — it blocks the calling thread. Async callers should compose
+    /// `try_read` with their runtime's own sleep primitive, or write an
+    /// equivalent polling helper around the runtime's sleep.
     ///
     /// `timeout = None` waits indefinitely.
     pub fn wait_for_message(&mut self, timeout: Option<Duration>) -> io::Result<bool> {
-        const INITIAL_BACKOFF_US: u64 = 1;
-        const MAX_BACKOFF_US: u64 = 10_000;
-
         let deadline = timeout.map(|d| Instant::now() + d);
-        let mut backoff_us: u64 = INITIAL_BACKOFF_US;
+        let mut backoff = BACKOFF_START;
 
         loop {
+            // Load the word *before* looking: a commit after the look then changes it, and
+            // the futex returns at once instead of sleeping through the record.
+            let sequence = self.file_sequence;
+            let seen = self.wake_word_if_waking();
             if self.poll_for_user_message()? {
                 return Ok(true);
             }
-            if let Some(d) = deadline
-                && Instant::now() >= d
-            {
+            let Some(left) = time_left(deadline) else {
                 return Ok(false);
-            }
-            let mut sleep_us = backoff_us;
-            if let Some(d) = deadline {
-                let remaining = d.saturating_duration_since(Instant::now());
-                let remaining_us = remaining.as_micros().min(u64::MAX as u128) as u64;
-                if remaining_us == 0 {
-                    return Ok(false);
+            };
+            match seen {
+                // The look followed a roll: the word belongs to the old segment. Look again.
+                Some(_) if self.file_sequence != sequence => {}
+                Some(value) => {
+                    let nap = left.min(WAKE_SLEEP_CAP);
+                    match wake::wait(self.wake_word(), value, nap)? {
+                        wake::Waited::Changed => {}
+                        wake::Waited::TimedOut => {
+                            if nap == WAKE_SLEEP_CAP && self.poll_for_user_message()? {
+                                // A full capped sleep with nobody waking us, yet a record is
+                                // there: this segment's flag is wrong.
+                                self.wake_untrusted = true;
+                                return Ok(true);
+                            }
+                        }
+                        wake::Waited::Unsupported => self.wake_untrusted = true,
+                    }
                 }
-                sleep_us = sleep_us.min(remaining_us);
+                None => {
+                    thread::sleep(backoff.min(left));
+                    backoff = (backoff * 2).min(BACKOFF_CAP);
+                }
             }
-            thread::sleep(Duration::from_micros(sleep_us));
-            backoff_us = (backoff_us * 2).min(MAX_BACKOFF_US);
         }
+    }
+
+    /// The current segment's wake word value, if its writer wakes readers and that is still
+    /// believed. `Acquire`, so a value observed here carries the commit bumped before it.
+    #[inline]
+    fn wake_word_if_waking(&self) -> Option<u32> {
+        if !wake::SUPPORTED || self.wake_untrusted {
+            return None;
+        }
+        let ch = get_channel_header(self.header.as_ptr());
+        let flags = unsafe { &*(std::ptr::addr_of!(ch.wake_flags) as *const AtomicU8) };
+        (flags.load(Ordering::Acquire) & WAKE_FLAG_WAKES != 0)
+            .then(|| ch.wake_word.load(Ordering::Acquire))
+    }
+
+    #[inline]
+    fn wake_word(&self) -> &AtomicU32 {
+        &get_channel_header(self.header.as_ptr()).wake_word
     }
 
     /// Non-blocking peek: advance past any Skip/Roll/Channel service
@@ -3315,6 +3360,8 @@ impl Reader {
         // segment was written by a pre-fix writer that lost a record's count in crash recovery.
         self.position = next.base_record_index;
         self.file = next.file;
+        self.header = next.header;
+        self.wake_untrusted = false;
         self.read_position = 0;
         self.maps.clear();
         self.maps.push(Arc::new(MappedRegion {
@@ -3378,10 +3425,12 @@ impl Reader {
         }
         let channel_name = ch.channel_name;
         let base_record_index = ch.base_record_index;
+        let header = RegionMapping::create_read_only(&file, 0, region::page_size())?;
         Ok(Successor {
             sequence: next_sequence,
             file,
             region0,
+            header,
             channel_name,
             base_record_index,
         })
@@ -3399,6 +3448,7 @@ struct BatchEnd {
 
 struct BatchRoll {
     file: File,
+    header: RegionMapping<ReadOnly>,
     channel_name: [u8; CHANNEL_NAME_MAX],
     base_record_index: u64,
 }
@@ -3408,8 +3458,108 @@ struct Successor {
     sequence: u64,
     file: File,
     region0: RegionMapping<ReadOnly>,
+    /// Page 0, kept for the wake flag and word.
+    header: RegionMapping<ReadOnly>,
     channel_name: [u8; CHANNEL_NAME_MAX],
     base_record_index: u64,
+}
+
+/// Where `wait_for_message`'s backoff starts, and where it and every futex sleep stop growing.
+const BACKOFF_START: Duration = Duration::from_micros(1);
+const BACKOFF_CAP: Duration = Duration::from_millis(10);
+/// Longest single sleep on a wake word: a writer that stops waking costs at most this per
+/// wait, never a hang.
+const WAKE_SLEEP_CAP: Duration = BACKOFF_CAP;
+
+/// Time until `deadline`: `None` once it has passed, effectively forever without one.
+fn time_left(deadline: Option<Instant>) -> Option<Duration> {
+    match deadline {
+        None => Some(Duration::MAX),
+        Some(d) => {
+            let left = d.saturating_duration_since(Instant::now());
+            (!left.is_zero()).then_some(left)
+        }
+    }
+}
+
+/// Block until any of `readers` has a user message at its cursor, and return its index; or
+/// return `Ok(None)` once the optional `timeout` has passed. `timeout = None` waits
+/// indefinitely.
+///
+/// Like [`Reader::wait_for_message`] over several channels at once: on `Ok(Some(i))`, the next
+/// `readers[i].try_read()` returns a record. Service records are consumed on the way, as there.
+///
+/// Readers whose writers wake them ([`WriterBuilder::wake_readers`]) are slept on together,
+/// with one `futex_waitv` over all their wake words (Linux 5.16+, and kernels that backport
+/// it, such as RHEL 9). The rest are polled with the same backoff `wait_for_message` uses, and
+/// when the group is mixed the sleeps are kept that short. On a kernel without `futex_waitv`,
+/// or more than 128 waking readers, everything falls back to the backoff. Earlier readers in
+/// the slice win ties.
+///
+/// `readers` must not be empty.
+pub fn wait_any(
+    readers: &mut [&mut Reader],
+    timeout: Option<Duration>,
+) -> io::Result<Option<usize>> {
+    if readers.is_empty() {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "wait_any needs at least one reader",
+        ));
+    }
+    let deadline = timeout.map(|d| Instant::now() + d);
+    let mut backoff = BACKOFF_START;
+    let mut seen: Vec<(u64, Option<u32>)> = Vec::with_capacity(readers.len());
+    loop {
+        seen.clear();
+        seen.extend(
+            readers
+                .iter()
+                .map(|r| (r.file_sequence, r.wake_word_if_waking())),
+        );
+        for (i, reader) in readers.iter_mut().enumerate() {
+            if reader.poll_for_user_message()? {
+                return Ok(Some(i));
+            }
+        }
+        let Some(left) = time_left(deadline) else {
+            return Ok(None);
+        };
+        // A reader that followed a roll while looking has a stale word; leave it out this
+        // round, which makes the group count as mixed and keeps the sleep short.
+        let words: Vec<(&AtomicU32, u32)> = readers
+            .iter()
+            .zip(&seen)
+            .filter(|(r, (sequence, _))| r.file_sequence == *sequence)
+            .filter_map(|(r, (_, value))| value.map(|v| (r.wake_word(), v)))
+            .collect();
+        let all_wake = words.len() == readers.len();
+        let nap = left.min(if all_wake { WAKE_SLEEP_CAP } else { backoff });
+        let waited = if words.is_empty() || words.len() > wake::WAITV_MAX {
+            wake::Waited::Unsupported
+        } else {
+            wake::wait_any(&words, nap)?
+        };
+        drop(words);
+        match waited {
+            wake::Waited::Changed => {}
+            wake::Waited::TimedOut if all_wake && nap == WAKE_SLEEP_CAP => {
+                // A full capped sleep with nobody waking us: any reader that now has a record
+                // has a writer that does not wake, whatever its flag says.
+                for (i, reader) in readers.iter_mut().enumerate() {
+                    if reader.poll_for_user_message()? {
+                        reader.wake_untrusted = true;
+                        return Ok(Some(i));
+                    }
+                }
+            }
+            wake::Waited::TimedOut => backoff = (backoff * 2).min(BACKOFF_CAP),
+            wake::Waited::Unsupported => {
+                thread::sleep(nap);
+                backoff = (backoff * 2).min(BACKOFF_CAP);
+            }
+        }
+    }
 }
 
 fn now_ns() -> u64 {
@@ -7053,6 +7203,176 @@ mod tests {
             "a writer that does not wake clears it"
         );
         cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// Latency from each commit (stamped into the record) to the reader having it, for a
+    /// reader that waits with `wait_for_message` while the writer pauses `gap` between commits.
+    fn wait_latencies(
+        base: &str,
+        wake: bool,
+        rounds: u64,
+        gap: Duration,
+    ) -> anyhow::Result<Vec<u64>> {
+        cleanup_channel_files(base);
+        WriterBuilder::new(base).wake_readers(wake).precreate()?;
+        let mut r = ReaderBuilder::new(base).build()?;
+        let writer_base = base.to_string();
+        let writer = thread::spawn(move || -> anyhow::Result<()> {
+            let mut w = WriterBuilder::new(&writer_base)
+                .wake_readers(wake)
+                .build()?;
+            for i in 0..rounds {
+                thread::sleep(gap);
+                w.try_reserve(8)?.copy_from_slice(&now_ns().to_le_bytes());
+                w.commit(0, 8, i)?;
+            }
+            Ok(())
+        });
+        let mut latencies = Vec::new();
+        for _ in 0..rounds {
+            assert!(
+                r.wait_for_message(Some(Duration::from_secs(10)))?,
+                "a record arrives"
+            );
+            let received = now_ns();
+            let m = r.try_read()?.expect("wait_for_message promised a record");
+            let sent = u64::from_le_bytes(m.payload().try_into()?);
+            latencies.push(received.saturating_sub(sent));
+        }
+        writer.join().expect("writer thread")?;
+        cleanup_channel_files(base);
+        latencies.sort_unstable();
+        Ok(latencies)
+    }
+
+    /// A reader asleep in `wait_for_message` on a waking channel runs again soon after the
+    /// commit. With 30 ms between commits a backed-off reader sleeps in 10 ms steps, so its
+    /// latency spreads over 0–10 ms; a woken one is far below 2 ms even on an untuned machine.
+    #[test]
+    fn woken_reader_runs_soon_after_the_commit() -> anyhow::Result<()> {
+        if !wake::SUPPORTED {
+            return Ok(());
+        }
+        let lat = wait_latencies(
+            "test_woken_reader_latency",
+            true,
+            20,
+            Duration::from_millis(30),
+        )?;
+        let median = lat[lat.len() / 2];
+        assert!(
+            median < 2_000_000,
+            "median wake latency {median} ns; all: {lat:?}"
+        );
+        Ok(())
+    }
+
+    /// The wake on the old segment's word after a `Roll` gets a sleeping reader across the roll.
+    #[test]
+    fn wake_reaches_a_reader_across_a_roll() -> anyhow::Result<()> {
+        if !wake::SUPPORTED {
+            return Ok(());
+        }
+        let base = "test_wake_across_roll";
+        cleanup_channel_files(base);
+        WriterBuilder::new(base).wake_readers(true).precreate()?;
+        let mut r = ReaderBuilder::new(base).build()?;
+        let writer_base = base.to_string();
+        let writer = thread::spawn(move || -> anyhow::Result<()> {
+            let mut w = WriterBuilder::new(&writer_base)
+                .wake_readers(true)
+                .build()?;
+            thread::sleep(Duration::from_millis(30));
+            w.roll_file()?;
+            thread::sleep(Duration::from_millis(30));
+            Ok(write_indexed(&mut w, 0..1)?)
+        });
+        let started = Instant::now();
+        assert!(r.wait_for_message(Some(Duration::from_secs(10)))?);
+        assert_eq!(r.try_read()?.expect("record").header().user_meta_u64, 0);
+        assert_eq!(r.file_sequence(), 1, "followed the roll");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        writer.join().expect("writer thread")?;
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// A segment flagged as waking whose writer does not wake (an older writer reopened it)
+    /// costs at most a capped sleep, after which the reader backs off for that segment.
+    #[test]
+    fn stale_wake_flag_falls_back_to_backoff() -> anyhow::Result<()> {
+        if !wake::SUPPORTED {
+            return Ok(());
+        }
+        let base = "test_stale_wake_flag";
+        cleanup_channel_files(base);
+        WriterBuilder::new(base).precreate()?;
+        poke_on_disk(base, 0, WAKE_FLAGS_AT, &[1])?; // flagged, but nobody will wake
+        let mut r = ReaderBuilder::new(base).build()?;
+        let writer_base = base.to_string();
+        let writer = thread::spawn(move || -> anyhow::Result<()> {
+            let mut w = WriterBuilder::new(&writer_base).build()?;
+            // Reopening clears the flag; set it again behind the writer's back.
+            poke_on_disk(&writer_base, 0, WAKE_FLAGS_AT, &[1])?;
+            thread::sleep(Duration::from_millis(30));
+            Ok(write_indexed(&mut w, 0..1)?)
+        });
+        assert!(r.wait_for_message(Some(Duration::from_secs(10)))?);
+        assert!(
+            r.wake_untrusted,
+            "the flag is no longer believed for this segment"
+        );
+        assert!(r.wake_word_if_waking().is_none());
+        writer.join().expect("writer thread")?;
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// `wait_any` returns the reader that has something: at once when one already does, after a
+    /// wake when the record comes later, by polling when that channel does not wake, and `None`
+    /// once the timeout passes.
+    #[test]
+    fn wait_any_returns_the_ready_reader() -> anyhow::Result<()> {
+        let (a, b, c) = ("test_wait_any_a", "test_wait_any_b", "test_wait_any_c");
+        for (base, wake) in [(a, true), (b, true), (c, false)] {
+            cleanup_channel_files(base);
+            WriterBuilder::new(base).wake_readers(wake).precreate()?;
+        }
+        let mut ra = ReaderBuilder::new(a).build()?;
+        let mut rb = ReaderBuilder::new(b).build()?;
+        let mut rc = ReaderBuilder::new(c).build()?;
+
+        let none = wait_any(&mut [&mut ra, &mut rb], Some(Duration::from_millis(30)))?;
+        assert_eq!(none, None, "nothing written: times out");
+
+        for (target, wake) in [(b, true), (c, false)] {
+            let target = target.to_string();
+            let writer = thread::spawn(move || -> anyhow::Result<()> {
+                let mut w = WriterBuilder::new(&target).wake_readers(wake).build()?;
+                thread::sleep(Duration::from_millis(30));
+                Ok(write_indexed(&mut w, 0..1)?)
+            });
+            let ready = if wake {
+                wait_any(&mut [&mut ra, &mut rb], Some(Duration::from_secs(10)))?
+            } else {
+                wait_any(&mut [&mut ra, &mut rc], Some(Duration::from_secs(10)))?
+            };
+            assert_eq!(ready, Some(1), "the reader whose channel was written");
+            writer.join().expect("writer thread")?;
+        }
+        // Already there: returned without sleeping.
+        assert_eq!(
+            wait_any(&mut [&mut rb, &mut ra], Some(Duration::ZERO))?,
+            Some(0)
+        );
+        assert_eq!(rb.try_read()?.expect("record").header().user_meta_u64, 0);
+
+        let err = wait_any(&mut [], None).expect_err("empty");
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        for base in [a, b, c] {
+            cleanup_channel_files(base);
+        }
         Ok(())
     }
 }
