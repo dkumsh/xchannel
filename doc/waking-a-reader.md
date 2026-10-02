@@ -9,8 +9,8 @@ below are measured with `examples/futex-wake.rs`, on a laptop and on a latency-t
 A reader that has caught up should learn of the next commit in about ten microseconds, without
 polling, and a channel that does not ask for this should pay nothing.
 
-`wait_for_message` sleeps well — 1 µs doubling to a 10 ms cap — but it wakes on a timer, not on the
-commit. Ten microseconds by looking is a hundred thousand looks a second, per channel, per reader.
+`wait_for_message` sleeps with backoff (1 µs doubling to a 10 ms cap before 6.2; 50 µs to 500 µs
+since), but it wakes on a timer, not on the commit. Ten microseconds by looking is a hundred thousand looks a second, per channel, per reader.
 
 ## The constraint: readers cannot write
 
@@ -132,10 +132,11 @@ state, so its commit path stays byte-identical to today's.
 ## Rules the reader needs
 
 - **Trust the flag, not the version.** A segment without `wake_flags` bit 0 gets today's backoff.
-- **Always cap the sleep**, at today's 10 ms backoff cap.
+- **Always cap the sleep**, at 10 ms. A woken reader runs at once, so the cap adds no latency; it
+  only bounds what a missing wake costs.
 - **Detect a wrong flag.** An older writer reopening a channel leaves the flag set with nobody
-  waking. Capped sleeps alone would then cost up to 10 ms on every wait, worse than today's backoff,
-  which restarts at 1 µs on each wait. So if a capped sleep times out and a record turns out to be
+  waking. Capped sleeps alone would then cost up to 10 ms on every wait, far worse than the
+  backoff, which restarts at 50 µs on each wait and never sleeps longer than 500 µs. So if a capped sleep times out and a record turns out to be
   waiting, treat the flag as wrong and use the backoff for the rest of that segment. The exposure
   is one segment: the next one an older writer creates has the flag clear.
 

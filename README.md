@@ -417,8 +417,9 @@ they shape what the library is and isn't suited for.
 
 - **Kernel wake-up is opt-in, per channel, and Linux only.** `try_read`
   is strictly non-blocking. By default `Reader::wait_for_message` /
-  `read_blocking` sleep with backoff (1 µs → 10 ms cap, no syscall on the
-  writer side). A writer built with `WriterBuilder::wake_readers(true)`
+  `read_blocking` sleep with backoff (50 µs → 500 µs cap, no syscall on the
+  writer side), so the first record after a quiet spell can wait up to
+  about half a millisecond. A writer built with `WriterBuilder::wake_readers(true)`
   wakes them through a futex instead (see [Waking readers](#waking-readers)),
   at the cost of a syscall on every commit. There is no file descriptor to
   hand to `epoll`/`select`. Async runtimes should compose `try_read` with
@@ -1049,7 +1050,7 @@ writer wakes readers through a futex instead of leaving them to poll
 
 A reader that has caught up waits with `wait_for_message` (one channel) or
 `xchannel::wait_any` (several). By default that is a backoff sleep that
-grows to 10 ms. If the writer opts in, readers sleep on a futex in the
+grows to 500 µs. If the writer opts in, readers sleep on a futex in the
 segment header instead and run again within microseconds of the next
 commit:
 

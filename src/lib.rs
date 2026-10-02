@@ -418,7 +418,7 @@ impl WriterBuilder {
     /// segment's wake word and `futex_wake`s anyone sleeping on it.
     /// [`Reader::wait_for_message`], [`Reader::read_blocking`] and [`wait_any`] then sleep on
     /// that word and wake within microseconds of a commit, instead of on a backoff timer that
-    /// grows to 10 ms. Readers stay read-only; nothing about them is in shared memory.
+    /// grows to 500 µs. Readers stay read-only; nothing about them is in shared memory.
     ///
     /// The cost is one futex syscall on **every** commit, whether or not anyone is waiting:
     /// measured at about 165 ns on a recent laptop CPU and 730 ns on an older,
@@ -2028,6 +2028,10 @@ pub struct Reader {
     /// waking writer preempted between publishing a record and bumping the word looks the
     /// same once. Reset at every roll.
     wake_miss: Option<u32>,
+    /// Futex waits that ended because the word changed: proof in tests that the reader was
+    /// woken rather than backed off.
+    #[cfg(test)]
+    woken: u32,
 }
 
 /// Where in a segment a new Reader starts.
@@ -2434,6 +2438,8 @@ impl Reader {
             header: page0,
             wake_untrusted: false,
             wake_miss: None,
+            #[cfg(test)]
+            woken: 0,
         })
     }
 
@@ -3121,10 +3127,12 @@ impl Reader {
     /// have run out twice with a record waiting and the wake word unmoved in between, it backs
     /// off instead for the rest of that segment.
     ///
-    /// **Otherwise** it uses adaptive sleep-based backoff (1 µs → 2 → 4 → ... up
-    /// to a 10 ms cap). At high publish rates the loop catches the next message
-    /// in the spinning regime; when the channel is idle the thread sleeps and
-    /// worst-case wake-up latency is bounded by the cap.
+    /// **Otherwise** it sleeps with backoff: 50 µs, doubling to a 500 µs cap, re-checking
+    /// after each sleep. So the first record after a quiet spell waits about 250 µs on average
+    /// and at most about 550 µs (the cap plus Linux's 50 µs timer slack), and an idle reader
+    /// wakes about 2,000 times a second. There is no spinning; a reader that needs less
+    /// latency than that should spin on `try_read`, or read a channel whose writer wakes
+    /// readers.
     ///
     /// This is a synchronous helper. **Do not call from an async runtime
     /// task** — it blocks the calling thread. Async callers should compose
@@ -3153,7 +3161,12 @@ impl Reader {
                 Some(value) => {
                     let nap = left.min(WAKE_SLEEP_CAP);
                     match wake::wait(self.wake_word(), value, nap)? {
-                        wake::Waited::Changed => {}
+                        wake::Waited::Changed => {
+                            #[cfg(test)]
+                            {
+                                self.woken += 1;
+                            }
+                        }
                         wake::Waited::TimedOut => {
                             if nap == WAKE_SLEEP_CAP && self.poll_for_user_message()? {
                                 // A full capped sleep ran out, yet a record is there.
@@ -3492,12 +3505,15 @@ struct Successor {
     base_record_index: u64,
 }
 
-/// Where `wait_for_message`'s backoff starts, and where it and every futex sleep stop growing.
-const BACKOFF_START: Duration = Duration::from_micros(1);
-const BACKOFF_CAP: Duration = Duration::from_millis(10);
-/// Longest single sleep on a wake word: a writer that stops waking costs at most this per
-/// wait, never a hang.
-const WAKE_SLEEP_CAP: Duration = BACKOFF_CAP;
+/// Where `wait_for_message`'s backoff starts and where it stops growing. Linux's default timer
+/// slack (50 µs) makes any shorter sleep take about that long anyway; the cap bounds the delay
+/// before an idle reader sees the next record, at about 2,000 wake-ups a second per idle reader.
+const BACKOFF_START: Duration = Duration::from_micros(50);
+const BACKOFF_CAP: Duration = Duration::from_micros(500);
+/// Longest single sleep on a wake word. A woken reader runs at once, so this adds no latency;
+/// it only bounds what a writer that stops waking (a stale flag) costs per wait: slow polling,
+/// never a hang.
+const WAKE_SLEEP_CAP: Duration = Duration::from_millis(10);
 
 /// Time until `deadline`: `None` once it has passed, effectively forever without one.
 fn time_left(deadline: Option<Instant>) -> Option<Duration> {
@@ -7254,7 +7270,7 @@ mod tests {
         wake: bool,
         rounds: u64,
         gap: Duration,
-    ) -> anyhow::Result<Vec<u64>> {
+    ) -> anyhow::Result<(Vec<u64>, u32)> {
         cleanup_channel_files(base);
         WriterBuilder::new(base).wake_readers(wake).precreate()?;
         let mut r = ReaderBuilder::new(base).build()?;
@@ -7284,23 +7300,23 @@ mod tests {
         writer.join().expect("writer thread")?;
         cleanup_channel_files(base);
         latencies.sort_unstable();
-        Ok(latencies)
+        Ok((latencies, r.woken))
     }
 
-    /// A reader asleep in `wait_for_message` on a waking channel runs again soon after the
-    /// commit. With 30 ms between commits a backed-off reader sleeps in 10 ms steps, so its
-    /// latency spreads over 0–10 ms; a woken one is far below 2 ms even on an untuned machine.
+    /// A reader asleep in `wait_for_message` on a waking channel is woken by the commit, not by
+    /// a timer: its futex waits end because the word changed, and it runs again soon after.
     #[test]
     fn woken_reader_runs_soon_after_the_commit() -> anyhow::Result<()> {
         if !wake::SUPPORTED {
             return Ok(());
         }
-        let lat = wait_latencies(
+        let (lat, woken) = wait_latencies(
             "test_woken_reader_latency",
             true,
             20,
             Duration::from_millis(30),
         )?;
+        assert!(woken >= 10, "only {woken} of 20 waits ended in a wake");
         let median = lat[lat.len() / 2];
         assert!(
             median < 2_000_000,
@@ -7425,8 +7441,8 @@ mod tests {
     }
 
     /// Without `futex_waitv` (a kernel before 5.16, or a seccomp profile that forbids it),
-    /// `wait_any` over waking channels backs off from 1 µs like any other wait. It used to
-    /// sleep a flat 10 ms per round, so a record arriving 2 ms in waited about 8 ms more.
+    /// `wait_any` over waking channels backs off like any other wait. It used to sleep a flat
+    /// 10 ms per round, so a record arriving 2 ms in waited about 8 ms more.
     #[cfg(target_os = "linux")]
     #[test]
     fn wait_any_without_futex_waitv_backs_off() -> anyhow::Result<()> {

@@ -25,6 +25,12 @@
   long a sleeping reader takes to run again. The numbers above come from it.
 
 ### Changed
+- **The backoff of `wait_for_message`, `read_blocking` and `wait_any` is now 50 µs doubling to
+  500 µs** (was 1 µs doubling to 10 ms). The first record after a quiet spell now waits about
+  250 µs on average and at most about 550 µs, instead of 5 ms and 10 ms. An idle reader wakes
+  about 2,000 times a second instead of 100, around 0.5–1% of a core. The old start was nominal:
+  Linux's default 50 µs timer slack made every sleep under 50 µs take about 56 µs. The 10 ms cap
+  on futex sleeps is unchanged; a woken reader does not wait for it.
 - **`wait_for_message` / `read_blocking` sleep on the futex** when the segment's writer wakes
   readers, and keep the backoff otherwise. Each sleep is capped at 10 ms, so a stale flag (an
   older writer reopening the channel, which does not wake) costs slow polling, never a hang; once
