@@ -2019,10 +2019,15 @@ pub struct Reader {
     /// Page 0 of the segment being read, for its wake flag and wake word wherever the cursor
     /// is. Replaced at every roll.
     header: RegionMapping<ReadOnly>,
-    /// This segment's wake flag proved wrong: a capped sleep ran out with a record waiting,
-    /// so nobody is waking us (an older writer reopened the channel). Back off instead for
-    /// the rest of the segment. Reset at every roll.
+    /// This segment's wake flag proved wrong: twice a capped sleep ran out with a record
+    /// waiting and the word unmoved in between, so nobody is waking us (an older writer
+    /// reopened the channel). Back off instead for the rest of the segment. Reset at every roll.
     wake_untrusted: bool,
+    /// The word's value at the last capped sleep that ran out with a record waiting, while it
+    /// still held the value slept on. One such miss is not enough to distrust the flag: a
+    /// waking writer preempted between publishing a record and bumping the word looks the
+    /// same once. Reset at every roll.
+    wake_miss: Option<u32>,
 }
 
 /// Where in a segment a new Reader starts.
@@ -2428,6 +2433,7 @@ impl Reader {
             maps,
             header: page0,
             wake_untrusted: false,
+            wake_miss: None,
         })
     }
 
@@ -2697,6 +2703,7 @@ impl Reader {
             self.file = rolled.file;
             self.header = rolled.header;
             self.wake_untrusted = false;
+            self.wake_miss = None;
             self.channel_name_cached = rolled.channel_name;
             self.base_record_index_cached = rolled.base_record_index;
         }
@@ -3110,8 +3117,9 @@ impl Reader {
     /// **On a channel whose writer wakes readers** ([`WriterBuilder::wake_readers`],
     /// Linux) it sleeps on the segment's wake word and runs again within microseconds of
     /// the next commit. Each sleep is capped at 10 ms, so a writer that stops waking (an
-    /// older one reopening the channel) costs slow polling, never a hang; once a capped sleep
-    /// runs out with a record waiting, it backs off instead for the rest of that segment.
+    /// older one reopening the channel) costs slow polling, never a hang; once capped sleeps
+    /// have run out twice with a record waiting and the wake word unmoved in between, it backs
+    /// off instead for the rest of that segment.
     ///
     /// **Otherwise** it uses adaptive sleep-based backoff (1 µs → 2 → 4 → ... up
     /// to a 10 ms cap). At high publish rates the loop catches the next message
@@ -3148,9 +3156,8 @@ impl Reader {
                         wake::Waited::Changed => {}
                         wake::Waited::TimedOut => {
                             if nap == WAKE_SLEEP_CAP && self.poll_for_user_message()? {
-                                // A full capped sleep with nobody waking us, yet a record is
-                                // there: this segment's flag is wrong.
-                                self.wake_untrusted = true;
+                                // A full capped sleep ran out, yet a record is there.
+                                self.distrust_flag_if_unwoken(sequence, value);
                                 return Ok(true);
                             }
                         }
@@ -3181,6 +3188,26 @@ impl Reader {
     #[inline]
     fn wake_word(&self) -> &AtomicU32 {
         &get_channel_header(self.header.as_ptr()).wake_word
+    }
+
+    /// After a full capped sleep that ran out with a record waiting: count a miss if the
+    /// reader is still on that segment and the word still holds `seen`, the value slept on,
+    /// and stop trusting the segment's wake flag at the second miss on the same value.
+    ///
+    /// A writer that does not wake never changes the word, so it misses on every record that
+    /// arrives during a sleep and is caught at the second. A waking writer publishes a record
+    /// a moment before it bumps the word, and if it is preempted in between just as a sleep
+    /// runs out, it misses once; but its bump then moves the word, so the next miss, if any,
+    /// is on a different value and the flag stays trusted.
+    fn distrust_flag_if_unwoken(&mut self, sequence: u64, seen: u32) {
+        if self.file_sequence != sequence || self.wake_word().load(Ordering::Acquire) != seen {
+            return;
+        }
+        if self.wake_miss == Some(seen) {
+            self.wake_untrusted = true;
+        } else {
+            self.wake_miss = Some(seen);
+        }
     }
 
     /// Non-blocking peek: advance past any Skip/Roll/Channel service
@@ -3362,6 +3389,7 @@ impl Reader {
         self.file = next.file;
         self.header = next.header;
         self.wake_untrusted = false;
+        self.wake_miss = None;
         self.read_position = 0;
         self.maps.clear();
         self.maps.push(Arc::new(MappedRegion {
@@ -3492,8 +3520,9 @@ fn time_left(deadline: Option<Instant>) -> Option<Duration> {
 /// Readers whose writers wake them ([`WriterBuilder::wake_readers`]) are slept on together,
 /// with one `futex_waitv` over all their wake words (Linux 5.16+, and kernels that backport
 /// it, such as RHEL 9). The rest are polled with the same backoff `wait_for_message` uses, and
-/// when the group is mixed the sleeps are kept that short. On a kernel without `futex_waitv`,
-/// or more than 128 waking readers, everything falls back to the backoff. Earlier readers in
+/// when the group is mixed the sleeps are kept that short. On a kernel without `futex_waitv`
+/// (or where a seccomp profile forbids it), or with more than 128 waking readers, everything
+/// falls back to the backoff. Earlier readers in
 /// the slice win ties.
 ///
 /// `readers` must not be empty.
@@ -3534,28 +3563,40 @@ pub fn wait_any(
             .filter_map(|(r, (_, value))| value.map(|v| (r.wake_word(), v)))
             .collect();
         let all_wake = words.len() == readers.len();
-        let nap = left.min(if all_wake { WAKE_SLEEP_CAP } else { backoff });
-        let waited = if words.is_empty() || words.len() > wake::WAITV_MAX {
-            wake::Waited::Unsupported
+        // Decide first whether the futex call is possible at all; only then may a sleep be as
+        // long as the cap. Otherwise it is the backoff step, as for any non-waking reader.
+        let can_futex =
+            !words.is_empty() && words.len() <= wake::WAITV_MAX && wake::waitv_available();
+        let nap = left.min(if all_wake && can_futex {
+            WAKE_SLEEP_CAP
         } else {
+            backoff
+        });
+        let waited = if can_futex {
             wake::wait_any(&words, nap)?
+        } else {
+            wake::Waited::Unsupported
         };
         drop(words);
         match waited {
             wake::Waited::Changed => {}
             wake::Waited::TimedOut if all_wake && nap == WAKE_SLEEP_CAP => {
-                // A full capped sleep with nobody waking us: any reader that now has a record
-                // has a writer that does not wake, whatever its flag says.
+                // A full capped sleep ran out: a reader that now has a record may have a
+                // writer that does not wake, whatever its flag says.
                 for (i, reader) in readers.iter_mut().enumerate() {
                     if reader.poll_for_user_message()? {
-                        reader.wake_untrusted = true;
+                        if let (sequence, Some(value)) = seen[i] {
+                            reader.distrust_flag_if_unwoken(sequence, value);
+                        }
                         return Ok(Some(i));
                     }
                 }
             }
             wake::Waited::TimedOut => backoff = (backoff * 2).min(BACKOFF_CAP),
             wake::Waited::Unsupported => {
-                thread::sleep(nap);
+                // Also reached when the kernel turned out to lack futex_waitv just now, before
+                // anything slept: sleep the backoff step, never a flat cap.
+                thread::sleep(left.min(backoff));
                 backoff = (backoff * 2).min(BACKOFF_CAP);
             }
         }
@@ -7299,7 +7340,8 @@ mod tests {
     }
 
     /// A segment flagged as waking whose writer does not wake (an older writer reopened it)
-    /// costs at most a capped sleep, after which the reader backs off for that segment.
+    /// costs at most a capped sleep per record, and after two such records the reader backs
+    /// off for that segment.
     #[test]
     fn stale_wake_flag_falls_back_to_backoff() -> anyhow::Result<()> {
         if !wake::SUPPORTED {
@@ -7315,9 +7357,15 @@ mod tests {
             let mut w = WriterBuilder::new(&writer_base).build()?;
             // Reopening clears the flag; set it again behind the writer's back.
             poke_on_disk(&writer_base, 0, WAKE_FLAGS_AT, &[1])?;
-            thread::sleep(Duration::from_millis(30));
-            Ok(write_indexed(&mut w, 0..1)?)
+            for i in 0..2 {
+                thread::sleep(Duration::from_millis(30));
+                write_indexed(&mut w, i..i + 1)?;
+            }
+            Ok(())
         });
+        assert!(r.wait_for_message(Some(Duration::from_secs(10)))?);
+        assert!(!r.wake_untrusted, "one miss is not enough");
+        assert!(r.try_read()?.is_some());
         assert!(r.wait_for_message(Some(Duration::from_secs(10)))?);
         assert!(
             r.wake_untrusted,
@@ -7373,6 +7421,83 @@ mod tests {
         for base in [a, b, c] {
             cleanup_channel_files(base);
         }
+        Ok(())
+    }
+
+    /// Without `futex_waitv` (a kernel before 5.16, or a seccomp profile that forbids it),
+    /// `wait_any` over waking channels backs off from 1 µs like any other wait. It used to
+    /// sleep a flat 10 ms per round, so a record arriving 2 ms in waited about 8 ms more.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn wait_any_without_futex_waitv_backs_off() -> anyhow::Result<()> {
+        wake::disable_waitv(); // process-wide: other wait_any tests then use backoff too
+        let (a, b) = ("test_wait_any_no_waitv_a", "test_wait_any_no_waitv_b");
+        for base in [a, b] {
+            cleanup_channel_files(base);
+            WriterBuilder::new(base).wake_readers(true).precreate()?;
+        }
+        let mut ra = ReaderBuilder::new(a).build()?;
+        let mut rb = ReaderBuilder::new(b).build()?;
+        let mut latencies = Vec::new();
+        for i in 0..5 {
+            let target = b.to_string();
+            let writer = thread::spawn(move || -> anyhow::Result<()> {
+                let mut w = WriterBuilder::new(&target).wake_readers(true).build()?;
+                thread::sleep(Duration::from_millis(2));
+                w.try_reserve(8)?.copy_from_slice(&now_ns().to_le_bytes());
+                w.commit(0, 8, i)?;
+                Ok(())
+            });
+            assert_eq!(
+                wait_any(&mut [&mut ra, &mut rb], Some(Duration::from_secs(5)))?,
+                Some(1)
+            );
+            let received = now_ns();
+            let sent = u64::from_le_bytes(rb.try_read()?.expect("record").payload().try_into()?);
+            latencies.push(received.saturating_sub(sent));
+            writer.join().expect("writer thread")?;
+        }
+        latencies.sort_unstable();
+        let median = latencies[latencies.len() / 2];
+        assert!(median < 5_000_000, "median {median} ns: {latencies:?}");
+        for base in [a, b] {
+            cleanup_channel_files(base);
+        }
+        Ok(())
+    }
+
+    /// A capped sleep that ran out while the writer was between publishing a record and bumping
+    /// the word must not condemn the flag, whether the bump has landed by the time the reader
+    /// checks or lands only after. Only two misses on the same value, as a writer that does not
+    /// wake leaves it, mark the flag untrusted.
+    #[test]
+    fn a_late_wake_keeps_the_flag_trusted() -> anyhow::Result<()> {
+        if !wake::SUPPORTED {
+            return Ok(());
+        }
+        let base = "test_late_wake_keeps_flag";
+        cleanup_channel_files(base);
+        WriterBuilder::new(base).wake_readers(true).precreate()?;
+        let mut r = ReaderBuilder::new(base).build()?;
+        let seen = r.wake_word_if_waking().expect("flagged");
+
+        poke_on_disk(base, 0, WAKE_WORD_AT, &(seen + 1).to_le_bytes())?; // the late bump
+        r.distrust_flag_if_unwoken(0, seen);
+        assert!(!r.wake_untrusted, "the word moved: the writer does wake");
+
+        // The writer is still preempted when the reader checks: a miss, but only one.
+        let moved = r.wake_word_if_waking().expect("still flagged");
+        r.distrust_flag_if_unwoken(0, moved);
+        assert!(!r.wake_untrusted, "a single miss keeps the flag");
+        // Its bump lands, and a later sleep misses again on the new value: still one miss.
+        poke_on_disk(base, 0, WAKE_WORD_AT, &(moved + 1).to_le_bytes())?;
+        let bumped = r.wake_word_if_waking().expect("still flagged");
+        r.distrust_flag_if_unwoken(0, bumped);
+        assert!(!r.wake_untrusted, "the word moved between the misses");
+        // A second miss on the same value: nobody is waking.
+        r.distrust_flag_if_unwoken(0, bumped);
+        assert!(r.wake_untrusted, "the word never moved: nobody is waking");
+        cleanup_channel_files(base);
         Ok(())
     }
 }

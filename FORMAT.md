@@ -278,8 +278,11 @@ A commit after step 2 changes the word after step 1, so the wait in step 3
 either returns at once or is woken. The bound matters: the flag can be stale
 (a writer that predates this field reopened the segment and does not wake),
 and a stale flag must cost slow polling, never a hang. A reader that sees a
-full bounded wait run out with a record waiting should stop trusting the
-flag for that segment.
+full bounded wait run out with a record waiting, and `wake_word` still at
+`seen`, should stop trusting the flag for that segment once this has happened
+twice with `wake_word` unmoved in between. Once is not enough: a waking writer
+preempted between publishing a record (§6 step 7) and bumping the word
+(step 8) looks the same, but its bump then moves the word.
 
 A crashed writer's stranded `Roll` (§6.2) is woken by the writer that
 finishes it, unconditionally.

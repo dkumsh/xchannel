@@ -72,12 +72,34 @@ pub(crate) fn wait(_word: &AtomicU32, _expected: u32, _timeout: Duration) -> io:
 /// Most words one `futex_waitv` call accepts.
 pub(crate) const WAITV_MAX: usize = 128;
 
+/// Set once the kernel has refused `futex_waitv` — it is too old (`ENOSYS`), or a seccomp
+/// profile that predates it forbids it (`EPERM`, as older container runtimes do) — so it is
+/// not asked again.
+#[cfg(target_os = "linux")]
+static NO_WAITV: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether `wait_any` can sleep on several words at once, as far as is known yet.
+pub(crate) fn waitv_available() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        !NO_WAITV.load(Ordering::Relaxed)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
+/// Test hook: behave as on a kernel without `futex_waitv`.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn disable_waitv() {
+    NO_WAITV.store(true, Ordering::Relaxed);
+}
+
 /// Sleep while every `word` holds its `expected` value, for at most `timeout`: one
 /// `futex_waitv` over all of them. At most [`WAITV_MAX`] words.
 #[cfg(target_os = "linux")]
 pub(crate) fn wait_any(words: &[(&AtomicU32, u32)], timeout: Duration) -> io::Result<Waited> {
-    use std::sync::atomic::AtomicBool;
-
     /// `struct futex_waitv` from `<linux/futex.h>`.
     #[repr(C)]
     struct FutexWaitv {
@@ -88,8 +110,6 @@ pub(crate) fn wait_any(words: &[(&AtomicU32, u32)], timeout: Duration) -> io::Re
     }
     /// `FUTEX2_SIZE_U32`; no `FUTEX2_PRIVATE`, as these are shared futexes.
     const FUTEX2_SIZE_U32: u32 = 0x02;
-    /// Set once the kernel has said it has no `futex_waitv`, so it is not asked again.
-    static NO_WAITV: AtomicBool = AtomicBool::new(false);
 
     debug_assert!(words.len() <= WAITV_MAX);
     if words.is_empty() || NO_WAITV.load(Ordering::Relaxed) {
@@ -133,7 +153,7 @@ pub(crate) fn wait_any(words: &[(&AtomicU32, u32)], timeout: Duration) -> io::Re
     match err.raw_os_error() {
         Some(libc::EAGAIN) | Some(libc::EINTR) => Ok(Waited::Changed),
         Some(libc::ETIMEDOUT) => Ok(Waited::TimedOut),
-        Some(libc::ENOSYS) => {
+        Some(libc::ENOSYS) | Some(libc::EPERM) => {
             NO_WAITV.store(true, Ordering::Relaxed);
             Ok(Waited::Unsupported)
         }

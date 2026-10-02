@@ -26,8 +26,9 @@
 - **`wait_for_message` / `read_blocking` sleep on the futex** when the segment's writer wakes
   readers, and keep the backoff otherwise. Each sleep is capped at 10 ms, so a stale flag (an
   older writer reopening the channel, which does not wake) costs slow polling, never a hang; once
-  a capped sleep runs out with a record waiting, the reader backs off instead for the rest of that
-  segment.
+  capped sleeps have run out twice with a record waiting and the wake word unmoved in between, the
+  reader backs off instead for the rest of that segment. A single such miss is what a waking writer
+  preempted between publishing a record and bumping the word looks like, so it is not enough.
 - **Format, additively:** `ChannelHeader` gains `wake_flags` (offset 97) and `wake_word` (offset
   100), taken from `_reserved2`, which shrinks to 16 bytes (FORMAT.md §3, §6.3). Zero-default, so
   `format_version` stays 3: older readers ignore the fields, and newer readers on older files see
