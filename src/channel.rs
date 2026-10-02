@@ -165,8 +165,9 @@ pub(crate) struct ChannelHeader {
     /// Zero-filled padding to the 4-aligned `wake_word`.
     pub _reserved_pad: [u8; 2], // 98..100
     /// Bumped by a waking writer after every commit, and after committing the
-    /// segment's `Roll`; readers `futex_wait` on it. Written only by the writer.
-    /// Zero and untouched in a segment whose writer does not wake.
+    /// segment's `Roll`; readers `futex_wait` on it. Written only by writers.
+    /// Otherwise zero and untouched, except that a writer finishing a crashed
+    /// predecessor's stranded `Roll` bumps it whatever its own setting.
     pub wake_word: AtomicU32, // 100..104
     /// Reserved for future additive fields. Zero-filled; must be ignored on read.
     /// Additive, optional, zero-default fields may consume this without a

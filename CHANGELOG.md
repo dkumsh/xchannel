@@ -18,7 +18,9 @@
 - **`wait_any(readers, timeout)`** — block until any of several readers has a record, and return
   its index. Readers whose writers wake them sleep together in one `futex_waitv` (Linux 5.16+,
   and kernels that backport it, such as RHEL 9); the rest are polled with backoff, and when the
-  group is mixed the sleeps are kept that short.
+  group is mixed the sleeps are kept that short. Without `futex_waitv` (an older kernel, or a
+  container seccomp profile that forbids it), or with more than 128 waking readers, it backs off
+  like any other wait.
 - **`examples/futex-wake.rs`** — measures what a shared-file futex wake costs the writer and how
   long a sleeping reader takes to run again. The numbers above come from it.
 
