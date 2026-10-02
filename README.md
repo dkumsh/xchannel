@@ -93,7 +93,7 @@ a non-isolated developer laptop and a fully latency-tuned box.
 ### TL;DR
 
 At a realistic 10 K msg/s publish cadence (`100 µs` gap), end-to-end
-latency on the latency-tuned host (`lse`):
+latency on the latency-tuned server:
 
 | msg size | p50 | p99 | p99.9 |
 |---:|---:|---:|---:|
@@ -101,9 +101,9 @@ latency on the latency-tuned host (`lse`):
 | **256 B** | 117 ns | 456 ns     | 655 µs |
 | **4 KiB** | 723 ns | 647 µs ¹   | 879 µs |
 
-¹ 4 KiB shows a host-specific tail on `lse` we have not fully diagnosed
-— see [Open question](#open-question-4-kib-tail-on-lse). The same
-workload on `montblanc/disk/4 KiB` runs at p99 = 17 µs.
+¹ 4 KiB shows a host-specific tail on the server we have not fully diagnosed
+— see [Open question](#open-question-4-kib-tail-on-the-server). The same
+workload on `laptop/disk/4 KiB` runs at p99 = 17 µs.
 
 Saturation runs (writer pushing as fast as possible) show much higher p99
 / p99.9 — that is **queue-depth tail**, not the channel's intrinsic
@@ -154,14 +154,14 @@ saturation rate and the column should be read as "saturation".
 
 ### Hosts
 
-- **`montblanc`** — laptop, no isolation. i9-11900H, Ubuntu 25.10,
+- **laptop** — no isolation. i9-11900H, Ubuntu 25.10,
   kernel 6.17. A normal developer machine; expect noisier tails.
-- **`lse`** — latency-tuned production-style box. Xeon Gold 6146 @ 3.2 GHz,
+- **server** — latency-tuned production-style box. Xeon Gold 6146 @ 3.2 GHz,
   RHEL 9.6, kernel 5.14. Kernel cmdline includes
   `isolcpus=1-11,13-23 nohz_full=1-11,13-23 irqaffinity=0,12 intel_idle.max_cstate=0 idle=poll`.
   Cores 3 and 4 (used by the bench) are both isolated and on NUMA node 0.
 
-### Results: `montblanc` — i9-11900H, no isolation
+### Results: laptop — i9-11900H, no isolation
 
 #### `tmpfs` (`/dev/shm`)
 
@@ -215,7 +215,7 @@ saturation rate and the column should be read as "saturation".
 | 256 B | 10.00 K/s |  55 ns | 4.6 µs |  19 µs |
 | 4 KiB | 10.00 K/s | 1.5 µs |  17 µs |  91 µs |
 
-### Results: `lse` — Xeon Gold 6146, full isolation
+### Results: server — Xeon Gold 6146, full isolation
 
 #### `tmpfs` (`/dev/shm`)
 
@@ -271,8 +271,8 @@ saturation rate and the column should be read as "saturation".
 
 Full per-host detail (p90, p95, max, samples, complete system info) is in:
 
-- [`bench/results-montblanc.md`](bench/results-montblanc.md)
-- [`bench/results-lse.md`](bench/results-lse.md)
+- [`bench/results-laptop.md`](bench/results-laptop.md)
+- [`bench/results-server.md`](bench/results-server.md)
 
 ### How to read these numbers
 
@@ -284,8 +284,8 @@ folds the payload. It is the closest single number to "intrinsic
 xchannel latency."
 
 For all configurations and all loads, p50 is sub-microsecond up to 1 KiB
-and a few microseconds at 4 KiB. Between hosts, lse's higher p50 (90 ns
-vs 60 ns for 64 B) reflects its 3.2 GHz Xeon vs montblanc's 4–5 GHz
+and a few microseconds at 4 KiB. Between hosts, the server's higher p50 (90 ns
+vs 60 ns for 64 B) reflects its 3.2 GHz Xeon vs the laptop's 4–5 GHz
 boost — slower clock, similar count of instructions per message.
 
 #### p99 / p99.9 — what the worst 1 % / 0.1 % look like
@@ -298,7 +298,7 @@ scheduling luck happens in 30 s, and the worst few percent of samples
 read back the full queue depth. p99 / p99.9 in this regime measure
 **how badly the OS interrupted the reader during the worst burst** — not
 the channel's intrinsic latency. The clearest example is
-`montblanc/disk/64 B`:
+`laptop/disk/64 B`:
 
 | gap | p99 | p99.9 |
 |---|---|---|
@@ -315,7 +315,7 @@ away: a small handful of structural events (region transitions, page
 faults on freshly grown pages, residual kernel work the isolation
 doesn't fully suppress). Most cells settle into the few-µs range.
 
-The most striking single result is `lse/tmpfs/64 B` at `100 µs` gap:
+The most striking single result is `server/tmpfs/64 B` at `100 µs` gap:
 **p99 = 344 ns, p99.9 = 448 ns.** No queue, isolated cores, no scheduling
 noise — just the channel's per-message work, measured cleanly.
 
@@ -324,14 +324,14 @@ noise — just the channel's per-message work, measured cleanly.
 There are two cases where reducing load doesn't help the tail:
 
 1. **The writer's natural rate is already below the gap ceiling.** At
-   1 µs gap on `lse/tmpfs/4 KiB` the writer hits 314 K msg/s — that
+   1 µs gap on `server/tmpfs/4 KiB` the writer hits 314 K msg/s — that
    *is* its saturation rate; the gap is a no-op. The 1 µs and `sat`
    numbers should look identical for 4 KiB, and they do. Don't read
    that as a structural floor; the writer just isn't being throttled.
-2. **There's a genuine residual structural event.** All `lse` 4 KiB
+2. **There's a genuine residual structural event.** All server 4 KiB
    cells (both tmpfs and disk, every gap) show p99 between 450 and
-   670 µs while `montblanc/disk/4 KiB` at 100 µs gap is at p99 = 17 µs.
-   That is a real lse-specific effect — see the next subsection.
+   670 µs while `laptop/disk/4 KiB` at 100 µs gap is at p99 = 17 µs.
+   That is a real server-specific effect — see the next subsection.
 
 #### Saturation is not back-pressure
 
@@ -353,12 +353,12 @@ large message sizes (visible as ~100 ms `max` values in the per-host
 files when writeback flushes a large chunk), but at the percentiles in
 the headline tables they're indistinguishable from tmpfs in shape.
 
-### Open question: 4 KiB tail on `lse`
+### Open question: 4 KiB tail on the server
 
-Every `lse` cell — both `tmpfs` and `disk`, every publish gap including
+Every server cell — both `tmpfs` and `disk`, every publish gap including
 the lightly-loaded 100 µs case — shows p99 between 450 and 670 µs for
-4 KiB messages. The same workload on `montblanc/disk/4 KiB` at 10 K msg/s
-is at p99 = 17 µs, so xchannel itself is fine. The lse 4 KiB tail does
+4 KiB messages. The same workload on `laptop/disk/4 KiB` at 10 K msg/s
+is at p99 = 17 µs, so xchannel itself is fine. The server's 4 KiB tail does
 not collapse with reduced load, which rules out queue pressure.
 
 Plausible suspects we have not isolated yet: the page-fault path on the

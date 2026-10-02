@@ -1,11 +1,11 @@
-# xchannel benchmark — `montblanc`
+# xchannel benchmark — laptop
 
 _Generated 2026-04-30T14:32:26+01:00 by `bench/run.sh`._
 
 ## System
 
 ```
-host:        montblanc
+host:        laptop
 kernel:      Linux 6.17.0-22-generic #22-Ubuntu SMP PREEMPT_DYNAMIC Fri Mar 13 12:04:44 UTC 2026 x86_64 GNU/Linux
 os:          Ubuntu 25.10
 cpu:         11th Gen Intel(R) Core(TM) i9-11900H @ 2.50GHz

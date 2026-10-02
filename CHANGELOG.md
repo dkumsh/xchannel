@@ -4,8 +4,8 @@
 
 Recovery and error-path fixes, plus a typed error for pruned indices. **No format change and no
 API break:** files stay `format_version = 3`, and code built against 6.0 compiles unchanged.
-The read and commit paths cost the same as 6.0.0, measured on `lse` at saturation, 2.5–5 M/s and
-100K msg/s.
+The read and commit paths cost the same as 6.0.0, measured on the latency-tuned server at
+saturation, 2.5–5 M/s and 100K msg/s.
 
 Two behaviour changes, both on error paths:
 - a batch that reaches a roll it cannot follow now returns the records before the `Roll`
@@ -519,8 +519,8 @@ Purely additive; no format change (`format_version` stays 3).
   runs with a JSON summary on stdout, configurable publish gap
   (`--gap-ns N`), and `--keep-files` pass-through.
 - Added `bench/run.sh` matrix runner, `just bench` / `just bench-quick`
-  recipes, and reference results (`bench/results-montblanc.md`,
-  `bench/results-lse.md`).
+  recipes, and reference results (`bench/results-laptop.md`,
+  `bench/results-server.md`).
 - README gains a Benchmarks section with multi-host tables at three
   publish cadences and a "How to read these numbers" interpretation
   guide.

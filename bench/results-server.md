@@ -1,11 +1,11 @@
-# xchannel benchmark — `lse`
+# xchannel benchmark — server
 
 _Generated 2026-04-30T14:32:30+01:00 by `bench/run.sh`._
 
 ## System
 
 ```
-host:        lse
+host:        server
 kernel:      Linux 5.14.0-570.37.1.el9_6.x86_64 #1 SMP PREEMPT_DYNAMIC Sat Aug 16 01:10:00 EDT 2025 x86_64 GNU/Linux
 os:          Red Hat Enterprise Linux 9.6 (Plow)
 cpu:         Intel(R) Xeon(R) Gold 6146 CPU @ 3.20GHz
