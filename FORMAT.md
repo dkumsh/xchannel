@@ -83,7 +83,10 @@ Located at byte offset `16` of file region 0 (immediately after the
 |     44 |    4 | `user_header_kind`    | u32    | Reserved discriminant identifying the layout of the user-metadata bytes. Current writers emit `0` (the default `{message_type:u16, user_meta_u64:u64}` layout described in §4) and current readers refuse anything else. Non-zero values are reserved for future user-defined layouts; a Rust opt-in API for those layouts is intentionally not exposed today. Placed at this 4-aligned offset so the surrounding byte fields need no padding. |
 |     48 |    1 | `user_header_size`    | u8     | Size of the user-metadata bytes inside `MessageHeader` (`8`). |
 |     49 |   48 | `channel_name`        | u8[48] | Optional channel name; unused bytes are zero. Widened from 20 in version 3. |
-|     97 |   23 | `_reserved2`          | u8[23] | Reserved for future additive fields. Zero-filled; readers must ignore. Additive, optional, zero-default fields may consume this space **without** a `format_version` bump; any field that changes existing semantics must bump the version. |
+|     97 |    1 | `wake_flags`          | u8     | Bit 0: this segment's writer wakes readers (§6.3). Other bits reserved, zero. Set or cleared by every writer that creates or reopens the segment, to match its own setting. Zero (no waking) in files written before this field existed. |
+|     98 |    2 | `_reserved_pad`       | u8[2]  | Zero-filled padding. |
+|    100 |    4 | `wake_word`           | u32    | Wake counter (§6.3). Bumped only by a writer whose segment has `wake_flags` bit 0 set; readers wait on it and never write it. Zero and untouched otherwise. On a different cache line from `write_position` and `message_count`. |
+|    104 |   16 | `_reserved2`          | u8[16] | Reserved for future additive fields. Zero-filled; readers must ignore. Additive, optional, zero-default fields may consume this space **without** a `format_version` bump; any field that changes existing semantics must bump the version. |
 |    120 |    8 | `generation`          | u64    | Opaque incarnation id for the channel, chosen at creation and stamped identically into every segment (immutable, carried across rolls, preserved when a writer reopens). `0` when unset. Distinguishes "this log continues" from "this path was deleted and recreated" — a recreated channel restarts at `channel_sequence = 0` and `base_record_index = 0`, so nothing else tells the two apart, and a persisted cursor would silently refer to unrelated data. A consumer that stores a read position should store this alongside it and treat a change as a different channel, not a gap. xchannel assigns no meaning to the value. Placed **last** so that additive fields consuming `_reserved2` from the front never move it. |
 
 The `MessageHeader(Channel)` at offset `0` covers the bytes `[16, 144)`; its
@@ -172,6 +175,8 @@ For each user record `i`:
    update of `write_position` (`Skip`, `Roll`) is also a release store.
    `message_count` counts **user** records only — see §6.1 for why `Skip`
    does not increment it.
+8. If the segment's `wake_flags` bit 0 is set, the writer increments
+   `wake_word` (release) and wakes everyone waiting on it (§6.3).
 
    A writer that reopens a file and finds the slot at `write_position - 16`
    already committed (it crashed between steps 6 and 7) steps over that
@@ -212,6 +217,10 @@ The order of a roll is part of the contract:
 3. Rename the new file to its final name.
 4. Store `committed = 1` on the `Roll` (release).
 5. Advance the old file's `write_position` one slot **past** the `Roll`.
+6. If the writer wakes readers, increment the **old** file's `wake_word` and
+   wake its waiters, so readers asleep on it follow the `Roll` (§6.3). The
+   new file's `wake_flags` is set before step 3, so readers find it set from
+   the start.
 
 A reader that sees the `Roll` committed can therefore always open the next
 file. A reader that finds the next file present knows a `Roll` is at least
@@ -243,6 +252,37 @@ lies beyond the end of the file.
 - **Between steps 4 and 5:** `write_position - 16` is the committed `Roll`.
   That is a valid state: readers follow the `Roll` (§7), and the recovery
   above leaves it alone.
+
+### 6.3 Waking readers (optional)
+
+A writer may let readers sleep instead of polling. It sets `wake_flags`
+bit 0 in every segment it creates or reopens, and after every commit (§6
+step 8) and every `Roll` (§6.2 step 6) it increments that segment's
+`wake_word` with release semantics and wakes all waiters. Readers only read
+the word, so they keep read-only mappings.
+
+On Linux the wait and the wake are a **shared** futex on `wake_word`:
+`FUTEX_WAIT` / `FUTEX_WAKE` (or `futex_waitv` over several words), without
+`FUTEX_PRIVATE_FLAG`. The kernel keys a shared futex on the file's inode and
+offset, so a writer and readers that map the file at different addresses
+meet on the same word.
+
+A reader that finds no record and wants to wait:
+
+1. Load `wake_word` with acquire semantics (`seen`).
+2. Look for a record again. If there is one, stop.
+3. Wait until `wake_word` is no longer `seen`, for at most a bounded time
+   (the reference implementation uses 10 ms).
+
+A commit after step 2 changes the word after step 1, so the wait in step 3
+either returns at once or is woken. The bound matters: the flag can be stale
+(a writer that predates this field reopened the segment and does not wake),
+and a stale flag must cost slow polling, never a hang. A reader that sees a
+full bounded wait run out with a record waiting should stop trusting the
+flag for that segment.
+
+A crashed writer's stranded `Roll` (§6.2) is woken by the writer that
+finishes it, unconditionally.
 
 ---
 

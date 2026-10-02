@@ -1,7 +1,8 @@
 # Waking a reader without polling
 
-**Status: a request, not an agreed design.** The numbers below are measured with
-`examples/futex-wake.rs`, on a laptop and on a latency-tuned server.
+**Status: implemented** as option 1 below: `WriterBuilder::wake_readers`, the futex path in
+`Reader::wait_for_message`, and `wait_any` over several readers (FORMAT.md §6.3). The numbers
+below are measured with `examples/futex-wake.rs`, on a laptop and on a latency-tuned server.
 
 ## What is wanted
 
@@ -194,10 +195,13 @@ So the ten-microsecond target is met only where the reader's core does not sleep
   example through `/dev/cpu_dma_latency`, which needs privileges), or a short spin before sleeping
   to catch the next record of a burst.
 
-## Still to measure
+## A channel that does not opt in
 
-- That a channel which does not opt in is unchanged: the same before/after runs on the tuned server
-  as the last two releases. This can only be done once the code exists.
+Unchanged, measured on the tuned server: 6.1.0 against the implementation, both with the same
+harness, two runs each alternated, at saturation, 5 M/s and 100K msg/s for 64 B and 256 B on tmpfs
+and disk. Every percentile and the throughput fell within run-to-run spread, with differences in
+both directions (at most 5 ns at p50). The writer's only addition on that path is a branch on its
+own setting.
 
 ## Reproducing
 

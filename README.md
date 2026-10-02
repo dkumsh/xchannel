@@ -415,13 +415,14 @@ they shape what the library is and isn't suited for.
   is being opened. A truly missing channel still fails fast with
   `ErrorKind::NotFound`.
 
-- **No kernel-mediated wake-up.** `try_read` is strictly non-blocking;
-  `Reader::read_blocking(timeout)` is a sleep-backoff helper
-  (1 µs → 10 ms cap, no syscall on the writer side). Sub-µs wake-up
-  would require a futex- or eventfd-based notification primitive that
-  xchannel does not currently provide. Async runtimes should compose
-  `try_read` with their own sleep — `read_blocking` uses
-  `std::thread::sleep` and will block an executor thread.
+- **Kernel wake-up is opt-in, per channel, and Linux only.** `try_read`
+  is strictly non-blocking. By default `Reader::wait_for_message` /
+  `read_blocking` sleep with backoff (1 µs → 10 ms cap, no syscall on the
+  writer side). A writer built with `WriterBuilder::wake_readers(true)`
+  wakes them through a futex instead (see [Waking readers](#waking-readers)),
+  at the cost of a syscall on every commit. There is no file descriptor to
+  hand to `epoll`/`select`. Async runtimes should compose `try_read` with
+  their own sleep: `wait_for_message` blocks the calling thread.
 
 - **Single-step writer-crash recovery only.** The publish step is
   "write payload → mark header committed → advance `write_position`".
@@ -1037,6 +1038,56 @@ at a time, without touching payloads. That is linear in the segment, not
 O(1): about 14 ns per record skipped (64-byte records on `/dev/shm`), so
 roughly 280 ms to reach the end of a 20M-record segment. Open or seek once,
 not per message; a smaller `file_roll_size` caps the worst case.
+
+---
+
+### Waking readers
+
+```
+writer wakes readers through a futex instead of leaving them to poll
+```
+
+A reader that has caught up waits with `wait_for_message` (one channel) or
+`xchannel::wait_any` (several). By default that is a backoff sleep that
+grows to 10 ms. If the writer opts in, readers sleep on a futex in the
+segment header instead and run again within microseconds of the next
+commit:
+
+```rust
+let mut writer = WriterBuilder::new(path).wake_readers(true).build()?;
+
+// elsewhere, in a reader process
+let mut a = ReaderBuilder::new(path_a).build()?;
+let mut b = ReaderBuilder::new(path_b).build()?;
+match xchannel::wait_any(&mut [&mut a, &mut b], None)? {
+    Some(0) => { /* a.try_read() has a record */ }
+    Some(1) => { /* b.try_read() has a record */ }
+    _ => {}
+}
+```
+
+Readers stay read-only: the writer bumps a word in the header and wakes
+everyone waiting on it, and nothing about a reader is in shared memory.
+
+What it costs and buys, measured with `examples/futex-wake.rs`:
+
+| | laptop (i9-11900H, untuned) | server (Xeon Gold 6146, tuned) |
+|---|---:|---:|
+| writer cost per commit, nobody waiting | 165 ns | 733 ns |
+| writer cost per commit that wakes a sleeper | 2.1–2.5 µs | 1.2–1.4 µs |
+| commit to sleeping reader running, p50 / p99 | 79 / 115 µs | 2.7 / 3.1 µs |
+
+- **The syscall is paid on every commit**, whether or not anyone waits, and
+  its price depends on the CPU's vulnerability mitigations. Opt in on
+  channels that are often idle, not on ones that run at millions a second.
+- **Wake latency is set by the reader's CPU idle states**, not by the
+  futex: on a host with deep C-states disabled it is a few microseconds; on
+  an untuned laptop the core's wake-up from deep sleep dominates.
+- **A channel that does not opt in is unchanged**, and readers of it keep
+  the backoff. So do readers on macOS, where opting in does nothing.
+
+The design, the alternatives considered and the measurements are in
+[`doc/waking-a-reader.md`](doc/waking-a-reader.md).
 
 ---
 

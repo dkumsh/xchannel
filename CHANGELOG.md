@@ -1,5 +1,41 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- **`WriterBuilder::wake_readers(true)`** — the writer wakes readers that wait for the channel,
+  instead of leaving them to poll. After every commit, and after committing a segment's `Roll`,
+  it bumps a wake word in the segment header and `futex_wake`s everyone sleeping on it. Readers
+  stay read-only; nothing about a reader is in shared memory. Off by default. A channel that does
+  not opt in is unchanged: the writer branches only on its own setting.
+
+  The cost is one futex syscall on every commit, whether or not anyone waits: about 165 ns on a
+  recent laptop CPU and 730 ns on an older server CPU with heavy vulnerability mitigations, plus
+  1–2.5 µs on a commit that wakes a sleeper. A sleeping reader runs again about 3 µs after the
+  commit on a host with deep C-states disabled, and around 80 µs on an untuned laptop, where the
+  core's wake-up from deep sleep dominates. Linux only; elsewhere the setting is accepted and does
+  nothing.
+- **`wait_any(readers, timeout)`** — block until any of several readers has a record, and return
+  its index. Readers whose writers wake them sleep together in one `futex_waitv` (Linux 5.16+,
+  and kernels that backport it, such as RHEL 9); the rest are polled with backoff, and when the
+  group is mixed the sleeps are kept that short.
+- **`examples/futex-wake.rs`** — measures what a shared-file futex wake costs the writer and how
+  long a sleeping reader takes to run again. The numbers above come from it.
+
+### Changed
+- **`wait_for_message` / `read_blocking` sleep on the futex** when the segment's writer wakes
+  readers, and keep the backoff otherwise. Each sleep is capped at 10 ms, so a stale flag (an
+  older writer reopening the channel, which does not wake) costs slow polling, never a hang; once
+  a capped sleep runs out with a record waiting, the reader backs off instead for the rest of that
+  segment.
+- **Format, additively:** `ChannelHeader` gains `wake_flags` (offset 97) and `wake_word` (offset
+  100), taken from `_reserved2`, which shrinks to 16 bytes (FORMAT.md §3, §6.3). Zero-default, so
+  `format_version` stays 3: older readers ignore the fields, and newer readers on older files see
+  the flag clear and keep the backoff.
+- **A writer finishing a stranded roll** (6.1.0) also wakes readers asleep on that segment.
+- **`libc` floor raised to 0.2.183**, the first version this was built against that defines
+  `SYS_futex_waitv` on the supported targets.
+
 ## 6.1.0 (2026-10-01)
 
 Recovery and error-path fixes, plus a typed error for pruned indices. **No format change and no
