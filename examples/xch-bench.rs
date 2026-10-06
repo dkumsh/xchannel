@@ -105,6 +105,10 @@ mod bench {
         #[arg(long = "keep-files", default_value = "0")]
         keep_files: u64,
 
+        /// Writer-only: keep pages faulted in ahead of the writer (WriterBuilder::prefault).
+        #[arg(long = "prefault", action = ArgAction::SetTrue)]
+        prefault: bool,
+
         /// Print extra diagnostics to stderr.
         #[arg(long = "verbose", action = ArgAction::SetTrue)]
         verbose: bool,
@@ -246,6 +250,7 @@ mod bench {
             .region_size(region_size)
             .file_roll_size(roll_size)
             .mtu(mtu);
+        wb = wb.prefault(opt.prefault);
         if opt.keep_files > 0 {
             wb = wb.keep_files(opt.keep_files);
         }
@@ -441,6 +446,15 @@ mod bench {
             (0, 0, 0, 0, 0, 0, 0)
         };
 
+        if samples > 0 {
+            eprintln!(
+                "TAIL p9999_ns={} over_50us={} over_500us={} over_1ms={}",
+                hist.value_at_quantile(0.9999),
+                hist.count_between(50_000, u64::MAX),
+                hist.count_between(500_000, u64::MAX),
+                hist.count_between(1_000_000, u64::MAX)
+            );
+        }
         // Single JSON line on stdout for the runner to parse.
         println!(
             "{{\"role\":\"reader\",\"msg_size\":{},\"duration_secs\":{},\"warmup_secs\":{},\"samples\":{},\"msgs_per_sec\":{:.2},\"p50_ns\":{},\"p90_ns\":{},\"p95_ns\":{},\"p99_ns\":{},\"p999_ns\":{},\"min_ns\":{},\"max_ns\":{},\"gaps\":{},\"saw_writer\":{}}}",

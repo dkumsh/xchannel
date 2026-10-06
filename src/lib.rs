@@ -19,6 +19,7 @@
 //! IPC this is fine. Publishing uses `Release` and reading uses `Acquire`.
 
 mod channel;
+mod prefault;
 mod region;
 mod wake;
 
@@ -395,6 +396,8 @@ pub struct WriterBuilder {
     base_record_index: u64,
     generation: u64,
     wake_readers: bool,
+    prefault: bool,
+    prefault_core: Option<usize>,
 }
 
 impl WriterBuilder {
@@ -409,7 +412,25 @@ impl WriterBuilder {
             base_record_index: 0, // default: genesis channel starts at index 0
             generation: 0,        // default: unset incarnation id
             wake_readers: false,  // default: readers poll with backoff
+            prefault: false,
+            prefault_core: None,
         }
+    }
+
+    /// Keep the writer's pages faulted in ahead of it on a thread of its own (`xch-prefault`), so
+    /// the first write to a page and the move to the next region cost the writer no fault and no
+    /// syscall. Off by default. Linux only (`MADV_POPULATE_WRITE`, 5.14+); elsewhere it is
+    /// accepted and does nothing.
+    pub fn prefault(mut self, on: bool) -> Self {
+        self.prefault = on;
+        self
+    }
+
+    /// Pin the prefault thread to `core`, such as a housekeeping core shared with other
+    /// background threads. Unpinned by default.
+    pub fn prefault_core(mut self, core: usize) -> Self {
+        self.prefault_core = Some(core);
+        self
     }
 
     /// Wake readers that wait for this channel, instead of leaving them to poll.
@@ -554,7 +575,9 @@ impl WriterBuilder {
             ));
         }
         sweep_stale_partial_files(&self.path);
-        Writer::open_or_create(
+        let prefault = self.prefault && cfg!(target_os = "linux");
+        let prefault_core = self.prefault_core;
+        let mut writer = Writer::open_or_create(
             self.path,
             self.region_size,
             self.file_roll_size,
@@ -564,7 +587,12 @@ impl WriterBuilder {
             self.base_record_index,
             self.generation,
             self.wake_readers,
-        )
+        )?;
+        if prefault {
+            writer.prefault_core = prefault_core;
+            writer.start_prefault()?;
+        }
+        Ok(writer)
     }
 
     /// Convenience: just ensure the channel file exists and is initialized, then drop.
@@ -651,6 +679,9 @@ impl ReaderBuilder {
 
 // ========== Channel Writer ==========
 pub struct Writer {
+    /// First, so it stops before the header it reads is unmapped.
+    prefault: Option<prefault::Prefaulter>,
+    prefault_core: Option<usize>,
     base_path: PathBuf,
     file_sequence: u64,
     file: File,
@@ -764,6 +795,8 @@ impl Writer {
         }
 
         Ok(Self {
+            prefault: None,
+            prefault_core: None,
             base_path,
             file_sequence: sequence,
             file,
@@ -1417,6 +1450,15 @@ impl Writer {
     /// can clean up the orphan `.partial` (or `WriterBuilder::build`
     /// will sweep it on next startup).
     pub fn roll_file(&mut self) -> io::Result<()> {
+        let prefaulted = self.prefault.take().is_some();
+        let rolled = self.roll_file_now();
+        if prefaulted {
+            self.start_prefault()?;
+        }
+        rolled
+    }
+
+    fn roll_file_now(&mut self) -> io::Result<()> {
         // Any pending reservation refers to a slot in OLD that's about
         // to be replaced by a Roll marker (or live elsewhere in OLD
         // that we won't return to). Invalidate it so a follow-up
@@ -1609,15 +1651,9 @@ impl Writer {
             let skip_len = leftover - HEADER_SLOT;
             let new_wp = wp + HEADER_SLOT + skip_len; // == next region start
             let next_idx = (new_wp / self.region_size) as u64;
-            let needed_end = (next_idx + 1) * self.region_size as u64;
 
             // 1) Grow file and map the *next* region first.
-            self.ensure_len(needed_end)?;
-            let mut new_region = RegionMapping::create_writable(
-                &self.file,
-                next_idx * self.region_size as u64,
-                self.region_size,
-            )?;
+            let mut new_region = self.region_at(next_idx)?;
 
             // Pre-install header at the start of the new region (committed = 0).
             if let Some(h) = new_region.get_bytes_mut(0, MESSAGE_HEADER_SIZE) {
@@ -1656,8 +1692,7 @@ impl Writer {
             }
 
             // 3) Switch writer state to the new region and publish wp.
-            self.current_region = new_region;
-            self.current_region_index = next_idx;
+            self.switch_region(new_region, next_idx);
             self.next_hdr_pos = new_wp;
             // A Skip is not a user record: advance the advisory write_position but
             // do not bump `message_count` (which counts user records only).
@@ -1668,14 +1703,8 @@ impl Writer {
             let next_region_start = ((wp / self.region_size) + 1) * self.region_size;
 
             let next_idx = (next_region_start / self.region_size) as u64;
-            let needed_end = (next_idx + 1) * self.region_size as u64;
-            self.ensure_len(needed_end)?;
-            self.current_region = RegionMapping::create_writable(
-                &self.file,
-                next_idx * self.region_size as u64,
-                self.region_size,
-            )?;
-            self.current_region_index = next_idx;
+            let new_region = self.region_at(next_idx)?;
+            self.switch_region(new_region, next_idx);
 
             // Pre-install header at start
             if let Some(h) = self.current_region.get_bytes_mut(0, MESSAGE_HEADER_SIZE) {
@@ -1698,7 +1727,58 @@ impl Writer {
     }
 
     #[inline]
+    fn start_prefault(&mut self) -> io::Result<()> {
+        let wp = &self.channel_header().write_position as *const AtomicU64;
+        // Safety: the header outlives the prefaulter, which is dropped first.
+        let prefaulter = prefault::Prefaulter::start(
+            &self.file,
+            self.file_len,
+            self.region_size,
+            &mut self.current_region,
+            self.current_region_index,
+            unsafe { &*wp },
+            self.prefault_core,
+        )?;
+        self.prefault = Some(prefaulter);
+        Ok(())
+    }
+
+    /// Why the prefault thread stopped, if it did: an OS error from `madvise`, such as `EINVAL`
+    /// on a kernel older than 5.14. The writer carries on mapping and faulting its own regions.
+    pub fn prefault_error(&self) -> Option<io::Error> {
+        let errno = self.prefault.as_ref()?.shared.failed.load(Ordering::Acquire);
+        (errno != 0).then(|| io::Error::from_raw_os_error(errno))
+    }
+
+    /// The writable mapping of region `index`: the one prepared ahead if there is one.
+    fn region_at(&mut self, index: u64) -> io::Result<RegionMapping<Writable>> {
+        let needed_end = (index + 1) * self.region_size as u64;
+        if let Some(region) = self.prefault.as_ref().and_then(|p| p.take(index)) {
+            self.file_len = self.file_len.max(needed_end);
+            return Ok(region);
+        }
+        self.ensure_len(needed_end)?;
+        RegionMapping::create_writable(&self.file, index * self.region_size as u64, self.region_size)
+    }
+
+    fn switch_region(&mut self, region: RegionMapping<Writable>, index: u64) {
+        let left = std::mem::replace(&mut self.current_region, region);
+        self.current_region_index = index;
+        if let Some(prefault) = &self.prefault {
+            prefault.moved(&mut self.current_region, index, left);
+        }
+    }
+
     fn ensure_len(&mut self, want: u64) -> io::Result<()> {
+        if let Some(prefault) = &self.prefault {
+            let mut len = prefault.shared.file_len.lock().unwrap_or_else(|e| e.into_inner());
+            if want > *len {
+                self.file.set_len(want)?;
+                *len = want;
+            }
+            self.file_len = self.file_len.max(*len);
+            return Ok(());
+        }
         if want > self.file_len {
             // ftruncate to grow before any mmap touches those pages.
             self.file.set_len(want)?;
