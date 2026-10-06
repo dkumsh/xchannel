@@ -1,0 +1,305 @@
+//! Keeping the reader's next region mapped ahead of it, and its old regions unmapped, off its
+//! thread.
+//!
+//! Moving to a region costs a reader an `mmap` and a minor fault on each page it then touches;
+//! leaving one costs a `munmap` that tears down every page-table entry the region filled, which
+//! for a large region is the longest stall a reader sees. Here a thread maps the region after the
+//! reader's and populates it with `MADV_POPULATE_READ`, so the reader takes it ready and faults
+//! nothing, and drops the regions the reader hands back. A region not ready in time is mapped by
+//! the reader as before.
+//!
+//! Near the end of a segment the thread also opens the next one, under its final name or still
+//! under the `.partial` name the writer prepares it at, and maps and populates its first region.
+//! The reader takes it at the roll once the final name is confirmed to be the same file.
+
+use crate::helper::{Failure, Thread, drop_page_tables};
+use crate::region::{ReadOnly, RegionMapping, page_size};
+use crate::{Helper, MappedRegion, make_channel_file_path, make_partial_channel_file_path};
+use std::fs::File;
+use std::io;
+use std::os::unix::fs::MetadataExt;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
+
+const POLL: Duration = Duration::from_micros(200);
+/// How often the next segment is looked for while it does not exist yet.
+const LOOK_FOR_NEXT: Duration = Duration::from_millis(5);
+
+struct Ready {
+    file_sequence: u64,
+    region_idx: u64,
+    mapping: RegionMapping<ReadOnly>,
+}
+
+/// The segment after the reader's, opened and mapped ahead of the roll.
+pub(crate) struct NextSegment {
+    pub(crate) sequence: u64,
+    pub(crate) file: File,
+    pub(crate) region0: RegionMapping<ReadOnly>,
+    pub(crate) header: RegionMapping<ReadOnly>,
+    dev: u64,
+    ino: u64,
+}
+
+impl NextSegment {
+    /// Whether `path` names this file.
+    pub(crate) fn is_at(&self, path: &std::path::Path) -> bool {
+        std::fs::metadata(path).is_ok_and(|m| (m.dev(), m.ino()) == (self.dev, self.ino))
+    }
+}
+
+/// What the reader leaves behind for the thread to release; held only to be dropped there.
+#[allow(dead_code)]
+pub(crate) enum Retired {
+    Region(Arc<MappedRegion>),
+    Segment(NextSegment),
+    File(File),
+    Header(RegionMapping<ReadOnly>),
+}
+
+pub(crate) struct Shared {
+    stop: AtomicBool,
+    /// Set if the thread stopped early. The reader then maps every region itself, and drops what
+    /// it would have handed over.
+    pub(crate) failure: Arc<Failure>,
+    region_size: usize,
+    base_path: PathBuf,
+    want_sequence: AtomicU64,
+    want_region: AtomicU64,
+    /// A segment the reader rolled into, for the thread to map from: the file it opened, or `None`
+    /// when it took the one the thread opened ahead.
+    rolled: Mutex<Option<(u64, Option<File>)>>,
+    ready: Mutex<Option<Ready>>,
+    next_segment: Mutex<Option<NextSegment>>,
+    retired: Mutex<Vec<Retired>>,
+    /// Tests: make the thread stop as it would on an old kernel or a bug.
+    #[cfg(test)]
+    pub(crate) inject: crate::helper::Inject,
+}
+
+pub(crate) struct MapAhead {
+    pub(crate) shared: Arc<Shared>,
+    thread: Thread,
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+impl MapAhead {
+    pub(crate) fn start(
+        helper: Helper,
+        base_path: PathBuf,
+        file: &File,
+        file_sequence: u64,
+        region_idx: u64,
+        region_size: usize,
+    ) -> io::Result<Self> {
+        let shared = Arc::new(Shared {
+            stop: AtomicBool::new(false),
+            failure: Arc::default(),
+            region_size,
+            base_path,
+            want_sequence: AtomicU64::new(file_sequence),
+            want_region: AtomicU64::new(region_idx + 1),
+            rolled: Mutex::new(Some((file_sequence, Some(file.try_clone()?)))),
+            ready: Mutex::new(None),
+            next_segment: Mutex::new(None),
+            retired: Mutex::new(Vec::with_capacity(64)),
+            #[cfg(test)]
+            inject: Default::default(),
+        });
+        let for_thread = shared.clone();
+        let thread = helper.spawn("xch-map-ahead", shared.failure.clone(), move || {
+            run(&for_thread)
+        })?;
+        Ok(Self { shared, thread })
+    }
+
+    /// Region `region_idx` of segment `file_sequence`, if it was mapped ahead.
+    pub(crate) fn take(
+        &self,
+        file_sequence: u64,
+        region_idx: u64,
+    ) -> Option<RegionMapping<ReadOnly>> {
+        let mut ready = lock(&self.shared.ready);
+        match ready.take() {
+            Some(r) if r.file_sequence == file_sequence && r.region_idx == region_idx => {
+                Some(r.mapping)
+            }
+            other => {
+                *ready = other;
+                None
+            }
+        }
+    }
+
+    /// Segment `sequence`, if it was opened ahead.
+    pub(crate) fn take_segment(&self, sequence: u64) -> Option<NextSegment> {
+        let mut next = lock(&self.shared.next_segment);
+        match next.take() {
+            Some(n) if n.sequence == sequence => Some(n),
+            other => {
+                *next = other;
+                None
+            }
+        }
+    }
+
+    /// The reader is now in `region_idx` of segment `file_sequence`.
+    pub(crate) fn moved(&self, file_sequence: u64, region_idx: u64) {
+        self.shared
+            .want_region
+            .store(region_idx + 1, Ordering::Release);
+        self.shared
+            .want_sequence
+            .store(file_sequence, Ordering::Release);
+    }
+
+    /// The reader rolled into segment `file_sequence`, open as `file`, unless the thread opened it
+    /// itself.
+    pub(crate) fn rolled(&self, file_sequence: u64, file: Option<&File>) {
+        let file = match file.map(File::try_clone) {
+            Some(Ok(file)) => Some(file),
+            Some(Err(_)) => return self.moved(file_sequence, 0),
+            None => None,
+        };
+        *lock(&self.shared.rolled) = Some((file_sequence, file));
+        self.moved(file_sequence, 0);
+    }
+
+    /// Hand `left` to the thread to release; or, once it has stopped, release it here, with
+    /// whatever was handed over before the reader noticed.
+    pub(crate) fn retire(&self, left: impl IntoIterator<Item = Retired>) {
+        let mut retired = lock(&self.shared.retired);
+        if self.shared.failure.stopped() {
+            retired.clear();
+            drop(retired);
+            left.into_iter().for_each(drop);
+            return;
+        }
+        retired.extend(left);
+    }
+}
+
+impl Drop for MapAhead {
+    fn drop(&mut self) {
+        self.shared.stop.store(true, Ordering::Release);
+        self.thread.join();
+    }
+}
+
+fn run(shared: &Shared) -> io::Result<()> {
+    let size = shared.region_size as u64;
+    let mut segment: Option<(u64, File)> = None;
+    let mut upcoming: Option<(u64, File)> = None;
+    let mut releasing = Vec::with_capacity(64);
+    let mut done = (u64::MAX, u64::MAX);
+    let mut looked_for_next = Instant::now() - LOOK_FOR_NEXT;
+    while !shared.stop.load(Ordering::Acquire) {
+        #[cfg(test)]
+        shared.inject.fire()?;
+        // Only the reader says which file a segment is: a file opened ahead under the `.partial`
+        // name may have been abandoned and replaced, and only the reader checks that at the roll.
+        if let Some((seq, file)) = lock(&shared.rolled).take() {
+            segment = match file {
+                Some(file) => Some((seq, file)),
+                None => upcoming.take().filter(|(s, _)| *s == seq),
+            };
+        }
+        let file_sequence = shared.want_sequence.load(Ordering::Acquire);
+        let region_idx = shared.want_region.load(Ordering::Acquire);
+        if let Some((seq, file)) = &segment
+            && *seq == file_sequence
+        {
+            let len = file.metadata()?.len();
+            if done != (file_sequence, region_idx) && len >= (region_idx + 1) * size {
+                let mapping =
+                    RegionMapping::create_read_only(file, region_idx * size, size as usize)?;
+                populate(&mapping)?;
+                let stale = lock(&shared.ready).replace(Ready {
+                    file_sequence,
+                    region_idx,
+                    mapping,
+                });
+                drop(stale);
+                done = (file_sequence, region_idx);
+            }
+            let in_last_region = len < (region_idx + 1) * size;
+            if in_last_region
+                && looked_for_next.elapsed() >= LOOK_FOR_NEXT
+                && !matches!(&*lock(&shared.next_segment), Some(n) if n.sequence == file_sequence + 1)
+            {
+                looked_for_next = Instant::now();
+                if let Some(next) = open_next(shared, file_sequence + 1) {
+                    upcoming = next.file.try_clone().ok().map(|f| (next.sequence, f));
+                    let stale = lock(&shared.next_segment).replace(next);
+                    drop(stale);
+                }
+            }
+        }
+        std::mem::swap(&mut *lock(&shared.retired), &mut releasing);
+        for left in &releasing {
+            match left {
+                Retired::Region(region) if Arc::strong_count(region) == 1 => {
+                    let mapping = &region.mapping;
+                    drop_page_tables(mapping.as_ptr(), mapping.region_size());
+                }
+                Retired::Segment(next) => {
+                    drop_page_tables(next.region0.as_ptr(), next.region0.region_size())
+                }
+                _ => {}
+            }
+        }
+        releasing.clear();
+        std::thread::sleep(POLL);
+    }
+    Ok(())
+}
+
+/// Segment `sequence` opened, its first region mapped and populated, if it exists yet.
+fn open_next(shared: &Shared, sequence: u64) -> Option<NextSegment> {
+    let size = shared.region_size;
+    let paths = [
+        make_channel_file_path(&shared.base_path, sequence).ok()?,
+        make_partial_channel_file_path(&shared.base_path, sequence).ok()?,
+    ];
+    let file = paths.iter().find_map(|p| File::open(p).ok())?;
+    let meta = file.metadata().ok()?;
+    if meta.len() < size as u64 {
+        return None;
+    }
+    let region0 = RegionMapping::create_read_only(&file, 0, size).ok()?;
+    populate(&region0).ok()?;
+    let header = RegionMapping::create_read_only(&file, 0, page_size()).ok()?;
+    Some(NextSegment {
+        sequence,
+        file,
+        region0,
+        header,
+        dev: meta.dev(),
+        ino: meta.ino(),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn populate(mapping: &RegionMapping<ReadOnly>) -> io::Result<()> {
+    // Safety: the whole mapping, page-aligned; populating reads nothing into the program.
+    match unsafe {
+        libc::madvise(
+            mapping.as_ptr() as *mut _,
+            mapping.region_size(),
+            libc::MADV_POPULATE_READ,
+        )
+    } {
+        0 => Ok(()),
+        _ => Err(io::Error::last_os_error()),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn populate(_mapping: &RegionMapping<ReadOnly>) -> io::Result<()> {
+    Ok(())
+}

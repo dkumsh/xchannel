@@ -1,5 +1,46 @@
 # Changelog
 
+## Unreleased
+
+Writers and readers can hand their mapping work to a helper thread, so the hot thread never
+faults in a fresh page, maps or unmaps a region, or creates, opens or deletes a segment. **No
+format break and no API break:** both are opt-in builder settings, off by default; code built
+against 6.2 compiles and behaves unchanged. Linux only (5.14+); elsewhere the settings are
+accepted and do nothing.
+
+Measured on a latency-tuned server, 96-byte records at 10K msg/s for 5 minutes, 64 MB regions,
+writer and reader pinned to their own cores and both helpers on a third, `Unmap::AtFileRoll` on
+both: p99 393 ns and p99.9 597 ns with 2 GB segments, and nothing above 113 µs in 3 M reads,
+against p99 4.4 µs, p99.9 6.4 µs and five reads of 1–3 ms without helpers, one per region. With
+128 MB segments, rolling every two minutes, the same: nothing above 106 µs. A roll still renames
+the new segment on the writer's thread, tens of microseconds once per segment.
+
+### Added
+- **`WriterBuilder::helper(Helper)`** — a thread (`xch-prefault`) keeps the pages just ahead of
+  the writer populated with `MADV_POPULATE_WRITE`, about 100 ms of the writer's rate (64 KB to
+  1 MB; populated much further ahead they are written back and fault again), maps the next
+  region before the writer reaches it, and follows the writer across file rolls. Halfway through
+  a rolling segment's last region it creates the next segment under its `.partial` name, so the
+  roll only stamps its base and renames it, and it deletes the segments `keep_files` drops. A
+  prepared segment left by a writer that exits is deleted; one left by a crash is swept by the
+  next `build`, as before.
+- **`ReaderBuilder::helper(Helper)`** — a thread (`xch-map-ahead`) maps the next region and
+  populates it with `MADV_POPULATE_READ`, so the reader takes it ready and faults nothing. Near
+  the end of a segment it opens the next one, under its final or `.partial` name, and maps its
+  first region; the reader takes it at the roll only if the final name is the same file, and
+  validates it as before.
+- **`Helper::on_core(n)` / `Helper::inherit()`** — where the helper runs. A thread inherits the
+  CPU mask of the thread that spawns it, so a helper started from a pinned hot thread would share
+  its core; there is deliberately no default.
+- **`WriterBuilder::unmap(Unmap)` / `ReaderBuilder::unmap(Unmap)`** — `Unmap::AtFileRoll` keeps
+  the regions moved past mapped until the file rolls, instead of releasing each one as it is left
+  (`Unmap::Immediate`, the default). Unmapping takes the process's memory-map lock and flushes
+  the TLB on every core running the process, from whichever thread does it: a 64 MB region took
+  1–20 ms, and a page fault or `mmap` on the hot thread waited for it. Helpers now drop a
+  mapping's page tables with `MADV_DONTNEED`, which leaves faults running, before unmapping it.
+- **`Writer::helper_error()` / `Reader::helper_error()`** — why a helper stopped, if it did. The
+  writer or reader then maps its own regions as before.
+
 ## 6.2.0 (2026-10-03)
 
 Readers can now sleep until the writer commits, instead of polling, on channels whose writer opts

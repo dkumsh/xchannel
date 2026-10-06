@@ -19,6 +19,8 @@
 //! IPC this is fine. Publishing uses `Release` and reading uses `Acquire`.
 
 mod channel;
+mod helper;
+mod map_ahead;
 mod prefault;
 mod region;
 mod wake;
@@ -27,6 +29,7 @@ use channel::{
     ChannelHeader, ENDIANNESS_LE, FORMAT_VERSION, HeaderType, MessageHeader, SYSTEM_HEADER_SIZE,
     USER_HEADER_KIND_DEFAULT, USER_HEADER_SIZE, WAKE_FLAG_WAKES,
 };
+pub use helper::{Helper, Unmap};
 pub use region::{ReadOnly, RegionMapping, Writable, page_size};
 
 use std::fs::{File, OpenOptions, read_dir};
@@ -396,8 +399,8 @@ pub struct WriterBuilder {
     base_record_index: u64,
     generation: u64,
     wake_readers: bool,
-    prefault: bool,
-    prefault_core: Option<usize>,
+    helper: Option<Helper>,
+    unmap: Unmap,
 }
 
 impl WriterBuilder {
@@ -412,24 +415,27 @@ impl WriterBuilder {
             base_record_index: 0, // default: genesis channel starts at index 0
             generation: 0,        // default: unset incarnation id
             wake_readers: false,  // default: readers poll with backoff
-            prefault: false,
-            prefault_core: None,
+            helper: None,
+            unmap: Unmap::Immediate,
         }
     }
 
-    /// Keep the writer's pages faulted in ahead of it on a thread of its own (`xch-prefault`), so
-    /// the first write to a page and the move to the next region cost the writer no fault and no
-    /// syscall. Off by default. Linux only (`MADV_POPULATE_WRITE`, 5.14+); elsewhere it is
-    /// accepted and does nothing.
-    pub fn prefault(mut self, on: bool) -> Self {
-        self.prefault = on;
+    /// Hand the writer's mapping work to a thread of its own (`xch-prefault`): it keeps the pages
+    /// just ahead of the writer faulted in, maps the next region before the writer reaches it and
+    /// unmaps the ones it left, so none of that costs the writer a fault or a syscall. Off by
+    /// default. `build` fails if the helper cannot be pinned where [`Helper::on_core`] says.
+    ///
+    /// Linux only, and it needs 5.14+ for `MADV_POPULATE_WRITE`: on an older kernel the helper
+    /// stops at once, [`Writer::helper_error`] says why, and the writer works as it does without
+    /// one. Elsewhere it is accepted and does nothing.
+    pub fn helper(mut self, helper: Helper) -> Self {
+        self.helper = Some(helper);
         self
     }
 
-    /// Pin the prefault thread to `core`, such as a housekeeping core shared with other
-    /// background threads. Unpinned by default.
-    pub fn prefault_core(mut self, core: usize) -> Self {
-        self.prefault_core = Some(core);
+    /// When the writer releases the regions it has written past; [`Unmap::Immediate`] by default.
+    pub fn unmap(mut self, unmap: Unmap) -> Self {
+        self.unmap = unmap;
         self
     }
 
@@ -575,8 +581,7 @@ impl WriterBuilder {
             ));
         }
         sweep_stale_partial_files(&self.path);
-        let prefault = self.prefault && cfg!(target_os = "linux");
-        let prefault_core = self.prefault_core;
+        let helper = self.helper.filter(|_| cfg!(target_os = "linux"));
         let mut writer = Writer::open_or_create(
             self.path,
             self.region_size,
@@ -588,9 +593,12 @@ impl WriterBuilder {
             self.generation,
             self.wake_readers,
         )?;
-        if prefault {
-            writer.prefault_core = prefault_core;
+        writer.unmap = self.unmap;
+        if helper.is_some() {
+            writer.helper = helper;
             writer.start_prefault()?;
+        } else if self.unmap == Unmap::AtFileRoll {
+            writer.held.reserve(64);
         }
         Ok(writer)
     }
@@ -609,6 +617,8 @@ pub struct ReaderBuilder {
     mode: ReaderMode,
     batch_limit: Option<u16>,
     expected_generation: Option<u64>,
+    helper: Option<Helper>,
+    unmap: Unmap,
 }
 
 impl ReaderBuilder {
@@ -618,6 +628,8 @@ impl ReaderBuilder {
             mode: ReaderMode::LateJoin,
             batch_limit: None,
             expected_generation: None,
+            helper: None,
+            unmap: Unmap::Immediate,
         }
     }
 
@@ -668,11 +680,38 @@ impl ReaderBuilder {
         self
     }
 
+    /// Hand the reader's mapping work to a thread of its own (`xch-map-ahead`): it maps and
+    /// populates the next region before the reader reaches it, and unmaps the regions the reader
+    /// has left, so moving between regions costs the reader neither. Off by default. `build`
+    /// fails if the helper cannot be pinned where [`Helper::on_core`] says.
+    ///
+    /// Linux only, and it needs 5.14+ for `MADV_POPULATE_READ`: on an older kernel the helper
+    /// stops at once, [`Reader::helper_error`] says why, and the reader works as it does without
+    /// one. Elsewhere it is accepted and does nothing.
+    #[inline]
+    pub fn helper(mut self, helper: Helper) -> Self {
+        self.helper = Some(helper);
+        self
+    }
+
+    /// When the reader releases the regions it has read past; [`Unmap::Immediate`] by default.
+    #[inline]
+    pub fn unmap(mut self, unmap: Unmap) -> Self {
+        self.unmap = unmap;
+        self
+    }
+
     /// Open a Reader according to the configured mode.
     #[inline]
     pub fn build(self) -> io::Result<Reader> {
         let mut reader = Reader::open_with(self.path, self.mode, self.expected_generation)?;
         reader.batch_limit = self.batch_limit;
+        reader.unmap = self.unmap;
+        if self.unmap == Unmap::AtFileRoll {
+            reader.held.reserve(64);
+        }
+        reader.helper = self.helper.filter(|_| cfg!(target_os = "linux"));
+        reader.start_map_ahead()?;
         Ok(reader)
     }
 }
@@ -681,7 +720,10 @@ impl ReaderBuilder {
 pub struct Writer {
     /// First, so it stops before the header it reads is unmapped.
     prefault: Option<prefault::Prefaulter>,
-    prefault_core: Option<usize>,
+    helper: Option<Helper>,
+    unmap: Unmap,
+    /// Regions written past and kept mapped until the roll (`AtFileRoll` without a helper).
+    held: Vec<RegionMapping<Writable>>,
     base_path: PathBuf,
     file_sequence: u64,
     file: File,
@@ -796,7 +838,9 @@ impl Writer {
 
         Ok(Self {
             prefault: None,
-            prefault_core: None,
+            helper: None,
+            unmap: Unmap::Immediate,
+            held: Vec::new(),
             base_path,
             file_sequence: sequence,
             file,
@@ -1450,15 +1494,6 @@ impl Writer {
     /// can clean up the orphan `.partial` (or `WriterBuilder::build`
     /// will sweep it on next startup).
     pub fn roll_file(&mut self) -> io::Result<()> {
-        let prefaulted = self.prefault.take().is_some();
-        let rolled = self.roll_file_now();
-        if prefaulted {
-            self.start_prefault()?;
-        }
-        rolled
-    }
-
-    fn roll_file_now(&mut self) -> io::Result<()> {
         // Any pending reservation refers to a slot in OLD that's about
         // to be replaced by a Roll marker (or live elsewhere in OLD
         // that we won't return to). Invalidate it so a follow-up
@@ -1516,16 +1551,29 @@ impl Writer {
             new_index,
             new_file_len,
             new_next_hdr,
-        ) = Self::prepare_segment_at(
-            &new_partial_path,
-            next_seq,
-            self.region_size,
-            self.file_roll_size,
-            self.mtu,
-            &self.channel_name,
-            new_base_record_index,
-            generation,
-        )?;
+        ) = match self
+            .prefault
+            .as_ref()
+            .and_then(|p| p.take_segment(next_seq))
+        {
+            Some(mut prepared) => {
+                let ch = unsafe {
+                    &mut *(prepared.1.as_mut_ptr().add(MESSAGE_HEADER_SIZE) as *mut ChannelHeader)
+                };
+                ch.base_record_index = new_base_record_index;
+                prepared
+            }
+            None => Self::prepare_segment_at(
+                &new_partial_path,
+                next_seq,
+                self.region_size,
+                self.file_roll_size,
+                self.mtu,
+                &self.channel_name,
+                new_base_record_index,
+                generation,
+            )?,
+        };
 
         // Publish Roll in OLD file BEFORE swapping `self` to NEW. If
         // any step here errors, `self` is still consistent on OLD.
@@ -1608,11 +1656,28 @@ impl Writer {
 
         self.file_sequence = next_seq;
         self.file = new_file;
-        self.channel_region = new_channel_region;
-        self.current_region = new_current_region;
+        let old_channel = std::mem::replace(&mut self.channel_region, new_channel_region);
+        let old_current = std::mem::replace(&mut self.current_region, new_current_region);
         self.current_region_index = new_index;
         self.file_len = new_file_len;
         self.next_hdr_pos = new_next_hdr;
+        if let Some(prefault) = &self.prefault {
+            let wp = &self.channel_header().write_position as *const AtomicU64;
+            prefault.rolled(
+                prefault::Position {
+                    sequence: self.file_sequence,
+                    file: &self.file,
+                    file_len: self.file_len,
+                    region: &mut self.current_region,
+                    index: self.current_region_index,
+                    // Safety: `channel_region` is handed to the prefaulter before it is dropped.
+                    write_position: unsafe { &*wp },
+                },
+                [old_channel, old_current],
+            );
+        } else {
+            self.held.clear();
+        }
 
         // Retention: best-effort. The roll itself has already
         // committed (Roll marker is released, NEW is on disk, `self`
@@ -1628,7 +1693,12 @@ impl Writer {
         {
             let prune_seq = next_seq - n;
             if let Ok(prune_path) = make_channel_file_path(&self.base_path, prune_seq) {
-                let _ = std::fs::remove_file(&prune_path);
+                match &self.prefault {
+                    Some(prefault) => prefault.unlink(prune_path),
+                    None => {
+                        let _ = std::fs::remove_file(&prune_path);
+                    }
+                }
             }
         }
 
@@ -1729,36 +1799,59 @@ impl Writer {
     #[inline]
     fn start_prefault(&mut self) -> io::Result<()> {
         let wp = &self.channel_header().write_position as *const AtomicU64;
-        // Safety: the header outlives the prefaulter, which is dropped first.
+        let regions_per_file = match self.file_roll_size {
+            0 => None,
+            roll => Some(preallocation_len(self.region_size, roll)? / self.region_size as u64),
+        };
+        let spec = (self.file_roll_size > 0).then(|| prefault::SegmentSpec {
+            base_path: self.base_path.clone(),
+            file_roll_size: self.file_roll_size,
+            mtu: self.mtu,
+            channel_name: self.channel_name,
+            generation: self.channel_header().generation,
+        });
         let prefaulter = prefault::Prefaulter::start(
-            &self.file,
-            self.file_len,
+            prefault::Position {
+                sequence: self.file_sequence,
+                file: &self.file,
+                file_len: self.file_len,
+                region: &mut self.current_region,
+                index: self.current_region_index,
+                // Safety: the header outlives the prefaulter, which is dropped first.
+                write_position: unsafe { &*wp },
+            },
             self.region_size,
-            &mut self.current_region,
-            self.current_region_index,
-            unsafe { &*wp },
-            self.prefault_core,
+            regions_per_file,
+            spec,
+            self.unmap,
+            self.helper.unwrap_or(Helper::inherit()),
         )?;
         self.prefault = Some(prefaulter);
         Ok(())
     }
 
-    /// Why the prefault thread stopped, if it did: an OS error from `madvise`, such as `EINVAL`
-    /// on a kernel older than 5.14. The writer carries on mapping and faulting its own regions.
-    pub fn prefault_error(&self) -> Option<io::Error> {
-        let errno = self.prefault.as_ref()?.shared.failed.load(Ordering::Acquire);
-        (errno != 0).then(|| io::Error::from_raw_os_error(errno))
+    /// Why the helper thread stopped, if it did: an OS error, such as `EINVAL` from `madvise` on
+    /// a kernel older than 5.14, or a panic. The writer then carries on as it does without a
+    /// helper: it maps, faults and unmaps its own regions and deletes the segments retention
+    /// drops, those it handed over before it noticed included.
+    pub fn helper_error(&self) -> Option<io::Error> {
+        self.prefault.as_ref()?.shared.failure.error()
     }
 
     /// The writable mapping of region `index`: the one prepared ahead if there is one.
     fn region_at(&mut self, index: u64) -> io::Result<RegionMapping<Writable>> {
         let needed_end = (index + 1) * self.region_size as u64;
-        if let Some(region) = self.prefault.as_ref().and_then(|p| p.take(index)) {
+        let sequence = self.file_sequence;
+        if let Some(region) = self.prefault.as_ref().and_then(|p| p.take(sequence, index)) {
             self.file_len = self.file_len.max(needed_end);
             return Ok(region);
         }
         self.ensure_len(needed_end)?;
-        RegionMapping::create_writable(&self.file, index * self.region_size as u64, self.region_size)
+        RegionMapping::create_writable(
+            &self.file,
+            index * self.region_size as u64,
+            self.region_size,
+        )
     }
 
     fn switch_region(&mut self, region: RegionMapping<Writable>, index: u64) {
@@ -1766,18 +1859,25 @@ impl Writer {
         self.current_region_index = index;
         if let Some(prefault) = &self.prefault {
             prefault.moved(&mut self.current_region, index, left);
+        } else if self.unmap == Unmap::AtFileRoll {
+            self.held.push(left);
         }
     }
 
     fn ensure_len(&mut self, want: u64) -> io::Result<()> {
         if let Some(prefault) = &self.prefault {
-            let mut len = prefault.shared.file_len.lock().unwrap_or_else(|e| e.into_inner());
-            if want > *len {
-                self.file.set_len(want)?;
-                *len = want;
+            let mut segment = prefault::lock(&prefault.shared.segment);
+            // Through the helper's handle only while it is on this segment: one it could not
+            // open at the roll is grown here, as without a helper. Growing the old one instead
+            // would leave this file short of the region the writer maps next.
+            if segment.sequence == self.file_sequence {
+                if want > segment.len {
+                    segment.file.set_len(want)?;
+                    segment.len = want;
+                }
+                self.file_len = self.file_len.max(segment.len);
+                return Ok(());
             }
-            self.file_len = self.file_len.max(*len);
-            return Ok(());
         }
         if want > self.file_len {
             // ftruncate to grow before any mmap touches those pages.
@@ -2076,6 +2176,11 @@ impl<'a> MessageBatch<'a> {
 }
 
 pub struct Reader {
+    map_ahead: Option<map_ahead::MapAhead>,
+    helper: Option<Helper>,
+    unmap: Unmap,
+    /// Regions of the current segment read past and kept mapped until the roll (`AtFileRoll`).
+    held: Vec<Arc<MappedRegion>>,
     base_path: PathBuf,
     file_sequence: u64,
     file: File,
@@ -2501,6 +2606,10 @@ impl Reader {
         }));
 
         Ok(Self {
+            map_ahead: None,
+            helper: None,
+            unmap: Unmap::Immediate,
+            held: Vec::new(),
             base_path,
             file_sequence: sequence,
             file,
@@ -2595,6 +2704,10 @@ impl Reader {
     fn reopen(&mut self, mode: ReaderMode) -> io::Result<()> {
         let mut fresh = Self::open_with(&self.base_path, mode, Some(self.generation_cached))?;
         fresh.batch_limit = self.batch_limit;
+        fresh.unmap = self.unmap;
+        fresh.held.reserve(self.held.capacity());
+        fresh.helper = self.helper;
+        fresh.start_map_ahead()?;
         *self = fresh;
         Ok(())
     }
@@ -2716,16 +2829,93 @@ impl Reader {
             }
         }
 
-        let region_size = self.region_size();
         let file = scan_file.unwrap_or(&self.file);
-        let map =
-            RegionMapping::create_read_only(file, region_idx * region_size as u64, region_size)?;
+        let map = self.map_region(file, scan_file_sequence, region_idx)?;
         self.maps.push(Arc::new(MappedRegion {
             file_sequence: scan_file_sequence,
             region_idx,
             mapping: map,
         }));
         Ok(())
+    }
+
+    fn map_region(
+        &self,
+        file: &File,
+        file_sequence: u64,
+        region_idx: u64,
+    ) -> io::Result<RegionMapping<ReadOnly>> {
+        let region_size = self.region_size();
+        let map = match self
+            .map_ahead
+            .as_ref()
+            .and_then(|a| a.take(file_sequence, region_idx))
+        {
+            Some(map) => map,
+            None => {
+                RegionMapping::create_read_only(file, region_idx * region_size as u64, region_size)?
+            }
+        };
+        if let Some(ahead) = &self.map_ahead {
+            ahead.moved(file_sequence, region_idx);
+        }
+        Ok(map)
+    }
+
+    fn start_map_ahead(&mut self) -> io::Result<()> {
+        let Some(helper) = self.helper else {
+            return Ok(());
+        };
+        let region_idx = self.current_map().map_or(0, |m| m.region_idx);
+        self.map_ahead = Some(map_ahead::MapAhead::start(
+            helper,
+            self.base_path.clone(),
+            &self.file,
+            self.file_sequence,
+            region_idx,
+            self.region_size(),
+        )?);
+        Ok(())
+    }
+
+    /// Why the helper thread stopped, if it did: an OS error, such as `EINVAL` from `madvise` on
+    /// a kernel older than 5.14, or a panic. The reader then carries on as it does without a
+    /// helper: it maps, faults and unmaps its own regions.
+    pub fn helper_error(&self) -> Option<io::Error> {
+        self.map_ahead.as_ref()?.shared.failure.error()
+    }
+
+    /// Release regions the reader has left: to the helper, or kept until the roll under
+    /// `Unmap::AtFileRoll` while they belong to the segment being read.
+    fn retire(&mut self, region: Arc<MappedRegion>) {
+        if self.unmap == Unmap::AtFileRoll && region.file_sequence == self.file_sequence {
+            self.held.push(region);
+        } else if let Some(ahead) = &self.map_ahead {
+            ahead.retire([map_ahead::Retired::Region(region)]);
+        }
+    }
+
+    /// Keep only the last mapping, as the first.
+    fn retire_all_but_last(&mut self) {
+        let last = self.maps.len() - 1;
+        self.maps.swap(0, last);
+        while self.maps.len() > 1 {
+            let region = self.maps.pop().expect("more than one mapping");
+            self.retire(region);
+        }
+    }
+
+    /// The reader moved into a new segment: release what it held of the old ones.
+    fn rolled(&mut self, opened_ahead: bool, old_file: File, old_header: RegionMapping<ReadOnly>) {
+        if let Some(ahead) = &self.map_ahead {
+            ahead.rolled(self.file_sequence, (!opened_ahead).then_some(&self.file));
+            ahead.retire(self.held.drain(..).map(map_ahead::Retired::Region).chain([
+                map_ahead::Retired::File(old_file),
+                map_ahead::Retired::Header(old_header),
+            ]));
+        } else {
+            self.held.clear();
+        }
     }
 
     fn prune_to_current(&mut self) {
@@ -2739,10 +2929,7 @@ impl Reader {
             panic!("current map does not match reader position");
         }
         if self.maps.len() > 1 {
-            let first = 0;
-            let last = self.maps.len() - 1;
-            self.maps.swap(first, last);
-            self.maps.truncate(1);
+            self.retire_all_but_last();
         }
     }
 
@@ -2786,12 +2973,13 @@ impl Reader {
         self.position = end.position;
         self.file_sequence = end.file_sequence;
         if let Some(rolled) = end.rolled {
-            self.file = rolled.file;
-            self.header = rolled.header;
+            let old_file = std::mem::replace(&mut self.file, rolled.file);
+            let old_header = std::mem::replace(&mut self.header, rolled.header);
             self.wake_untrusted = false;
             self.wake_miss = None;
             self.channel_name_cached = rolled.channel_name;
             self.base_record_index_cached = rolled.base_record_index;
+            self.rolled(rolled.opened_ahead, old_file, old_header);
         }
 
         if self.batch_pos.is_empty() {
@@ -2885,7 +3073,7 @@ impl Reader {
                     HeaderType::Roll => {
                         // Switch to the next file and continue scanning from its start, with
                         // the same continuity checks a single-record roll makes.
-                        let prev = rolled.as_ref().map_or(&self.file, |r| &r.file);
+                        let prev = rolled.as_ref().map_or(&self.header, |r| &r.header);
                         let next = match self.open_successor(prev, scan_file_sequence + 1) {
                             Ok(next) => next,
                             // Hand over what was collected before the Roll, as single reads
@@ -2909,6 +3097,7 @@ impl Reader {
                             mapping: next.region0,
                         }));
                         rolled = Some(BatchRoll {
+                            opened_ahead: next.opened_ahead,
                             file: next.file,
                             header: next.header,
                             channel_name: next.channel_name,
@@ -3449,9 +3638,7 @@ impl Reader {
         {
             return Ok(());
         }
-        let region_size = self.region_size();
-        let new_map =
-            RegionMapping::create_read_only(&self.file, idx * region_size as u64, region_size)?;
+        let new_map = self.map_region(&self.file, self.file_sequence, idx)?;
         self.maps.push(Arc::new(MappedRegion {
             file_sequence: self.file_sequence,
             region_idx: idx,
@@ -3467,7 +3654,7 @@ impl Reader {
     /// `open_successor` refusing it — leaves the reader exactly where it was, so the error can
     /// be returned again, or the same call retried once the segment appears.
     fn open_next_file(&mut self) -> io::Result<()> {
-        let next = self.open_successor(&self.file, self.file_sequence + 1)?;
+        let next = self.open_successor(&self.header, self.file_sequence + 1)?;
 
         // Past the last fallible step: commit the new segment in one go.
         self.file_sequence = next.sequence;
@@ -3479,41 +3666,59 @@ impl Reader {
         // The on-disk numbering is authoritative; it equals the count carried so far unless a
         // segment was written by a pre-fix writer that lost a record's count in crash recovery.
         self.position = next.base_record_index;
-        self.file = next.file;
-        self.header = next.header;
+        let old_file = std::mem::replace(&mut self.file, next.file);
+        let old_header = std::mem::replace(&mut self.header, next.header);
         self.wake_untrusted = false;
         self.wake_miss = None;
         self.read_position = 0;
-        self.maps.clear();
         self.maps.push(Arc::new(MappedRegion {
             file_sequence: next.sequence,
             region_idx: 0,
             mapping: next.region0,
         }));
+        self.retire_all_but_last();
+        self.rolled(next.opened_ahead, old_file, old_header);
         Ok(())
     }
 
     /// Open and validate segment `next_sequence`, the successor of the segment open as `prev`.
     /// Touches nothing on `self`; both the single-record roll and the batch scan commit the
     /// result themselves.
-    fn open_successor(&self, prev: &File, next_sequence: u64) -> io::Result<Successor> {
+    fn open_successor(
+        &self,
+        prev_header: &RegionMapping<ReadOnly>,
+        next_sequence: u64,
+    ) -> io::Result<Successor> {
         // The absolute index the next segment must begin at, computed from the one we are
         // leaving: a roll stamps the new file's base as the old file's `base + message_count`.
-        // Read from the file we still hold open, so this works even after retention unlinked
+        // Read from the page we still hold mapped, so this works even after retention unlinked
         // it (readers finish a pruned file through their inode reference).
         let expected_base = {
-            let map = RegionMapping::create_read_only(prev, 0, region::page_size())?;
-            let ch = get_channel_header(map.as_ptr());
+            let ch = get_channel_header(prev_header.as_ptr());
             ch.base_record_index + ch.message_count.load(Ordering::Acquire)
         };
         let file_path = make_channel_file_path(&self.base_path, next_sequence)?;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(false)
-            .open(&file_path)?;
-
         let region_size = self.region_size();
-        let region0 = RegionMapping::create_read_only(&file, 0, region_size)?;
+        let ahead = self
+            .map_ahead
+            .as_ref()
+            .and_then(|a| a.take_segment(next_sequence));
+        let (file, region0, header, opened_ahead) = match ahead {
+            Some(next) if next.is_at(&file_path) => {
+                (next.file, next.region0, Some(next.header), true)
+            }
+            stale => {
+                if let (Some(stale), Some(ahead)) = (stale, &self.map_ahead) {
+                    ahead.retire([map_ahead::Retired::Segment(stale)]);
+                }
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(false)
+                    .open(&file_path)?;
+                let region0 = RegionMapping::create_read_only(&file, 0, region_size)?;
+                (file, region0, None, false)
+            }
+        };
         let mh = unsafe { &*(region0.as_ptr() as *const MessageHeader) };
         if mh.parsed_header_type()? != HeaderType::Channel {
             return Err(err_other("next file missing Channel header"));
@@ -3546,9 +3751,13 @@ impl Reader {
         }
         let channel_name = ch.channel_name;
         let base_record_index = ch.base_record_index;
-        let header = RegionMapping::create_read_only(&file, 0, region::page_size())?;
+        let header = match header {
+            Some(header) => header,
+            None => RegionMapping::create_read_only(&file, 0, region::page_size())?,
+        };
         Ok(Successor {
             sequence: next_sequence,
+            opened_ahead,
             file,
             region0,
             header,
@@ -3568,6 +3777,7 @@ struct BatchEnd {
 }
 
 struct BatchRoll {
+    opened_ahead: bool,
     file: File,
     header: RegionMapping<ReadOnly>,
     channel_name: [u8; CHANNEL_NAME_MAX],
@@ -3577,6 +3787,8 @@ struct BatchRoll {
 /// A validated next segment, opened but not yet committed to the reader.
 struct Successor {
     sequence: u64,
+    /// The helper opened it ahead of the roll.
+    opened_ahead: bool,
     file: File,
     region0: RegionMapping<ReadOnly>,
     /// Page 0, kept for the wake flag and word.
@@ -7593,6 +7805,246 @@ mod tests {
         // A second miss on the same value: nobody is waking.
         r.distrust_flag_if_unwoken(0, bumped);
         assert!(r.wake_untrusted, "the word never moved: nobody is waking");
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    // ---------- helpers that stop early ----------
+
+    /// `Writer` and `Reader` keep the auto traits they had before they could own a helper thread:
+    /// losing one breaks code that names it, such as a `catch_unwind` over a writer.
+    #[test]
+    fn writer_and_reader_keep_their_auto_traits() {
+        fn assert_auto<T: Send + Sync + std::panic::UnwindSafe + std::panic::RefUnwindSafe>() {}
+        assert_auto::<Writer>();
+        assert_auto::<Reader>();
+    }
+
+    /// Segment files of channel `base` on disk, `.partial` ones included.
+    #[cfg(target_os = "linux")]
+    fn segment_files(base: &str) -> usize {
+        std::fs::read_dir(".")
+            .unwrap()
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .filter(|n| n == base || n.starts_with(&format!("{base}.")))
+            .count()
+    }
+
+    /// Live mappings of channel `base`'s segments in this process, unlinked ones included.
+    #[cfg(target_os = "linux")]
+    fn segment_mappings(base: &str) -> usize {
+        let path = std::env::current_dir().unwrap().join(base);
+        let path = path.to_str().unwrap();
+        std::fs::read_to_string("/proc/self/maps")
+            .unwrap()
+            .lines()
+            .filter_map(|line| line.split_once('/').map(|(_, p)| format!("/{p}")))
+            .filter(|p| p == path || p.starts_with(&format!("{path}.")))
+            .count()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn until(mut done: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if done() {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        false
+    }
+
+    /// A writer whose helper stopped carries on as without one: it unmaps the regions it leaves
+    /// and retention deletes segments, instead of queuing both for a thread that is gone.
+    #[cfg(target_os = "linux")]
+    fn writer_outlives_its_helper(base: &str, stop: impl Fn(&Writer)) -> anyhow::Result<Writer> {
+        cleanup_channel_files(base);
+        let mut w = WriterBuilder::new(base)
+            .region_size(page_size() * 16)
+            .file_roll_size(page_size() as u64 * 64)
+            .keep_files(2)
+            .helper(Helper::inherit())
+            .build()?;
+        stop(&w);
+        assert!(until(|| w.helper_error().is_some()), "the helper stopped");
+        for i in 0..50_000u64 {
+            w.try_reserve(96)?[..8].copy_from_slice(&i.to_le_bytes());
+            w.commit(0, 96, i)?;
+        }
+        assert!(w.file_sequence > 10, "rolled many times");
+        let (files, maps) = (segment_files(base), segment_mappings(base));
+        assert!(
+            files <= 3,
+            "{files} segment files on disk: retention stopped"
+        );
+        assert!(
+            maps <= 4,
+            "{maps} segment mappings: regions left are not unmapped"
+        );
+        Ok(w)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_writer_whose_helper_fails_unmaps_and_deletes_for_itself() -> anyhow::Result<()> {
+        let base = "test_writer_helper_fails";
+        let w = writer_outlives_its_helper(base, |w| {
+            w.prefault.as_ref().unwrap().shared.inject.error()
+        })?;
+        let e = w.helper_error().expect("stopped");
+        assert_eq!(e.raw_os_error(), Some(libc::EINVAL), "{e}");
+        drop(w);
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_writer_whose_helper_panics_reports_it_and_carries_on() -> anyhow::Result<()> {
+        let base = "test_writer_helper_panics";
+        let w = writer_outlives_its_helper(base, |w| {
+            w.prefault.as_ref().unwrap().shared.inject.panic()
+        })?;
+        let e = w.helper_error().expect("stopped");
+        assert_eq!(e.kind(), ErrorKind::Other);
+        assert!(e.to_string().contains("panicked"), "{e}");
+        drop(w);
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// The reader's side of the same: once its helper stopped, it unmaps what it leaves itself.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_reader_whose_helper_fails_unmaps_for_itself() -> anyhow::Result<()> {
+        let base = "test_reader_helper_fails";
+        cleanup_channel_files(base);
+        {
+            let mut w = WriterBuilder::new(base)
+                .region_size(page_size() * 16)
+                .file_roll_size(page_size() as u64 * 64)
+                .build()?;
+            for i in 0..50_000u64 {
+                w.try_reserve(96)?[..8].copy_from_slice(&i.to_le_bytes());
+                w.commit(0, 96, i)?;
+            }
+        }
+        let mut r = ReaderBuilder::new(base)
+            .late_join()
+            .helper(Helper::inherit())
+            .build()?;
+        r.map_ahead.as_ref().unwrap().shared.inject.error();
+        assert!(until(|| r.helper_error().is_some()), "the helper stopped");
+        let mut read = 0u64;
+        while let Some(m) = r.try_read()? {
+            assert_eq!(m.header().user_meta_u64, read);
+            read += 1;
+        }
+        assert_eq!(read, 50_000);
+        let maps = segment_mappings(base);
+        assert!(
+            maps <= 4,
+            "{maps} segment mappings: regions left are not unmapped"
+        );
+        assert_eq!(
+            r.helper_error().and_then(|e| e.raw_os_error()),
+            Some(libc::EINVAL)
+        );
+        drop(r);
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// Read every record of channel `base` from its first segment.
+    #[cfg(target_os = "linux")]
+    fn records_in(base: &str) -> io::Result<u64> {
+        let mut r = ReaderBuilder::new(base).late_join().build()?;
+        let mut read = 0u64;
+        while let Some(m) = r.try_read()? {
+            assert_eq!(m.header().user_meta_u64, read);
+            read += 1;
+        }
+        Ok(read)
+    }
+
+    /// If the helper cannot open the segment the writer rolls to (out of file descriptors), the
+    /// writer grows that segment itself. It used to grow the old one through the helper's
+    /// handle instead: the old file swelled to the new one's size, and the writer's idea of the
+    /// new file's length was the old one's.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_writer_grows_a_segment_its_helper_could_not_open() -> anyhow::Result<()> {
+        let base = "test_helper_clone_fails";
+        cleanup_channel_files(base);
+        let mut w = WriterBuilder::new(base)
+            .region_size(page_size() * 16)
+            .helper(Helper::inherit())
+            .build()?;
+        let shared = w.prefault.as_ref().unwrap().shared.clone();
+        shared.fail_clone.store(true, Ordering::Release);
+        w.roll_file()?; // not rolling by size: the new segment starts one region long
+        let old = make_channel_file_path(Path::new(base), 0)?;
+        let old_len = std::fs::metadata(&old)?.len();
+        for i in 0..20_000u64 {
+            w.try_reserve(96)?[..8].copy_from_slice(&i.to_le_bytes());
+            w.commit(0, 96, i)?;
+        }
+        let new_len = std::fs::metadata(make_channel_file_path(Path::new(base), 1)?)?.len();
+        assert_eq!(
+            std::fs::metadata(&old)?.len(),
+            old_len,
+            "the old segment is left alone"
+        );
+        assert!(
+            new_len > 30 * page_size() as u64 * 16,
+            "the new one grew: {new_len}"
+        );
+        assert_eq!(w.file_len, new_len, "the writer knows the new one's length");
+        assert!(w.helper_error().is_none(), "the helper carries on");
+        drop(w);
+        assert_eq!(records_in(base)?, 20_000);
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// A next segment the helper cannot create (no space, no permission) is tried once, leaves
+    /// no `.partial` behind, and is created by the writer at the roll, instead of being retried
+    /// on every 50 µs pass until then.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_segment_the_helper_cannot_create_is_tried_once() -> anyhow::Result<()> {
+        let base = "test_helper_prepare_fails";
+        cleanup_channel_files(base);
+        let mut w = WriterBuilder::new(base)
+            .region_size(page_size() * 16)
+            .file_roll_size(page_size() as u64 * 64)
+            .helper(Helper::inherit())
+            .build()?;
+        let shared = w.prefault.as_ref().unwrap().shared.clone();
+        shared.fail_prepare.store(true, Ordering::Release);
+        for i in 0..20_000u64 {
+            w.try_reserve(96)?[..8].copy_from_slice(&i.to_le_bytes());
+            w.commit(0, 96, i)?;
+            if i % 200 == 199 {
+                thread::sleep(Duration::from_millis(1)); // let the helper make its passes
+            }
+        }
+        let rolls = w.file_sequence;
+        let attempts = shared.prepare_attempts.load(Ordering::Relaxed);
+        assert!(rolls >= 5, "rolled {rolls} times");
+        assert!(
+            (1..=rolls + 1).contains(&attempts),
+            "{attempts} attempts at creating segments ahead over {rolls} rolls"
+        );
+        let partials = std::fs::read_dir(".")?
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .filter(|n| n.starts_with(base) && n.ends_with(PARTIAL_SUFFIX))
+            .count();
+        assert_eq!(partials, 0, "a failed attempt leaves no .partial");
+        assert!(w.helper_error().is_none(), "the helper carries on");
+        drop(w);
+        assert_eq!(records_in(base)?, 20_000);
         cleanup_channel_files(base);
         Ok(())
     }

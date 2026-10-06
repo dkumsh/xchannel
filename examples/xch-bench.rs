@@ -17,7 +17,7 @@ mod bench {
     use std::io;
     use std::path::PathBuf;
 
-    use xchannel::{Reader, ReaderBuilder, ReaderMode, WriterBuilder, page_size};
+    use xchannel::{Helper, Reader, ReaderBuilder, ReaderMode, Unmap, WriterBuilder, page_size};
 
     #[derive(Debug, Clone, Copy, ValueEnum)]
     enum StartMode {
@@ -105,9 +105,17 @@ mod bench {
         #[arg(long = "keep-files", default_value = "0")]
         keep_files: u64,
 
-        /// Writer-only: keep pages faulted in ahead of the writer (WriterBuilder::prefault).
-        #[arg(long = "prefault", action = ArgAction::SetTrue)]
-        prefault: bool,
+        /// Run the writer's helper thread on this core (WriterBuilder::helper).
+        #[arg(long = "writer-helper-core")]
+        writer_helper_core: Option<usize>,
+
+        /// Run the reader's helper thread on this core (ReaderBuilder::helper).
+        #[arg(long = "reader-helper-core")]
+        reader_helper_core: Option<usize>,
+
+        /// Keep regions mapped until the file roll (Unmap::AtFileRoll), writer or reader.
+        #[arg(long = "unmap-at-roll", action = ArgAction::SetTrue)]
+        unmap_at_roll: bool,
 
         /// Print extra diagnostics to stderr.
         #[arg(long = "verbose", action = ArgAction::SetTrue)]
@@ -250,7 +258,12 @@ mod bench {
             .region_size(region_size)
             .file_roll_size(roll_size)
             .mtu(mtu);
-        wb = wb.prefault(opt.prefault);
+        if let Some(core) = opt.writer_helper_core {
+            wb = wb.helper(Helper::on_core(core));
+        }
+        if opt.unmap_at_roll {
+            wb = wb.unmap(Unmap::AtFileRoll);
+        }
         if opt.keep_files > 0 {
             wb = wb.keep_files(opt.keep_files);
         }
@@ -326,7 +339,14 @@ mod bench {
             StartMode::Live => ReaderMode::Live,
             StartMode::Latejoin => ReaderMode::LateJoin,
         };
-        let mut reader = ReaderBuilder::new(&opt.file).mode(mode).build()?;
+        let mut rb = ReaderBuilder::new(&opt.file).mode(mode);
+        if let Some(core) = opt.reader_helper_core {
+            rb = rb.helper(Helper::on_core(core));
+        }
+        if opt.unmap_at_roll {
+            rb = rb.unmap(Unmap::AtFileRoll);
+        }
+        let mut reader = rb.build()?;
 
         if opt.verbose {
             eprintln!(
