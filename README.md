@@ -1090,6 +1090,65 @@ What it costs and buys, measured with `examples/futex-wake.rs`:
 The design, the alternatives considered and the measurements are in
 [`doc/waking-a-reader.md`](doc/waking-a-reader.md).
 
+### Helper threads
+
+```
+a background thread maps, faults in and unmaps, so the hot thread never does
+```
+
+A segment is a sparse file mapped one region at a time. Left to itself, the
+writer faults on the first write to every page, and at each region boundary
+both sides map the next region and unmap the last. Unmapping a large region
+holds the process's memory-map lock for milliseconds, and any page fault on
+another thread of the process waits for it. A pinned hot thread can hand all
+of that to a helper on another core:
+
+```rust
+use xchannel::{Helper, Unmap};
+
+let mut writer = WriterBuilder::new(path)
+    .helper(Helper::on_core(12))
+    .unmap(Unmap::AtFileRoll)
+    .build()?;
+
+// elsewhere, in a reader process
+let mut reader = ReaderBuilder::new(path)
+    .live()
+    .helper(Helper::on_core(12))
+    .unmap(Unmap::AtFileRoll)
+    .build()?;
+```
+
+- **The writer's helper** keeps the pages just ahead of the writer faulted
+  in, maps the next region before the writer reaches it, and near the end of
+  a segment creates the next one under its `.partial` name, so a roll only
+  stamps and renames it. It also deletes the segments `keep_files` drops.
+- **The reader's helper** maps and faults in the next region, and opens the
+  next segment ahead of the roll.
+- **`Unmap::AtFileRoll`** keeps the regions moved past mapped until the
+  segment rolls, so nothing is unmapped mid-segment.
+- **Name the core.** A thread inherits the CPU mask of the thread that
+  spawns it: a helper built from a thread pinned to an isolated core would
+  share it. `Helper::inherit()` says so on purpose. `build` fails if the
+  helper cannot run on the core named.
+
+Measured on the tuned server with 64 MB regions, 96-byte records at
+10K msg/s for 5 minutes, writer and reader on their own cores and both
+helpers on a third:
+
+| | p99 | p99.9 | reads over 50 µs | max |
+|---|---:|---:|---:|---:|
+| no helpers | 4.4 µs | 6.4 µs | 994 | 2.8 ms |
+| both helpers, `Unmap::AtFileRoll` | 393 ns | 597 ns | 5 | 113 µs |
+
+A roll still renames the new segment on the writer's thread, tens of
+microseconds once per segment.
+
+The helpers are Linux only and need kernel 5.14+ for `MADV_POPULATE_*`. On
+an older kernel a helper stops at once, `helper_error()` says why, and the
+writer or reader works as it does without one. Elsewhere `helper` is
+accepted and does nothing; `unmap` works on every platform.
+
 ---
 
 # Rolling files
@@ -1106,8 +1165,8 @@ demo.xch.2
 
 Process:
 
-1. writer writes **Roll marker**
-2. creates next file
+1. writer creates the next file under a `.partial` name (ahead of time, with a helper)
+2. writer writes the **Roll marker**, renames the next file into place, and commits the marker
 3. readers follow automatically
 
 ---

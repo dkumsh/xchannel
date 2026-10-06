@@ -1,12 +1,14 @@
 # Changelog
 
-## Unreleased
+## 6.3.0 (2026-10-06)
 
 Writers and readers can hand their mapping work to a helper thread, so the hot thread never
 faults in a fresh page, maps or unmaps a region, or creates, opens or deletes a segment. **No
 format break and no API break:** both are opt-in builder settings, off by default; code built
-against 6.2 compiles and behaves unchanged. Linux only (5.14+); elsewhere the settings are
-accepted and do nothing.
+against 6.2 compiles and behaves unchanged. The helpers are Linux only and need 5.14+ for
+`MADV_POPULATE_*`: on an older kernel a helper stops at once, `helper_error()` says why, and the
+writer or reader works as it does without one. Elsewhere `helper` is accepted and does nothing;
+`unmap` works on every platform.
 
 Measured on a latency-tuned server, 96-byte records at 10K msg/s for 5 minutes, 64 MB regions,
 writer and reader pinned to their own cores and both helpers on a third, `Unmap::AtFileRoll` on
@@ -31,15 +33,19 @@ the new segment on the writer's thread, tens of microseconds once per segment.
   validates it as before.
 - **`Helper::on_core(n)` / `Helper::inherit()`** — where the helper runs. A thread inherits the
   CPU mask of the thread that spawns it, so a helper started from a pinned hot thread would share
-  its core; there is deliberately no default.
+  its core; there is deliberately no default. `build` fails if the helper cannot be pinned to the
+  core named: one the process may not run on, or one past the highest the OS can name.
 - **`WriterBuilder::unmap(Unmap)` / `ReaderBuilder::unmap(Unmap)`** — `Unmap::AtFileRoll` keeps
   the regions moved past mapped until the file rolls, instead of releasing each one as it is left
   (`Unmap::Immediate`, the default). Unmapping takes the process's memory-map lock and flushes
   the TLB on every core running the process, from whichever thread does it: a 64 MB region took
   1–20 ms, and a page fault or `mmap` on the hot thread waited for it. Helpers now drop a
   mapping's page tables with `MADV_DONTNEED`, which leaves faults running, before unmapping it.
-- **`Writer::helper_error()` / `Reader::helper_error()`** — why a helper stopped, if it did. The
-  writer or reader then maps its own regions as before.
+  `Unmap` is `#[non_exhaustive]`, so policies can be added later.
+- **`Writer::helper_error()` / `Reader::helper_error()`** — why a helper stopped early, if it
+  did: an OS error, such as `EINVAL` from `madvise` before Linux 5.14, or a panic. The writer or
+  reader then works as it does without a helper: it maps and unmaps its own regions, and the
+  writer deletes the segments `keep_files` drops, those it had already handed over included.
 
 ## 6.2.0 (2026-10-03)
 
