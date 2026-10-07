@@ -1149,7 +1149,16 @@ on the writer or the reader (`examples/roll-syscalls.rs` traces it; with
 `wake_readers` the writer makes its one futex wake). Without a helper, or when
 it falls behind, the hot thread prepares, opens and maps it itself, as before.
 
-_Roll measurements pending (server run in progress)._
+Measured on the tuned server against 6.3.0, both with helpers, 8 MB files,
+96-byte records, 500 rolls at 500K msg/s (three rounds) and 200 at 100K msg/s;
+reader latency is from each record's scheduled send:
+
+| | 6.3.0 | 7.0.0 |
+|---|---:|---:|
+| writer roll, median | 50–54 µs | 2.0–3.0 µs |
+| writer roll, p99 | 57–127 µs | 3.3–5.9 µs |
+| reader, the 64 records after a roll, p99 | 52–54 µs | 3.1–4.3 µs |
+| reader, other records, median | 0.31 µs | 0.30 µs |
 
 The helpers are Linux only and need kernel 5.14+ for `MADV_POPULATE_*`. On
 an older kernel a helper stops at once, `helper_error()` says why, and the

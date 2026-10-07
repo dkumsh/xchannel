@@ -9,7 +9,13 @@ opened ahead without a `stat`. When both helpers have the next file ready, a rol
 call on the writer or the reader. **Format break:** files are `format_version = 4`; v3 files are
 refused. The Rust API is unchanged apart from one addition.
 
-_Roll measurements pending (server run in progress)._
+Measured on the latency-tuned server against 6.3.0 with the same helpers (writer, reader and both
+helpers on three isolated cores of one socket), 8 MB files, 96-byte records, three alternating
+rounds of 500 rolls at 500K msg/s and one of 200 rolls at 100K msg/s: the writer's roll takes
+2.0–3.0 µs median and 3.3–5.9 µs at p99, against 50–54 µs and 57–127 µs. The 64 records after each
+roll, timed from their scheduled send, reach the reader at p99 3.1–4.3 µs, against 52–54 µs.
+Every other record costs the same in both: writer p50 0.12 µs, reader p50 0.30 µs. Both versions
+also show a rare 180–220 µs event unrelated to rolls.
 
 ### Migration
 - **6.x and 7.0 cannot read each other's files.** Upgrade a channel's writer and all its readers

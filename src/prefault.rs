@@ -755,7 +755,8 @@ fn map_header(shared: &Shared, sequence: u64) -> io::Result<Option<RegionMapping
 }
 
 /// [`populate`] a range of the writer's mappings, which it may have unmapped since: a range no
-/// longer mapped is skipped, not an error.
+/// longer mapped is skipped, not an error. One reused by another mapping meanwhile is prefaulted
+/// instead, which writes nothing and costs only the faults.
 fn populate_writers(at: *mut u8, len: usize) -> io::Result<()> {
     match populate(at, len) {
         Err(e) if matches!(e.raw_os_error(), Some(libc::ENOMEM) | Some(libc::EFAULT)) => Ok(()),
