@@ -56,9 +56,35 @@ const CRC32C_TABLE: [u32; 256] = {
 };
 
 pub(crate) fn crc32c(bytes: &[u8]) -> u32 {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("sse4.2") {
+        // Safety: SSE4.2 is present.
+        return unsafe { crc32c_sse42(bytes) };
+    }
+    crc32c_table(bytes)
+}
+
+fn crc32c_table(bytes: &[u8]) -> u32 {
     let mut c = !0u32;
     for &b in bytes {
         c = CRC32C_TABLE[((c ^ b as u32) & 0xFF) as usize] ^ (c >> 8);
+    }
+    !c
+}
+
+/// The same CRC with the `crc32` instruction: no table to miss in cache.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse4.2")]
+unsafe fn crc32c_sse42(bytes: &[u8]) -> u32 {
+    use std::arch::x86_64::{_mm_crc32_u8, _mm_crc32_u64};
+    let mut c = !0u64;
+    let mut words = bytes.chunks_exact(8);
+    for w in &mut words {
+        c = _mm_crc32_u64(c, u64::from_le_bytes(w.try_into().expect("8 bytes")));
+    }
+    let mut c = c as u32;
+    for &b in words.remainder() {
+        c = _mm_crc32_u8(c, b);
     }
     !c
 }
@@ -413,6 +439,11 @@ mod tests {
     fn crc32c_matches_the_standard_check_value() {
         assert_eq!(crc32c(b"123456789"), 0xE306_9283);
         assert_eq!(crc32c(b""), 0);
+        assert_eq!(crc32c_table(b"123456789"), 0xE306_9283);
+        let bytes: Vec<u8> = (0..100u8).map(|b| b.wrapping_mul(37)).collect();
+        for len in 0..bytes.len() {
+            assert_eq!(crc32c(&bytes[..len]), crc32c_table(&bytes[..len]), "{len}");
+        }
     }
 
     #[test]

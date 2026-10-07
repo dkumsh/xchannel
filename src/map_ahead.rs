@@ -41,7 +41,7 @@ pub(crate) struct NextSegment {
     /// Region 0, ready to push onto the reader's maps.
     pub(crate) region0: Arc<MappedRegion>,
     pub(crate) header: RegionMapping<ReadOnly>,
-    /// Who the file says it is, which never changes once it is installed.
+    /// Who the file says it is, its header already validated; none of it changes.
     pub(crate) identity: Identity,
 }
 
@@ -290,9 +290,16 @@ fn open_next(shared: &Shared, sequence: u64) -> Option<NextSegment> {
         return None;
     }
     let region0 = RegionMapping::create_read_only(&file, 0, size).ok()?;
-    let identity = crate::validate_v4_prefix(region0.as_ptr()).ok()?;
+    let page0 = region0.as_ptr();
+    let mh = unsafe { &*(page0 as *const crate::MessageHeader) };
+    if mh.parsed_header_type().ok()? != crate::HeaderType::Channel {
+        return None;
+    }
+    crate::validate_channel_header(crate::get_channel_header(page0), size, sequence).ok()?;
+    let identity = crate::validate_v4_prefix(page0).ok()?;
     populate(&region0).ok()?;
     let header = RegionMapping::create_read_only(&file, 0, page_size()).ok()?;
+    populate(&header).ok()?;
     Some(NextSegment {
         sequence,
         file,

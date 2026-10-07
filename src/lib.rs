@@ -2348,6 +2348,8 @@ pub struct Reader {
     /// Page 0 of the segment being read, for its wake flag and wake word wherever the cursor
     /// is. Replaced at every roll.
     header: RegionMapping<ReadOnly>,
+    /// The segment's instance ID: the parent its successor must name.
+    instance: InstanceId,
     /// This segment's wake flag proved wrong: twice a capped sleep ran out with a record
     /// waiting and the word unmoved in between, so nobody is waking us (an older writer
     /// reopened the channel). Back off instead for the rest of the segment. Reset at every roll.
@@ -2734,7 +2736,7 @@ impl Reader {
         let ch = get_channel_header(page0.as_ptr());
         let region_size = ch.region_size as usize;
         validate_channel_header(ch, region_size, sequence)?;
-        validate_v4_prefix(page0.as_ptr())?;
+        let identity = validate_v4_prefix(page0.as_ptr())?;
         if !is_published(page0.as_ptr())? {
             return Err(io::Error::new(
                 ErrorKind::NotFound,
@@ -2788,6 +2790,7 @@ impl Reader {
             batch_pos: Vec::with_capacity(DEFAULT_BATCH_POS_CAP),
             maps,
             header: page0,
+            instance: identity.instance,
             wake_untrusted: false,
             wake_miss: None,
             #[cfg(test)]
@@ -3138,6 +3141,7 @@ impl Reader {
         if let Some(rolled) = end.rolled {
             let old_file = std::mem::replace(&mut self.file, rolled.file);
             let old_header = std::mem::replace(&mut self.header, rolled.header);
+            self.instance = rolled.instance;
             self.wake_untrusted = false;
             self.wake_miss = None;
             self.channel_name_cached = rolled.channel_name;
@@ -3236,11 +3240,14 @@ impl Reader {
                     HeaderType::Roll => {
                         // Switch to the next file and continue scanning from its start, with
                         // the same continuity checks a single-record roll makes.
-                        let prev = rolled.as_ref().map_or(&self.header, |r| &r.header);
+                        let (prev, prev_instance) = rolled
+                            .as_ref()
+                            .map_or((&self.header, self.instance), |r| (&r.header, r.instance));
                         let next = match self
                             .roll_edge(map_idx, cursor_off, hdr.payload_len)
-                            .and_then(|edge| self.open_successor(prev, scan_file_sequence, &edge))
-                        {
+                            .and_then(|edge| {
+                                self.open_successor(prev, scan_file_sequence, prev_instance, &edge)
+                            }) {
                             Ok(next) => next,
                             // Hand over what was collected before the Roll, as single reads
                             // would; the cursor stops on the Roll, so the next call meets the
@@ -3260,6 +3267,7 @@ impl Reader {
                         self.maps.push(next.region0);
                         rolled = Some(BatchRoll {
                             opened_ahead: next.opened_ahead,
+                            instance: next.instance,
                             file: next.file,
                             header: next.header,
                             channel_name: next.channel_name,
@@ -3818,7 +3826,7 @@ impl Reader {
     /// `open_successor` refusing it — leaves the reader exactly where it was, so the error can
     /// be returned again, or the same call retried once the segment appears.
     fn open_next_file(&mut self, edge: &RollEdge) -> io::Result<()> {
-        let next = self.open_successor(&self.header, self.file_sequence, edge)?;
+        let next = self.open_successor(&self.header, self.file_sequence, self.instance, edge)?;
 
         // Past the last fallible step: commit the new segment in one go.
         self.file_sequence = next.sequence;
@@ -3832,6 +3840,7 @@ impl Reader {
         self.position = next.base_record_index;
         let old_file = std::mem::replace(&mut self.file, next.file);
         let old_header = std::mem::replace(&mut self.header, next.header);
+        self.instance = next.instance;
         self.wake_untrusted = false;
         self.wake_miss = None;
         self.read_position = 0;
@@ -3858,16 +3867,13 @@ impl Reader {
         &self,
         prev_header: &RegionMapping<ReadOnly>,
         prev_sequence: u64,
+        prev_instance: InstanceId,
         edge: &RollEdge,
     ) -> io::Result<Successor> {
-        let (prev_instance, expected_base) = {
-            let page0 = prev_header.as_ptr();
-            let ch = get_channel_header(page0);
-            (
-                unsafe { v4::ext_at(page0) }.identity()?.instance,
-                ch.base_record_index
-                    .checked_add(ch.message_count.load(Ordering::Acquire)),
-            )
+        let expected_base = {
+            let ch = get_channel_header(prev_header.as_ptr());
+            ch.base_record_index
+                .checked_add(ch.message_count.load(Ordering::Acquire))
         };
         let next_sequence = prev_sequence
             .checked_add(1)
@@ -3884,9 +3890,12 @@ impl Reader {
             .as_ref()
             .and_then(|a| a.take_segment(next_sequence));
         let (file, region0, header, opened_ahead) = match ahead {
-            Some(next) if edge.names(prev_sequence, prev_instance, &next.identity) => {
-                (next.file, next.region0, Some(next.header), true)
-            }
+            Some(next) if edge.names(prev_sequence, prev_instance, &next.identity) => (
+                next.file,
+                next.region0,
+                Some((next.header, next.identity)),
+                true,
+            ),
             stale => {
                 if let (Some(stale), Some(ahead)) = (stale, &self.map_ahead) {
                     ahead.retire([map_ahead::Retired::Segment(stale)]);
@@ -3905,13 +3914,18 @@ impl Reader {
             }
         };
         let page0 = region0.mapping.as_ptr();
-        let mh = unsafe { &*(page0 as *const MessageHeader) };
-        if mh.parsed_header_type()? != HeaderType::Channel {
-            return Err(err_other("next file missing Channel header"));
-        }
         let ch = get_channel_header(page0);
-        validate_channel_header(ch, region_size, next_sequence)?;
-        let identity = validate_v4_prefix(page0)?;
+        let identity = match &header {
+            Some((_, identity)) => *identity, // validated by the helper; immutable
+            None => {
+                let mh = unsafe { &*(page0 as *const MessageHeader) };
+                if mh.parsed_header_type()? != HeaderType::Channel {
+                    return Err(err_other("next file missing Channel header"));
+                }
+                validate_channel_header(ch, region_size, next_sequence)?;
+                validate_v4_prefix(page0)?
+            }
+        };
         if !edge.names(prev_sequence, prev_instance, &identity) {
             return Err(err_invalid_data(format!(
                 "segment {next_sequence} is instance {:?} of parent {:?}, but the Roll that \
@@ -3950,11 +3964,12 @@ impl Reader {
         let channel_name = ch.channel_name;
         let base_record_index = ch.base_record_index;
         let header = match header {
-            Some(header) => header,
+            Some((header, _)) => header,
             None => RegionMapping::create_read_only(&file, 0, region::page_size())?,
         };
         Ok(Successor {
             sequence: next_sequence,
+            instance: identity.instance,
             opened_ahead,
             file,
             region0,
@@ -3976,6 +3991,7 @@ struct BatchEnd {
 
 struct BatchRoll {
     opened_ahead: bool,
+    instance: InstanceId,
     file: File,
     header: RegionMapping<ReadOnly>,
     channel_name: [u8; CHANNEL_NAME_MAX],
@@ -3985,6 +4001,7 @@ struct BatchRoll {
 /// A validated next segment, opened but not yet committed to the reader.
 struct Successor {
     sequence: u64,
+    instance: InstanceId,
     /// The helper opened it ahead of the roll.
     opened_ahead: bool,
     file: File,
@@ -8685,7 +8702,6 @@ mod tests {
         let capacities = || {
             (
                 prefault::lock(&shared.retired).capacity(),
-                prefault::lock(&shared.retired_files).capacity(),
                 prefault::lock(&shared.doomed).capacity(),
             )
         };

@@ -197,7 +197,6 @@ impl<T> Bounded<T> {
         std::mem::swap(&mut self.items, other);
     }
 
-    #[cfg(test)]
     pub(crate) fn capacity(&self) -> usize {
         self.items.capacity()
     }
