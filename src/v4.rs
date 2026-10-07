@@ -284,6 +284,63 @@ impl ChannelHeaderExt {
     }
 }
 
+/// The extension of the file whose region 0 (or page 0) is mapped at `region0`.
+///
+/// # Safety
+/// `region0` must point at a live mapping of at least [`FIRST_RECORD_V4`] bytes of a file's start.
+pub(crate) unsafe fn ext_at<'a>(region0: *const u8) -> &'a ChannelHeaderExt {
+    unsafe { &*(region0.add(EXT_FILE_OFFSET) as *const ChannelHeaderExt) }
+}
+
+/// Mutable access for initialising a file nothing else has mapped yet.
+///
+/// # Safety
+/// As [`ext_at`], and nothing else may access these bytes meanwhile.
+pub(crate) unsafe fn ext_at_mut<'a>(region0: *mut u8) -> &'a mut ChannelHeaderExt {
+    unsafe { &mut *(region0.add(EXT_FILE_OFFSET) as *mut ChannelHeaderExt) }
+}
+
+// ---------- installation ----------
+
+/// Give the complete file at `from` its final name `to`, atomically, and only if `to` does not
+/// exist: [`ErrorKind::AlreadyExists`] if it does. Never replaces a file another writer, helper or
+/// recovery installed. On Linux `renameat2(RENAME_NOREPLACE)`; where that is missing, or the
+/// filesystem refuses it, a hard link and an unlink, which is atomic and no-replace as well.
+pub(crate) fn install_no_replace(from: &std::path::Path, to: &std::path::Path) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let c = |p: &std::path::Path| {
+            CString::new(p.as_os_str().as_bytes())
+                .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "path has a NUL byte"))
+        };
+        let (cfrom, cto) = (c(from)?, c(to)?);
+        // Safety: two valid C strings; the remaining arguments are plain integers.
+        let r = unsafe {
+            libc::syscall(
+                libc::SYS_renameat2,
+                libc::AT_FDCWD,
+                cfrom.as_ptr(),
+                libc::AT_FDCWD,
+                cto.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        if r == 0 {
+            return Ok(());
+        }
+        let e = io::Error::last_os_error();
+        match e.raw_os_error() {
+            Some(libc::ENOSYS) | Some(libc::EINVAL) => {} // no renameat2 here: link instead
+            _ => return Err(e),
+        }
+    }
+    std::fs::hard_link(from, to)?;
+    let _ = std::fs::remove_file(from);
+    Ok(())
+}
+
 // ---------- Roll body ----------
 
 /// What a committed v4 `Roll` says about the file after it.

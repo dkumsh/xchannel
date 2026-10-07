@@ -23,6 +23,7 @@
 
 use crate::helper::{Failure, Thread};
 use crate::region::{RegionMapping, Writable, page_size};
+use crate::v4::{Identity, InstanceId};
 use crate::{CHANNEL_NAME_MAX, Helper, Unmap, Writer, make_partial_channel_file_path};
 use std::fs::File;
 use std::io;
@@ -43,6 +44,8 @@ const POLL: Duration = Duration::from_micros(50);
 /// rolled to, this stays on the old one, and the thread leaves the new one to the writer.
 pub(crate) struct Segment {
     pub(crate) sequence: u64,
+    /// Its instance ID: the parent its successor names.
+    instance: InstanceId,
     pub(crate) file: File,
     pub(crate) len: u64,
 }
@@ -74,6 +77,7 @@ pub(crate) struct SegmentSpec {
 
 struct NextSegment {
     sequence: u64,
+    identity: Identity,
     path: PathBuf,
     segment: PreparedSegment,
 }
@@ -133,6 +137,7 @@ pub(crate) struct Prefaulter {
 /// [`Prefaulter::rolled`] or the prefaulter is dropped.
 pub(crate) struct Position<'a> {
     pub(crate) sequence: u64,
+    pub(crate) instance: InstanceId,
     pub(crate) file: &'a File,
     pub(crate) file_len: u64,
     pub(crate) region: &'a mut RegionMapping<Writable>,
@@ -157,6 +162,7 @@ impl Prefaulter {
             unmap,
             segment: Mutex::new(Segment {
                 sequence: at.sequence,
+                instance: at.instance,
                 file: at.file.try_clone()?,
                 len: at.file_len,
             }),
@@ -201,12 +207,13 @@ impl Prefaulter {
         }
     }
 
-    /// Segment `sequence`, if it was created ahead under its `.partial` name.
-    pub(crate) fn take_segment(&self, sequence: u64) -> Option<PreparedSegment> {
+    /// Segment `sequence`, if it was created ahead under its `.partial` name, with the identity
+    /// it was created with.
+    pub(crate) fn take_segment(&self, sequence: u64) -> Option<(Identity, PreparedSegment)> {
         let mut next = lock(&self.shared.next_segment);
         next.claimed = next.claimed.max(sequence);
         match next.ready.take() {
-            Some(n) if n.sequence == sequence => Some(n.segment),
+            Some(n) if n.sequence == sequence => Some((n.identity, n.segment)),
             other => {
                 next.ready = other;
                 None
@@ -277,6 +284,7 @@ impl Prefaulter {
         if let Ok(file) = file {
             *lock(&shared.segment) = Segment {
                 sequence: at.sequence,
+                instance: at.instance,
                 file,
                 len: at.file_len,
             };
@@ -421,6 +429,15 @@ fn prepare_segment(
     {
         return Ok(());
     }
+    // The parent the new file names: the segment being written, if the thread is still on it.
+    let parent = {
+        let segment = lock(&shared.segment);
+        (segment.sequence + 1 == sequence).then_some(segment.instance)
+    };
+    let Some(parent) = parent else {
+        return Ok(());
+    };
+    let identity = Identity::successor(InstanceId::fresh()?, parent, sequence - 1);
     let path = make_partial_channel_file_path(&spec.base_path, sequence)?;
     #[cfg(test)]
     shared.prepare_attempts.fetch_add(1, Ordering::Relaxed);
@@ -433,6 +450,7 @@ fn prepare_segment(
         &spec.channel_name,
         0,
         spec.generation,
+        &identity,
     );
     #[cfg(test)]
     let prepared = prepared.and_then(|s| match shared.fail_prepare.load(Ordering::Acquire) {
@@ -449,6 +467,7 @@ fn prepare_segment(
     let populated = populate(segment.2.as_mut_ptr(), ahead.min(shared.region_size));
     let stale = next.ready.replace(NextSegment {
         sequence,
+        identity,
         path,
         segment,
     });

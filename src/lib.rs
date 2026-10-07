@@ -32,6 +32,7 @@ use channel::{
 };
 pub use helper::{Helper, Unmap};
 pub use region::{ReadOnly, RegionMapping, Writable, page_size};
+use v4::{Identity, InstanceId, RollEdge};
 
 use std::fs::{File, OpenOptions, read_dir};
 use std::io::{self, ErrorKind};
@@ -41,17 +42,20 @@ use std::slice;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 // ========== Constants ==========
 const MESSAGE_HEADER_SIZE: usize = size_of::<MessageHeader>();
-const CHANNEL_HEADER_SIZE: usize = size_of::<ChannelHeader>();
 
 // Keep 8-byte alignment (can be revisited later).
 const ALIGN: usize = align_of::<MessageHeader>(); // 8 on supported targets
 
 // Header slot size == struct size (16B) for now.
 const HEADER_SLOT: usize = MESSAGE_HEADER_SIZE;
+/// File offset of a segment's first record: after the Channel record and its v4 extension.
+const FIRST_RECORD: usize = v4::FIRST_RECORD_V4;
+/// Room a writer keeps free at its next header slot, so a `Roll` fits wherever it stops.
+const ROLL_TOTAL: usize = v4::ROLL_TOTAL_V4;
 const DEFAULT_BATCH_SEGS_CAP: usize = 16;
 const DEFAULT_BATCH_POS_CAP: usize = 1024;
 const DEFAULT_BATCH_MAPS_CAP: usize = 16;
@@ -129,6 +133,57 @@ fn validate_channel_header(
         )));
     }
     Ok(())
+}
+
+/// Check what v4 adds to a segment's first record, mapped at `page0`, once
+/// [`validate_channel_header`] has accepted the format version: a Channel record of v4 length
+/// and a well-formed extension. Returns the file's identity, which never changes; says nothing
+/// about whether the file is published.
+fn validate_v4_prefix(page0: *const u8) -> io::Result<Identity> {
+    let mh = unsafe { &*(page0 as *const MessageHeader) };
+    if mh.length as usize != v4::CHANNEL_PAYLOAD_V4 {
+        return Err(err_invalid_data(format!(
+            "Channel record is {} bytes, but v4 makes it {}",
+            mh.length,
+            v4::CHANNEL_PAYLOAD_V4
+        )));
+    }
+    unsafe { v4::ext_at(page0) }.identity()
+}
+
+/// Whether the file mapped at `page0` is published, with acquire: its base is final once it is.
+fn is_published(page0: *const u8) -> io::Result<bool> {
+    Ok(unsafe { v4::ext_at(page0) }.state()? == v4::State::Published)
+}
+
+/// Whether segment `sequence` exists and is published. A file that is not there yet, or is still
+/// `PREPARED` (installed ahead of its roll), is not part of the channel's history.
+fn segment_is_published(base_path: &Path, sequence: u64) -> io::Result<bool> {
+    let Some(file) = open_segment_if_present(base_path, sequence)? else {
+        return Ok(false);
+    };
+    if file.metadata()?.len() < FIRST_RECORD as u64 {
+        return Ok(false);
+    }
+    let page0 = RegionMapping::create_read_only(&file, 0, region::page_size())?;
+    let ch = get_channel_header(page0.as_ptr());
+    validate_channel_header(ch, ch.region_size as usize, sequence)?;
+    validate_v4_prefix(page0.as_ptr())?;
+    is_published(page0.as_ptr())
+}
+
+/// The newest published segment of `base_path`. Newer final files still `PREPARED` (a successor
+/// installed ahead of its roll) are skipped. A file whose header this build cannot read is
+/// returned as it is, for the caller's open to report why.
+fn find_latest_published_sequence(base_path: &Path) -> io::Result<u64> {
+    let seqs = find_all_sequences(base_path)?;
+    for &seq in seqs.iter().rev() {
+        match segment_is_published(base_path, seq) {
+            Ok(true) | Err(_) => return Ok(seq),
+            Ok(false) => {}
+        }
+    }
+    Ok(seqs.first().copied().unwrap_or(0))
 }
 
 /// A "pre-installed" header is what `try_reserve()` lays down one
@@ -358,6 +413,13 @@ fn walk_segment_from(
             return end(pos, users, WalkStop::Visitor);
         }
         if header_type == HeaderType::Roll {
+            if mh.length as usize != v4::ROLL_PAYLOAD_V4 || off + ROLL_TOTAL > region_size {
+                return Err(err_invalid_data(format!(
+                    "segment walk: Roll at {pos} has a {}-byte body, not {}",
+                    mh.length,
+                    v4::ROLL_PAYLOAD_V4
+                )));
+            }
             return end(pos, users, WalkStop::Roll);
         }
         let total_len = HEADER_SLOT + mh.length as usize;
@@ -727,6 +789,8 @@ pub struct Writer {
     held: Vec<RegionMapping<Writable>>,
     base_path: PathBuf,
     file_sequence: u64,
+    /// The current file's instance ID: the predecessor its successor names.
+    instance: InstanceId,
     file: File,
     file_len: u64,
 
@@ -796,13 +860,13 @@ impl Writer {
                 ),
             ));
         }
-        if region_size < HEADER_SLOT + CHANNEL_HEADER_SIZE {
+        if region_size < FIRST_RECORD + ROLL_TOTAL {
             return Err(io::Error::new(
                 ErrorKind::InvalidInput,
                 format!(
                     "region_size ({}) must be >= header space ({})",
                     region_size,
-                    HEADER_SLOT + CHANNEL_HEADER_SIZE
+                    FIRST_RECORD + ROLL_TOTAL
                 ),
             ));
         }
@@ -814,7 +878,7 @@ impl Writer {
         }
 
         let base_path = path.as_ref().to_path_buf();
-        let sequence = find_latest_sequence(&base_path)?;
+        let sequence = discard_unpublished_tail(&base_path)?;
         let (file, channel_region, current_region, current_region_index, file_len, next_hdr_pos) =
             Self::open_file(
                 &base_path,
@@ -829,12 +893,21 @@ impl Writer {
         // Readers trust the flag of the segment they read, so it follows this writer's
         // setting, set or cleared, whoever created the segment.
         set_wake_flag(&channel_region, wake);
+        let identity = validate_v4_prefix(channel_region.as_ptr())?;
         if sequence > 0 {
-            // Best-effort, like retention: the previous segment does not affect writing.
+            // A writer that died after publishing this file but before committing the `Roll`
+            // that leads to it left that `Roll` staged: finish it before writing anything, so
+            // readers still in the predecessor can follow. Its errors are this open's errors.
             let ch = get_channel_header(channel_region.as_ptr());
             let (generation, base) = (ch.generation, ch.base_record_index);
-            let _ =
-                Self::commit_stranded_roll(&base_path, sequence - 1, region_size, generation, base);
+            Self::commit_stranded_roll(
+                &base_path,
+                sequence - 1,
+                region_size,
+                generation,
+                &identity,
+                base,
+            )?;
         }
 
         Ok(Self {
@@ -844,6 +917,7 @@ impl Writer {
             held: Vec::new(),
             base_path,
             file_sequence: sequence,
+            instance: identity.instance,
             file,
             file_len,
             channel_region,
@@ -862,30 +936,27 @@ impl Writer {
 
     /// Finish a roll that a crashed writer left half done.
     ///
-    /// `roll_file` renames the next segment in *before* it commits the old segment's `Roll`
-    /// marker. A writer that dies between the two leaves the next segment in place, so its
-    /// successor writer opens that one, while the old segment ends in a `Roll` that is staged
-    /// but never committed. Every reader still on the old segment would wait on it forever.
+    /// `roll_file` stages the old segment's `Roll` in full, publishes the next segment, and only
+    /// then commits the `Roll` and moves the old segment's `write_position` past it. A writer
+    /// that dies after publishing leaves the next segment as the channel's newest, so its
+    /// successor opens that one, while readers still in the old segment wait on a `Roll` that
+    /// is staged but never committed, or committed with its position not yet moved.
     ///
-    /// The staged `Roll` sits at the slot `write_position` names. To be sure that slot is a
-    /// record slot and not leftover bytes, walk the record chain from the start of its region
-    /// (each region begins with a record) and require the walk to stop, uncommitted, exactly
-    /// there, on a header that is a `Roll` with length 0. Then commit it and advance
-    /// `write_position` past it, as `roll_file` would have. A segment whose roll completed
-    /// stops the walk on its committed `Roll` instead, and is left alone. Costs one walk of at
-    /// most one region, at writer open only.
-    ///
-    /// It only touches a segment that is really this one's predecessor: same generation, and
-    /// its `base_record_index + message_count` equal to `next_base`, the checks a reader makes
-    /// when it follows the roll. It never grows a file (a truncated stub is left alone), and
-    /// the `write_position` advance is a compare-and-swap from the staged state, so running it
-    /// twice advances it once.
+    /// This finds the `Roll` by walking the old segment's record chain from the start of the
+    /// region `write_position` names (each region begins with a record), checks that its body
+    /// names `successor` exactly (sequence, instance ID, parent, and base), commits it if it is
+    /// still staged, and moves `write_position` to the terminal hint, both as `roll_file` would
+    /// have. A segment whose roll completed is left as it is. A `Roll` that names any other file,
+    /// or no `Roll` at all behind a published successor, is corruption and is reported, never
+    /// repaired by guessing. Running it twice changes nothing the second time. A predecessor
+    /// already pruned by retention is fine: no reader can still be waiting in it unopened.
     fn commit_stranded_roll(
         base_path: &Path,
         sequence: u64,
         region_size: usize,
         generation: u64,
-        next_base: u64,
+        successor: &Identity,
+        successor_base: u64,
     ) -> io::Result<()> {
         let path = make_channel_file_path(base_path, sequence)?;
         let file = match OpenOptions::new().read(true).write(true).open(&path) {
@@ -901,17 +972,51 @@ impl Writer {
         let mut region0 = RegionMapping::create_writable(&file, 0, region_size)?;
         let ch = get_channel_header(region0.as_ptr());
         validate_channel_header(ch, region_size, sequence)?;
-        let continues = ch.generation == generation
-            && ch.base_record_index + ch.message_count.load(Ordering::Acquire) == next_base;
-        if !continues {
-            return Ok(());
+        let identity = validate_v4_prefix(region0.as_ptr())?;
+        let corrupt = |what: String| {
+            Err(err_invalid_data(format!(
+                "segment {} follows segment {sequence}, but {what}",
+                sequence + 1
+            )))
+        };
+        if !is_published(region0.as_ptr())? {
+            return corrupt("that one is unpublished".into());
         }
-        let slot = (ch.write_position.load(Ordering::Acquire) as usize).saturating_sub(HEADER_SLOT);
+        if ch.generation != generation
+            || successor.predecessor != identity.instance
+            || successor.predecessor_sequence != sequence
+        {
+            return corrupt("does not name it as its parent".into());
+        }
+        let count = ch.message_count.load(Ordering::Acquire);
+        if ch.base_record_index.checked_add(count) != Some(successor_base) {
+            return corrupt(format!(
+                "starts at record {successor_base} while that one ends at {}",
+                ch.base_record_index.saturating_add(count)
+            ));
+        }
+
+        // Staged, the hint is the Roll's slot + 16; complete, its slot + 16 + 56.
+        let wp = ch.write_position.load(Ordering::Acquire) as usize;
+        let earliest = wp.saturating_sub(HEADER_SLOT + ROLL_TOTAL);
+        let walked = walk_segment_from(
+            &file,
+            region_size,
+            earliest - earliest % region_size,
+            |_, _, _| false,
+        )?;
+        let slot = walked.pos;
+        let (staged, behind) = match walked.stop {
+            WalkStop::Roll if wp == slot + HEADER_SLOT + ROLL_TOTAL => (false, false), // complete
+            WalkStop::Roll if wp == slot + HEADER_SLOT => (false, true), // position behind
+            WalkStop::Uncommitted if wp == slot + HEADER_SLOT => (true, true),
+            other => {
+                return corrupt(format!(
+                    "its record chain stops at {slot} ({other:?}) with write_position {wp}"
+                ));
+            }
+        };
         let region_start = slot - slot % region_size;
-        let walked = walk_segment_from(&file, region_size, region_start, |_, _, _| false)?;
-        if walked.stop != WalkStop::Uncommitted || walked.pos != slot {
-            return Ok(());
-        }
         let mut region = if region_start == 0 {
             None
         } else {
@@ -926,39 +1031,51 @@ impl Writer {
             None => region0.as_mut_ptr(),
         };
         let hdr = unsafe { base_ptr.add(slot - region_start) as *mut MessageHeader };
-        let staged = unsafe { &*hdr };
-        if staged.parsed_header_type()? != HeaderType::Roll || staged.length != 0 {
-            return Ok(());
+        let roll = unsafe { &*hdr };
+        if roll.parsed_header_type()? != HeaderType::Roll
+            || roll.length as usize != v4::ROLL_PAYLOAD_V4
+        {
+            return corrupt(format!(
+                "the record at its write position {slot} is not a Roll"
+            ));
         }
-        // The next segment must really be there, or readers following the Roll would fail.
-        if !make_channel_file_path(base_path, sequence + 1)?.try_exists()? {
-            return Ok(());
+        let body = unsafe {
+            slice::from_raw_parts(
+                base_ptr.add(slot - region_start + HEADER_SLOT),
+                v4::ROLL_PAYLOAD_V4,
+            )
+        };
+        let edge = RollEdge::decode(body)?;
+        if !edge.names(sequence, identity.instance, successor)
+            || edge.next_base_record_index != successor_base
+        {
+            return corrupt(format!("its Roll names another file: {edge:?}"));
         }
-        MessageHeader::commit(hdr);
-        let ch_mut =
-            unsafe { &*(region0.as_mut_ptr().add(MESSAGE_HEADER_SIZE) as *const ChannelHeader) };
-        let staged_wp = (slot + HEADER_SLOT) as u64;
-        let _ = ch_mut.write_position.compare_exchange(
-            staged_wp,
-            staged_wp + HEADER_SLOT as u64,
+        if !behind {
+            return Ok(()); // complete: nothing to do, nothing to wake
+        }
+        if staged {
+            MessageHeader::commit(hdr);
+        }
+        let ch = get_channel_header(region0.as_ptr());
+        let _ = ch.write_position.compare_exchange(
+            (slot + HEADER_SLOT) as u64,
+            (slot + HEADER_SLOT + ROLL_TOTAL) as u64,
             Ordering::Release,
             Ordering::Relaxed,
         );
         // Readers asleep on this segment's word (its writer woke readers) must wake to
         // follow the Roll. Unconditional: this writer's own setting is irrelevant here.
-        wake::wake_all(&ch_mut.wake_word);
+        wake::wake_all(&ch.wake_word);
         Ok(())
     }
 
-    /// Open a specific sequence file. If new => init region0's ChannelHeader and **pre-install first user header**.
-    /// Fresh-segment preparation at an explicit (partial) path. Does
-    /// `set_len`, channel header init, and first user-header
-    /// pre-install. The file is **not** renamed to its final name —
-    /// callers do that themselves to control the publish-visibility
-    /// window. `Writer::open_file` renames immediately; `roll_file`
-    /// renames after the OLD Roll header is staged (committed=0) but
-    /// before it's release-stored to `committed=1`, so readers
-    /// observing Roll can immediately resolve NEW.
+    /// Fresh-segment preparation at an explicit private (partial) path: `set_len`, the Channel
+    /// record with its v4 extension (`identity`, `PREPARED`), and the first user header
+    /// pre-installed. The file is **not** given its final name, and is not published: callers
+    /// install it with [`v4::install_no_replace`] and publish it themselves, which is what lets a
+    /// file be prepared well ahead of its roll. `base_record_index` is final for a channel's
+    /// initial file; a successor's is stamped at its roll, before it is published.
     #[allow(clippy::type_complexity, clippy::too_many_arguments)]
     fn prepare_segment_at(
         partial_path: &Path,
@@ -969,6 +1086,7 @@ impl Writer {
         channel_name: &[u8; CHANNEL_NAME_MAX],
         base_record_index: u64,
         generation: u64,
+        identity: &Identity,
     ) -> io::Result<(
         File,
         RegionMapping<Writable>,
@@ -999,7 +1117,7 @@ impl Writer {
         let mh_ptr = region0.as_mut_ptr();
         let mh = unsafe { &mut *(mh_ptr as *mut MessageHeader) };
         mh.committed = 1;
-        mh.length = CHANNEL_HEADER_SIZE as u32;
+        mh.length = v4::CHANNEL_PAYLOAD_V4 as u32;
         mh.header_type = HeaderType::Channel as u8;
         mh.message_type = 0;
         mh.user_meta_u64 = 0;
@@ -1026,11 +1144,13 @@ impl Writer {
             (*ch_ptr).wake_word = AtomicU32::new(0);
             (*ch_ptr)._reserved2 = [0; 16];
             (*ch_ptr).generation = generation;
+            // Nothing else has this file yet.
+            v4::ext_at_mut(mh_ptr).init_prepared(identity);
         }
 
         // 3) current region + first user header pre-install
         let mut current_region = RegionMapping::create_writable(&file, 0, region_size)?;
-        let start = align_up(MESSAGE_HEADER_SIZE + CHANNEL_HEADER_SIZE);
+        let start = FIRST_RECORD;
         let first_user_hdr = current_region
             .get_bytes_mut(start, MESSAGE_HEADER_SIZE)
             .ok_or_else(|| err_other("prepare_segment_at: cannot pre-install first header"))?;
@@ -1102,8 +1222,11 @@ impl Writer {
                 channel_name,
                 base_record_index,
                 generation,
+                &Identity::initial(InstanceId::fresh()?),
             )?;
-            std::fs::rename(&partial_path, &file_path)?;
+            v4::install_no_replace(&partial_path, &file_path)?;
+            // Its base is final already: publish it before the builder hands the writer out.
+            unsafe { v4::ext_at(prepared.1.as_ptr()) }.publish();
             Ok(prepared)
         } else {
             let file = OpenOptions::new().read(true).write(true).open(&file_path)?;
@@ -1116,6 +1239,18 @@ impl Writer {
             let region0 = RegionMapping::create_writable(&file, 0, region_size)?;
             let ch = get_channel_header(region0.as_ptr());
             validate_channel_header(ch, region_size, sequence)?;
+            validate_v4_prefix(region0.as_ptr())?;
+            if !is_published(region0.as_ptr())? {
+                // A channel's initial file installed but never published (its writer died in
+                // between): complete, with its base final, so publish it. A later file in that
+                // state was removed before this open (`discard_unpublished_tail`).
+                if sequence != 0 {
+                    return Err(err_invalid_data(format!(
+                        "segment {sequence} is unpublished, but is the newest file a writer resumes"
+                    )));
+                }
+                unsafe { v4::ext_at(region0.as_ptr()) }.publish();
+            }
 
             // wp denotes the **next header slot offset**
             let wp_payload = ch.write_position.load(Ordering::Relaxed) as usize;
@@ -1297,15 +1432,6 @@ impl Writer {
         ch.write_position.store(val, Ordering::Release);
     }
 
-    /// Add `delta` to the channel header's `write_position` through
-    /// the writer's already-mapped `channel_region`. Infallible —
-    /// same rationale as `store_wp_local`.
-    #[inline]
-    fn fetch_add_wp_local(&self, delta: u64) -> u64 {
-        let ch = self.channel_header();
-        ch.write_position.fetch_add(delta, Ordering::Release)
-    }
-
     /// Reserve space for a message payload of length `msg_size` placed **after** a pre-installed header.
     /// Returns a mutable slice the caller can fill, or `None` on failure (e.g. MTU/roll).
     ///
@@ -1320,25 +1446,27 @@ impl Writer {
             return Err(err_other("MTU exceeded"));
         }
 
-        // Capacity pre-check: the record (header + payload + padding +
-        // next-header slot) must fit in a single region — readers and
-        // writers always mmap whole regions, and a record straddling a
-        // region boundary cannot be expressed in the wire format. It
-        // must also fit in a fresh segment when `file_roll_size > 0`,
+        // Capacity pre-check: the record (header + payload + padding),
+        // and behind it room for a `Roll`, must fit in a single region —
+        // readers and writers always mmap whole regions, a record
+        // straddling a region boundary cannot be expressed in the wire
+        // format, and a writer must be able to stage a `Roll` at its next
+        // header slot whenever it rolls, manually or by size. It must
+        // also fit in a fresh segment when `file_roll_size > 0`,
         // otherwise no roll can ever satisfy the reservation and the
         // loop below would roll forever, creating unbounded segment
         // files.
         let record_size = HEADER_SLOT + msg_size;
         let record_with_padding = align_up(record_size);
-        let needed_total = record_with_padding + HEADER_SLOT;
+        let needed_total = record_with_padding + ROLL_TOTAL;
         if needed_total > self.region_size {
             return Err(err_other(format!(
                 "reservation size {msg_size} cannot fit in region_size {} \
-                 (needs {needed_total} bytes including header + padding + next-header slot)",
+                 (needs {needed_total} bytes including header + padding + room for a Roll)",
                 self.region_size,
             )));
         }
-        if self.file_roll_size > 0 && needed_total as u64 > self.file_roll_size {
+        if self.file_roll_size > 0 && (FIRST_RECORD + needed_total) as u64 > self.file_roll_size {
             return Err(err_other(format!(
                 "reservation size {msg_size} cannot fit in file_roll_size {} \
                  (needs {needed_total} bytes)",
@@ -1474,26 +1602,21 @@ impl Writer {
         Ok(())
     }
 
-    /// Roll to the next file. The publish order is the load-bearing
-    /// part — readers that observe the Roll marker on the OLD file
-    /// will immediately try to `open()` the NEW file's final path, so
-    /// the NEW file must exist on disk under that path *before* the
-    /// Roll marker becomes visible.
+    /// Roll to the next file. The order is the load-bearing part (FORMAT.md §6.2):
     ///
-    /// Steps:
-    /// 1) Compute the Roll header position in OLD (current header slot or next region start).
-    /// 2) Prepare NEW segment at `<base>.<N+1>.partial` (fully initialised: set_len, channel header, first user header). Not yet visible to readers.
-    /// 3) Grow OLD if needed; jump OLD's `wp` to the next region if `leftover < HEADER_SLOT`.
-    /// 4) Stage OLD's Roll header with `committed = 0` (invisible to readers).
-    /// 5) Atomically `rename` NEW's `.partial` to its final name — NEW is now discoverable.
-    /// 6) Release-store `committed = 1` on OLD's Roll header — readers wake here.
-    /// 7) Bump OLD's `write_position` past the Roll marker.
-    /// 8) Swap `self` to NEW.
-    /// 9) Retention sweep: unlink the file at sequence `next_seq - keep_files`, if configured.
+    /// 1) Take the successor the helper prepared, or prepare it now: a complete `PREPARED` file
+    ///    under a private `.partial` name, with a fresh instance ID naming this file as parent.
+    /// 2) Stage this file's `Roll` at the next header slot, `committed = 0`, with its full body:
+    ///    the successor's sequence, instance ID and base. The writer always leaves room for it.
+    /// 3) Install the successor under its final name, never replacing a file already there. It
+    ///    is still `PREPARED`: discovery and history ignore it. Last fallible step.
+    /// 4) Stamp the successor's base and wake flag, then publish it (release).
+    /// 5) Commit the `Roll` (release): readers in this file follow it from here.
+    /// 6) Move this file's `write_position` to its terminal hint, wake its sleepers, and switch.
+    /// 7) Retention: unlink the file at sequence `next_seq - keep_files`, if configured.
     ///
-    /// If any step before (8) fails, `self` is unchanged and a retry
-    /// can clean up the orphan `.partial` (or `WriterBuilder::build`
-    /// will sweep it on next startup).
+    /// A failure before (4) leaves `self` on this file with the `Roll` staged but uncommitted,
+    /// which the next record overwrites; a stray `.partial` is swept by the next `build`.
     pub fn roll_file(&mut self) -> io::Result<()> {
         // Any pending reservation refers to a slot in OLD that's about
         // to be replaced by a Roll marker (or live elsewhere in OLD
@@ -1502,146 +1625,103 @@ impl Writer {
         // stale length state.
         self.pending_msg_size = None;
 
-        // OLD context
-        let old_region_size = self.region_size;
         let old_seq = self.file_sequence;
-        let old_file = self.file.try_clone()?;
-
-        // Decide roll_pos in OLD file
-        let wp = self.next_hdr_pos; // current header slot
-        let off = wp % old_region_size;
-        let leftover = old_region_size - off;
-
-        let (roll_pos, grow_to_end) = if leftover < HEADER_SLOT {
-            // put Roll at next region start in OLD file
-            let next_region_start = ((wp / old_region_size) + 1) * old_region_size;
-            let next_idx = (next_region_start / old_region_size) as u64;
-            let needed_end = (next_idx + 1) * old_region_size as u64;
-            (next_region_start, Some(needed_end))
-        } else {
-            (wp, None)
-        };
-
-        // Prepare NEW segment at its `.partial` path. The file is fully
-        // initialised (set_len + channel header + first user header
-        // pre-installed) but invisible to readers. The rename to NEW's
-        // final name happens between OLD's Roll-header staging
-        // (committed=0) and the release-store of `committed=1`, so a
-        // reader that observes Roll resolves NEW on the very next
-        // path lookup.
-        let next_seq = old_seq + 1;
-        // The new segment's first record continues the absolute numbering: it is
-        // OLD's base plus the count of user records written to OLD. `self` is still
-        // on OLD here, so its channel header carries both. (Skip markers never
-        // bumped `message_count`, so this is a pure user-record count.)
-        // The generation is a property of the channel, not of a file: every segment
-        // carries the same value, so it is read from OLD and stamped into NEW.
-        let (new_base_record_index, generation) = {
+        let roll_pos = self.next_hdr_pos;
+        let roll_off = roll_pos % self.region_size;
+        if self.region_size - roll_off < ROLL_TOTAL {
+            // `try_reserve` and recovery keep this room; only a damaged file lacks it.
+            return Err(err_invalid_data(format!(
+                "no room for a Roll at {roll_pos}: the writer keeps {ROLL_TOTAL} bytes free"
+            )));
+        }
+        // The new segment's first record continues the absolute numbering: OLD's base plus the
+        // user records written to it. The generation is a property of the channel, stamped into
+        // every segment. `self` is still on OLD, so its channel header carries both.
+        let (old_base, old_count, generation) = {
             let ch = self.channel_header();
             (
-                ch.base_record_index + ch.message_count.load(Ordering::Relaxed),
+                ch.base_record_index,
+                ch.message_count.load(Ordering::Relaxed),
                 ch.generation,
             )
         };
+        let next_seq = old_seq
+            .checked_add(1)
+            .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "file sequence exhausted"))?;
         let new_partial_path = make_partial_channel_file_path(&self.base_path, next_seq)?;
         let new_final_path = make_channel_file_path(&self.base_path, next_seq)?;
+
+        // 1) The successor.
+        let prepared = self
+            .prefault
+            .as_ref()
+            .and_then(|p| p.take_segment(next_seq))
+            .filter(|(identity, _)| {
+                identity.predecessor == self.instance && identity.predecessor_sequence == old_seq
+            });
+        let (identity, prepared) = match prepared {
+            Some(prepared) => prepared,
+            None => {
+                let identity = Identity::successor(InstanceId::fresh()?, self.instance, old_seq);
+                let segment = Self::prepare_segment_at(
+                    &new_partial_path,
+                    next_seq,
+                    self.region_size,
+                    self.file_roll_size,
+                    self.mtu,
+                    &self.channel_name,
+                    0, // stamped below, before publication
+                    generation,
+                    &identity,
+                )?;
+                (identity, segment)
+            }
+        };
         let (
             new_file,
-            new_channel_region,
+            mut new_channel_region,
             new_current_region,
             new_index,
             new_file_len,
             new_next_hdr,
-        ) = match self
-            .prefault
-            .as_ref()
-            .and_then(|p| p.take_segment(next_seq))
-        {
-            Some(mut prepared) => {
-                let ch = unsafe {
-                    &mut *(prepared.1.as_mut_ptr().add(MESSAGE_HEADER_SIZE) as *mut ChannelHeader)
-                };
-                ch.base_record_index = new_base_record_index;
-                prepared
-            }
-            None => Self::prepare_segment_at(
-                &new_partial_path,
-                next_seq,
-                self.region_size,
-                self.file_roll_size,
-                self.mtu,
-                &self.channel_name,
-                new_base_record_index,
-                generation,
-            )?,
-        };
+        ) = prepared;
+        let edge = RollEdge::after(old_seq, old_base, old_count, identity.instance)?;
 
-        // Publish Roll in OLD file BEFORE swapping `self` to NEW. If
-        // any step here errors, `self` is still consistent on OLD.
-        //
-        // Once the Roll marker becomes reader-visible (the
-        // release-store on `committed=1`), every remaining step must
-        // be infallible — otherwise external state would say
-        // "rolled" while `self` is still on OLD. We achieve that by:
-        //   * Mapping OLD's Roll region exactly once and reusing it
-        //     for both the staged write and the release-store.
-        //   * Updating OLD's `write_position` through the writer's
-        //     already-mapped `channel_region` (no fresh mmap, no
-        //     syscall).
-        if let Some(needed_end) = grow_to_end {
-            // Grow-only: never let `set_len` shrink a preallocated
-            // OLD segment back down to a region boundary.
-            if needed_end > self.file_len {
-                old_file.set_len(needed_end)?;
-            }
-        }
-
-        // Map the OLD Roll region once and stage the Roll header
-        // with `committed = 0`. Invisible to readers until the
-        // release-store below.
-        let old_roll_region_idx = (roll_pos / old_region_size) as u64;
-        let mut old_roll_region = RegionMapping::<Writable>::create_writable(
-            &old_file,
-            old_roll_region_idx * old_region_size as u64,
-            old_region_size,
-        )?;
-        let roll_off_in_region = roll_pos % old_region_size;
+        // 2) Stage the Roll, whole, in the region the writer already holds.
         let roll_hdr_ptr = {
-            let bytes = old_roll_region
-                .get_bytes_mut(roll_off_in_region, MESSAGE_HEADER_SIZE)
+            let bytes = self
+                .current_region
+                .get_bytes_mut(roll_off, ROLL_TOTAL)
                 .ok_or_else(|| err_other("roll header outside region"))?;
+            bytes[HEADER_SLOT..].copy_from_slice(&edge.encode());
             bytes.as_mut_ptr() as *mut MessageHeader
         };
         unsafe {
             *roll_hdr_ptr = MessageHeader {
                 committed: 0,
-                length: 0,
+                length: v4::ROLL_PAYLOAD_V4 as u32,
                 header_type: HeaderType::Roll as u8,
                 message_type: 0,
-                user_meta_u64: now_ns(),
+                user_meta_u64: 0,
             };
         }
 
-        // If we jumped past leftover bytes, jump `wp` to roll_pos.
-        // Infallible: goes through self.channel_region.
-        if leftover < HEADER_SLOT {
-            self.store_wp_local(roll_pos as u64);
+        // 3) Install under the final name: discoverable, still unpublished. Last fallible step.
+        v4::install_no_replace(&new_partial_path, &new_final_path)?;
+
+        // 4) Finalise and publish the successor. Nothing reads its base before this store.
+        unsafe {
+            (*(new_channel_region.as_mut_ptr().add(MESSAGE_HEADER_SIZE) as *mut ChannelHeader))
+                .base_record_index = edge.next_base_record_index;
         }
-
-        // Publish NEW under its final name. Last fallible step.
-        // If this fails, OLD's Roll is still committed=0, no reader
-        // observes anything; cleanup unlinks the orphan partial on
-        // the next `WriterBuilder::build` or via `cleanup_channel_files`.
-        // NEW carries this writer's wake flag from the moment readers can find it.
         set_wake_flag(&new_channel_region, self.wake);
-        std::fs::rename(&new_partial_path, &new_final_path)?;
+        unsafe { v4::ext_at(new_channel_region.as_ptr()) }.publish();
 
-        // Release-commit the Roll marker through the already-held
-        // mapping. Infallible — readers wake here.
+        // 5) Commit the Roll, every byte of which was written above. Readers follow it now.
         MessageHeader::commit(roll_hdr_ptr);
 
-        // Advance OLD's `wp` past the Roll slot. Infallible.
-        self.fetch_add_wp_local(HEADER_SLOT as u64);
+        // 6) The terminal hint: one slot past the whole Roll. Never a readable record.
+        self.store_wp_local((roll_pos + ROLL_TOTAL + HEADER_SLOT) as u64);
 
         // Readers asleep on OLD's word must wake to follow the Roll: from here on this
         // writer bumps NEW's word only. `self` is still on OLD.
@@ -1649,13 +1729,8 @@ impl Writer {
             wake::wake_all(&self.channel_header().wake_word);
         }
 
-        // The OLD Roll mapping is no longer needed; let it drop
-        // before we overwrite `self` fields so there's no aliasing
-        // with the newly-installed `current_region` if they happen
-        // to be the same region 0.
-        drop(old_roll_region);
-
         self.file_sequence = next_seq;
+        self.instance = identity.instance;
         self.file = new_file;
         let old_channel = std::mem::replace(&mut self.channel_region, new_channel_region);
         let old_current = std::mem::replace(&mut self.current_region, new_current_region);
@@ -1667,6 +1742,7 @@ impl Writer {
             prefault.rolled(
                 prefault::Position {
                     sequence: self.file_sequence,
+                    instance: self.instance,
                     file: &self.file,
                     file_len: self.file_len,
                     region: &mut self.current_region,
@@ -1814,6 +1890,7 @@ impl Writer {
         let prefaulter = prefault::Prefaulter::start(
             prefault::Position {
                 sequence: self.file_sequence,
+                instance: self.instance,
                 file: &self.file,
                 file_len: self.file_len,
                 region: &mut self.current_region,
@@ -2253,6 +2330,14 @@ fn read_segment_header(file: &File, sequence: u64) -> io::Result<SegmentHeader> 
     }
     let ch = get_channel_header(map.as_ptr());
     validate_channel_header(ch, ch.region_size as usize, sequence)?;
+    validate_v4_prefix(map.as_ptr())?;
+    // Acquired before the base is read: a published file's base is final.
+    if !is_published(map.as_ptr())? {
+        return Err(io::Error::new(
+            ErrorKind::NotFound,
+            format!("segment {sequence} is not published yet"),
+        ));
+    }
     Ok(SegmentHeader {
         region_size: ch.region_size as usize,
         base_record_index: ch.base_record_index,
@@ -2308,7 +2393,7 @@ impl Reader {
                 // tail has moved on; list again and join it there.
                 let mut opened = None;
                 for _ in 0..MAX_OPEN_RETRIES {
-                    let seq = find_latest_sequence(&base_path)?;
+                    let seq = find_latest_published_sequence(&base_path)?;
                     let Some(file) = open_segment_if_present(&base_path, seq)? else {
                         continue;
                     };
@@ -2380,7 +2465,14 @@ impl Reader {
         index: u64,
         expected_generation: Option<u64>,
     ) -> io::Result<Option<Self>> {
-        let seqs = find_all_sequences(base_path)?;
+        let mut seqs = find_all_sequences(base_path)?;
+        // A newest file prepared ahead of a roll is not history: no range, no head.
+        while seqs.len() > 1
+            && let Some(&last) = seqs.last()
+            && !segment_is_published(base_path, last)?
+        {
+            seqs.pop();
+        }
         let (Some(&first), Some(&last)) = (seqs.first(), seqs.last()) else {
             return Err(io::Error::new(
                 ErrorKind::NotFound,
@@ -2577,16 +2669,26 @@ impl Reader {
         let ch = get_channel_header(page0.as_ptr());
         let region_size = ch.region_size as usize;
         validate_channel_header(ch, region_size, sequence)?;
+        validate_v4_prefix(page0.as_ptr())?;
+        // A `PREPARED` file is installed ahead of its roll and is not history yet; only a
+        // channel's initial file, before its first writer published it, is ever opened here so.
+        if !is_published(page0.as_ptr())? {
+            return Err(io::Error::new(
+                ErrorKind::NotFound,
+                format!("segment {sequence} of {base_path:?} is not published yet"),
+            ));
+        }
 
         let (read_pos, position) = match start {
             SegmentStart::Beginning => (0, ch.base_record_index),
             SegmentStart::Head => {
-                // Two `stat`s rather than a directory listing. A newer segment exists if the
-                // next one does — or if this one's own path is gone: retention unlinks oldest
-                // first, so a pruned successor means this segment was pruned before it.
-                let next = make_channel_file_path(&base_path, sequence + 1)?;
+                // No directory listing. A newer segment exists if the next one is published — a
+                // file merely installed under that name may be one prepared ahead of a roll —
+                // or if this one's own path is gone: retention unlinks oldest first, so a pruned
+                // successor means this segment was pruned before it.
                 let this = make_channel_file_path(&base_path, sequence)?;
-                let newer_segment_exists = || Ok(next.try_exists()? || !this.try_exists()?);
+                let newer_segment_exists =
+                    || Ok(segment_is_published(&base_path, sequence + 1)? || !this.try_exists()?);
                 Self::live_start(&file, ch, region_size, &newer_segment_exists)?
             }
             SegmentStart::At { read_pos, position } => (read_pos, position),
@@ -2789,7 +2891,7 @@ impl Reader {
     /// head, not the end of the file it currently reads. Reads one page of the latest
     /// segment's header; not a hot-path accessor.
     pub fn head_record_index(&self) -> io::Result<u64> {
-        let latest = find_latest_sequence(&self.base_path)?;
+        let latest = find_latest_published_sequence(&self.base_path)?;
         let file_path = make_channel_file_path(&self.base_path, latest)?;
         let file = OpenOptions::new()
             .read(true)
@@ -3075,7 +3177,10 @@ impl Reader {
                         // Switch to the next file and continue scanning from its start, with
                         // the same continuity checks a single-record roll makes.
                         let prev = rolled.as_ref().map_or(&self.header, |r| &r.header);
-                        let next = match self.open_successor(prev, scan_file_sequence + 1) {
+                        let next = match self
+                            .roll_edge(map_idx, cursor_off, hdr.payload_len)
+                            .and_then(|edge| self.open_successor(prev, scan_file_sequence, &edge))
+                        {
                             Ok(next) => next,
                             // Hand over what was collected before the Roll, as single reads
                             // would; the cursor stops on the Roll, so the next call meets the
@@ -3374,7 +3479,8 @@ impl Reader {
                 HeaderType::Roll => {
                     // `open_next_file` resets the cursor to the new segment's start; moving it
                     // here first would only strand it inside the old file if the roll failed.
-                    self.open_next_file()?;
+                    let edge = self.roll_edge(self.maps.len() - 1, off, hdr.payload_len)?;
+                    self.open_next_file(&edge)?;
                     continue;
                 }
             }
@@ -3538,7 +3644,8 @@ impl Reader {
                 HeaderType::Roll => {
                     // See the Roll arm in `scan_to_user_record`: the cursor moves only once
                     // the next segment is actually open.
-                    self.open_next_file()?;
+                    let edge = self.roll_edge(self.maps.len() - 1, off, hdr.payload_len)?;
+                    self.open_next_file(&edge)?;
                     continue;
                 }
             }
@@ -3654,8 +3761,8 @@ impl Reader {
     /// segment not visible yet, retention having removed it, or one of the checks in
     /// `open_successor` refusing it — leaves the reader exactly where it was, so the error can
     /// be returned again, or the same call retried once the segment appears.
-    fn open_next_file(&mut self) -> io::Result<()> {
-        let next = self.open_successor(&self.header, self.file_sequence + 1)?;
+    fn open_next_file(&mut self, edge: &RollEdge) -> io::Result<()> {
+        let next = self.open_successor(&self.header, self.file_sequence, edge)?;
 
         // Past the last fallible step: commit the new segment in one go.
         self.file_sequence = next.sequence;
@@ -3682,36 +3789,68 @@ impl Reader {
         Ok(())
     }
 
-    /// Open and validate segment `next_sequence`, the successor of the segment open as `prev`.
-    /// Touches nothing on `self`; both the single-record roll and the batch scan commit the
-    /// result themselves.
+    /// The body of the committed `Roll` at `off` in the region mapped as `maps[map_idx]`.
+    fn roll_edge(&self, map_idx: usize, off: usize, payload_len: usize) -> io::Result<RollEdge> {
+        let map = &self.maps[map_idx].mapping;
+        if off + HEADER_SLOT + payload_len > map.region_size() {
+            return Err(err_invalid_data("Roll body extends past its region"));
+        }
+        let body =
+            unsafe { slice::from_raw_parts(map.as_ptr().add(off + HEADER_SLOT), payload_len) };
+        RollEdge::decode(body)
+    }
+
+    /// Open and validate the segment `edge` leads to from segment `prev_sequence`, open as
+    /// `prev_header`. Touches nothing on `self`; both the single-record roll and the batch scan
+    /// commit the result themselves.
+    ///
+    /// The successor must be exactly the file the committed `Roll` names: its sequence, its own
+    /// instance ID and its parent's, and once published its base. A file the helper opened ahead
+    /// is checked against that in mapped memory, without asking the filesystem whether the name
+    /// still points at it: a file replaced at the same name has another instance ID. One opened
+    /// here, after the roll, is checked the same way.
     fn open_successor(
         &self,
         prev_header: &RegionMapping<ReadOnly>,
-        next_sequence: u64,
+        prev_sequence: u64,
+        edge: &RollEdge,
     ) -> io::Result<Successor> {
         // The absolute index the next segment must begin at, computed from the one we are
         // leaving: a roll stamps the new file's base as the old file's `base + message_count`.
         // Read from the page we still hold mapped, so this works even after retention unlinked
         // it (readers finish a pruned file through their inode reference).
-        let expected_base = {
-            let ch = get_channel_header(prev_header.as_ptr());
-            ch.base_record_index + ch.message_count.load(Ordering::Acquire)
+        let (prev_instance, expected_base) = {
+            let page0 = prev_header.as_ptr();
+            let ch = get_channel_header(page0);
+            (
+                unsafe { v4::ext_at(page0) }.identity()?.instance,
+                ch.base_record_index
+                    .checked_add(ch.message_count.load(Ordering::Acquire)),
+            )
         };
-        let file_path = make_channel_file_path(&self.base_path, next_sequence)?;
+        let next_sequence = prev_sequence
+            .checked_add(1)
+            .filter(|&n| n == edge.next_sequence)
+            .ok_or_else(|| {
+                err_invalid_data(format!(
+                    "segment {prev_sequence} rolls to segment {}, not the next one",
+                    edge.next_sequence
+                ))
+            })?;
         let region_size = self.region_size();
         let ahead = self
             .map_ahead
             .as_ref()
             .and_then(|a| a.take_segment(next_sequence));
         let (file, region0, header, opened_ahead) = match ahead {
-            Some(next) if next.is_at(&file_path) => {
+            Some(next) if edge.names(prev_sequence, prev_instance, &next.identity) => {
                 (next.file, next.region0, Some(next.header), true)
             }
             stale => {
                 if let (Some(stale), Some(ahead)) = (stale, &self.map_ahead) {
                     ahead.retire([map_ahead::Retired::Segment(stale)]);
                 }
+                let file_path = make_channel_file_path(&self.base_path, next_sequence)?;
                 let file = OpenOptions::new()
                     .read(true)
                     .write(false)
@@ -3726,17 +3865,35 @@ impl Reader {
         }
         let ch = get_channel_header(region0.as_ptr());
         validate_channel_header(ch, region_size, next_sequence)?;
+        let identity = validate_v4_prefix(region0.as_ptr())?;
+        if !edge.names(prev_sequence, prev_instance, &identity) {
+            return Err(err_invalid_data(format!(
+                "segment {next_sequence} is instance {:?} of parent {:?}, but the Roll that \
+                 leads to it names instance {:?} of parent {prev_instance:?}",
+                identity.instance, identity.predecessor, edge.next_instance
+            )));
+        }
+        // A committed `Roll` is written only after its successor is published.
+        if !is_published(region0.as_ptr())? {
+            return Err(err_invalid_data(format!(
+                "segment {next_sequence} is not published, but a committed Roll leads to it"
+            )));
+        }
         // The next segment must continue the absolute numbering. Anything else means this
         // file did not come from the series we have been reading — segments from two
         // different logs sharing a directory, an out-of-order or hand-copied file, or a
         // channel that was deleted and rebuilt at the same path while we held an unlinked
-        // file open (the rebuilt series restarts at sequence 0 and reuses these very
-        // filenames, so nothing else about it looks wrong). Refuse rather than splice.
-        if ch.base_record_index != expected_base {
+        // file open. Refuse rather than splice.
+        if Some(ch.base_record_index) != expected_base
+            || ch.base_record_index != edge.next_base_record_index
+        {
             return Err(err_invalid_data(format!(
                 "base_record_index discontinuity: segment {} starts at {} but the previous \
-                 segment ends at {} (segments from a different series?)",
-                next_sequence, ch.base_record_index, expected_base
+                 segment ends at {} and its Roll says {} (segments from a different series?)",
+                next_sequence,
+                ch.base_record_index,
+                expected_base.map_or("past u64::MAX".into(), |b| b.to_string()),
+                edge.next_base_record_index
             )));
         }
         // Unlike the base, the generation is constant across a channel's segments, so a
@@ -3912,9 +4069,10 @@ pub fn wait_any(
     }
 }
 
+#[cfg(test)]
 fn now_ns() -> u64 {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
     now.as_nanos() as u64
 }
@@ -4000,6 +4158,35 @@ fn preallocation_len(region_size: usize, file_roll_size: u64) -> io::Result<u64>
         ));
     }
     Ok(len)
+}
+
+/// The sequence a writer reopening `base_path` resumes: the newest file, once any newer final
+/// files that were never published are removed. Such a file is a successor installed for a roll
+/// its writer did not finish. No committed `Roll` names it, so no reader has taken it as history;
+/// it is unlinked, never truncated, so a mapping a reader's helper made of it ahead stays intact,
+/// and the next roll prepares a new file with a new instance ID. A channel's initial file is
+/// kept: `open_file` publishes it.
+fn discard_unpublished_tail(base_path: &Path) -> io::Result<u64> {
+    loop {
+        let seq = find_latest_sequence(base_path)?;
+        if seq == 0 {
+            return Ok(0);
+        }
+        let Some(file) = open_segment_if_present(base_path, seq)? else {
+            continue;
+        };
+        if file.metadata()?.len() < FIRST_RECORD as u64 {
+            return Ok(seq); // not one of ours; `open_file` reports it
+        }
+        let page0 = RegionMapping::create_read_only(&file, 0, region::page_size())?;
+        let ch = get_channel_header(page0.as_ptr());
+        validate_channel_header(ch, ch.region_size as usize, seq)?;
+        validate_v4_prefix(page0.as_ptr())?;
+        if is_published(page0.as_ptr())? {
+            return Ok(seq);
+        }
+        std::fs::remove_file(make_channel_file_path(base_path, seq)?)?;
+    }
 }
 
 /// Unlink any `<base>.partial` / `<base>.<N>.partial` siblings.
@@ -4601,7 +4788,8 @@ mod tests {
         }
 
         // Swap in a segment from the other series. Same sequence number, same generation,
-        // same geometry — every other check passes.
+        // same geometry — but not the file the Roll names: its instance ID gives it away before
+        // its base is even read.
         std::fs::copy(
             make_channel_file_path(Path::new(theirs), 1)?,
             make_channel_file_path(Path::new(ours), 1)?,
@@ -4616,7 +4804,8 @@ mod tests {
         };
         assert_eq!(err.kind(), ErrorKind::InvalidData);
         assert!(
-            err.to_string().contains("discontinuity"),
+            err.to_string()
+                .contains("but the Roll that leads to it names instance"),
             "unexpected error: {err}"
         );
 
@@ -5052,8 +5241,9 @@ mod tests {
             false, // wake_readers
         )?;
 
-        // Choose len so that after header + payload the aligned end is region - header_size.
-        let record_with_padding = region - HEADER_SLOT;
+        // Choose len so that after header + payload the aligned end leaves just the room a
+        // Roll needs, which every record must leave behind it.
+        let record_with_padding = region - ROLL_TOTAL;
         assert_eq!(record_with_padding % ALIGN, 0);
         let len = record_with_padding - HEADER_SLOT;
         {
@@ -5156,7 +5346,7 @@ mod tests {
             false, // wake_readers
         )?;
 
-        let start = align_up(MESSAGE_HEADER_SIZE + CHANNEL_HEADER_SIZE);
+        let start = FIRST_RECORD;
         let record_with_padding = region_size - start - HEADER_SLOT;
         assert_eq!(record_with_padding % ALIGN, 0);
         let len = record_with_padding - HEADER_SLOT;
@@ -5308,7 +5498,7 @@ mod tests {
             .file_roll_size((region_size as u64) * 10)
             .precreate()?;
 
-        let start = align_up(MESSAGE_HEADER_SIZE + CHANNEL_HEADER_SIZE);
+        let start = FIRST_RECORD;
         let file = OpenOptions::new().read(true).write(true).open(base)?;
         let mut region0 = RegionMapping::create_writable(&file, 0, region_size)?;
         let header = region0
@@ -5347,7 +5537,7 @@ mod tests {
             .file_roll_size((region_size as u64) * 10)
             .precreate()?;
 
-        let start = align_up(MESSAGE_HEADER_SIZE + CHANNEL_HEADER_SIZE);
+        let start = FIRST_RECORD;
         let file = OpenOptions::new().read(true).write(true).open(base)?;
         let mut region0 = RegionMapping::create_writable(&file, 0, region_size)?;
         let header = region0
@@ -5505,12 +5695,11 @@ mod tests {
         let region_size = page_size();
         // Big payload to wedge near the end of region 0, so the next
         // try_reserve triggers a region roll. With region_size=4096 and
-        // 144 bytes of region-0 overhead (16-byte Channel MessageHeader +
-        // 128-byte ChannelHeader), payload >= 3897 forces a roll on a
-        // subsequent 8-byte message. 3904 is the next aligned size, chosen
-        // so the post-big next-header slot lands at 4064 (identical roll
-        // geometry to the pre-128-byte-header layout).
-        let big = vec![0x77u8; 3904];
+        // the first record at 208 (16-byte Channel MessageHeader, 128-byte
+        // ChannelHeader, 64-byte v4 extension), 3816 puts the post-big
+        // next-header slot at 4040: the 56 bytes every record leaves free
+        // for a Roll, and too few for an 8-byte message plus that room.
+        let big = vec![0x77u8; 3816];
         let small_payload: [u8; 8] = [0xEE; 8];
 
         // 1) Write one big message, then `try_reserve` an 8-byte slot —
@@ -5530,14 +5719,14 @@ mod tests {
 
         // 2) Rewind wp from its post-roll value back to the value it
         //    held *before* roll_over_region's publish_wp. With
-        //    region_size=4096 and big payload=3904: the Skip sits at
-        //    offset 4064 with skip_len=16 (total Skip record = 32 bytes,
+        //    region_size=4096 and big payload=3816: the Skip sits at
+        //    offset 4040 with skip_len=40 (total Skip record = 56 bytes,
         //    filling exactly to the region boundary). Pre-roll wp was
-        //    4080 (set by the big message's publish_wp at the end of
+        //    4056 (set by the big message's publish_wp at the end of
         //    commit). Post-roll wp is 4112 (set by roll_over_region's
         //    publish_wp). The rewind is exactly the Skip record size,
         //    which is also the publish_wp delta inside roll_over_region.
-        rewind_write_position_on_disk(base, 32)?;
+        rewind_write_position_on_disk(base, 56)?;
         // A wrong count proves recovery recounts rather than trusting it: the
         // orphan is a Skip, which is not a user record, so the true count is 1.
         set_message_count_on_disk(base, 7)?;
@@ -6966,7 +7155,7 @@ mod tests {
     const WP_AT: u64 = MESSAGE_HEADER_SIZE as u64;
     const COUNT_AT: u64 = MESSAGE_HEADER_SIZE as u64 + 8;
     const BASE_AT: u64 = MESSAGE_HEADER_SIZE as u64 + 16;
-    const FIRST_RECORD_AT: u64 = (MESSAGE_HEADER_SIZE + CHANNEL_HEADER_SIZE) as u64;
+    const FIRST_RECORD_AT: u64 = FIRST_RECORD as u64;
 
     /// A recovery that fails partway writes nothing: the orphan is still at `write_position` and
     /// the count is untouched, so the next open recovers from scratch. (A recovery that dies after
@@ -7012,8 +7201,8 @@ mod tests {
         write_indexed(&mut w, 0..3)?;
         w.roll_file()?;
         write_indexed(&mut w, 3..5)?;
-        // After a roll the writer leaves `write_position` one slot past the Roll marker.
-        Ok(peek_u64_on_disk(base, 0, WP_AT)? - 2 * HEADER_SLOT as u64)
+        // After a roll the writer leaves `write_position` one slot past the whole Roll.
+        Ok(peek_u64_on_disk(base, 0, WP_AT)? - (ROLL_TOTAL + HEADER_SLOT) as u64)
     }
 
     /// Open segment 0 the way `Live` would after a directory listing that still showed it as
@@ -7144,8 +7333,8 @@ mod tests {
             w.commit(0, len as u32, index)
         };
         put(8, 0)?;
-        // Region 1 exactly: header + payload end where the file's last 16-byte slot begins.
-        put(region_size - 2 * HEADER_SLOT, 1)?;
+        // Region 1 exactly: header + payload end where the room kept for a Roll begins.
+        put(region_size - HEADER_SLOT - ROLL_TOTAL, 1)?;
         put(8, 2)?; // no room left: the Roll takes the last slot, this goes to segment 1
         assert_eq!(
             peek_u64_on_disk(base, 0, WP_AT)?,
@@ -7191,7 +7380,7 @@ mod tests {
         );
         assert_eq!(
             peek_u64_on_disk(base, 0, WP_AT)?,
-            roll_at + 2 * HEADER_SLOT as u64,
+            roll_at + (HEADER_SLOT + ROLL_TOTAL) as u64,
             "write_position advanced past the Roll, as roll_file does"
         );
         cleanup_channel_files(base);
@@ -7199,8 +7388,9 @@ mod tests {
     }
 
     /// The roll repair only touches a real predecessor: a staged Roll in a segment whose
-    /// numbering does not continue into this one (copied in from another series) is left
-    /// uncommitted, as is a truncated stub, which must not be grown either.
+    /// numbering does not continue into this one (copied in from another series) is not the
+    /// parent of the published successor: the open fails rather than splice them, and leaves its
+    /// Roll uncommitted. A truncated stub is left alone, and must not be grown either.
     #[test]
     fn writer_open_leaves_a_foreign_or_truncated_predecessor_alone() -> anyhow::Result<()> {
         let base = "test_writer_leaves_foreign_predecessor";
@@ -7213,13 +7403,14 @@ mod tests {
             &(roll_at + HEADER_SLOT as u64).to_le_bytes(),
         )?;
         poke_on_disk(base, 0, BASE_AT, &100u64.to_le_bytes())?; // no longer continues into seg 1
-        let _w = WriterBuilder::new(base).build()?;
+        let err = WriterBuilder::new(base).build().err().expect("refused");
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert!(err.to_string().contains("ends at 103"), "{err}");
         let seg0 = std::fs::read(make_channel_file_path(Path::new(base), 0)?)?;
         assert_eq!(
             seg0[roll_at as usize], 0,
             "foreign segment's Roll left staged"
         );
-        drop(_w);
 
         let seg0_path = make_channel_file_path(Path::new(base), 0)?;
         OpenOptions::new()
@@ -8047,6 +8238,240 @@ mod tests {
         drop(w);
         assert_eq!(records_in(base)?, 20_000);
         cleanup_channel_files(base);
+        Ok(())
+    }
+
+    // ---------- format v4 ----------
+
+    /// File offset of the publication state in the v4 extension.
+    const STATE_AT: u64 = 192;
+
+    /// The identity a segment's extension carries.
+    fn identity_on_disk(base: &str, seq: u64) -> anyhow::Result<Identity> {
+        let bytes = std::fs::read(make_channel_file_path(Path::new(base), seq)?)?;
+        Ok(validate_v4_prefix(bytes.as_ptr())?)
+    }
+
+    /// A segment's layout, as FORMAT.md gives it: a 192-byte Channel record, the extension at
+    /// 144 with the file published, the first record at 208.
+    #[test]
+    fn a_v4_segment_has_the_documented_layout() -> anyhow::Result<()> {
+        let base = "test_v4_layout";
+        cleanup_channel_files(base);
+        let mut w = WriterBuilder::new(base).build()?;
+        write_indexed(&mut w, 0..1)?;
+        let bytes = std::fs::read(make_channel_file_path(Path::new(base), 0)?)?;
+        assert_eq!(bytes[1], HeaderType::Channel as u8);
+        assert_eq!(
+            u32::from_le_bytes(bytes[4..8].try_into()?),
+            192,
+            "Channel length"
+        );
+        assert_eq!(
+            u16::from_le_bytes(bytes[56..58].try_into()?),
+            4,
+            "format_version"
+        );
+        assert_eq!(bytes[STATE_AT as usize], v4::PUBLISHED);
+        let identity = identity_on_disk(base, 0)?;
+        assert_eq!(identity, Identity::initial(identity.instance));
+        assert_eq!(bytes[208], 1, "first record committed at 208");
+        assert_eq!(
+            u64::from_le_bytes(bytes[216..224].try_into()?),
+            0,
+            "its index"
+        );
+        assert_eq!(w.instance, identity.instance);
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// A v3 file is not read or reopened: v4 changes what a file under its final name means.
+    #[test]
+    fn a_v3_segment_is_refused() -> anyhow::Result<()> {
+        let base = "test_v3_refused";
+        cleanup_channel_files(base);
+        WriterBuilder::new(base).precreate()?;
+        poke_on_disk(base, 0, 56, &3u16.to_le_bytes())?;
+        for err in [
+            ReaderBuilder::new(base)
+                .build()
+                .err()
+                .expect("reader refuses"),
+            ReaderBuilder::new(base)
+                .live()
+                .build()
+                .err()
+                .expect("live reader refuses"),
+            WriterBuilder::new(base)
+                .build()
+                .err()
+                .expect("writer refuses"),
+        ] {
+            assert_eq!(err.kind(), ErrorKind::InvalidData);
+            assert!(err.to_string().contains("format_version 3"), "{err}");
+        }
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// A roll's `Roll` names its successor exactly: sequence, instance ID and base, and the
+    /// successor names the file it follows.
+    #[test]
+    fn a_roll_names_its_successor() -> anyhow::Result<()> {
+        let base = "test_roll_names_successor";
+        let roll_at = rolled_once(base)?;
+        let bytes = std::fs::read(make_channel_file_path(Path::new(base), 0)?)?;
+        let at = roll_at as usize;
+        assert_eq!(bytes[at], 1, "committed");
+        assert_eq!(bytes[at + 1], HeaderType::Roll as u8);
+        assert_eq!(u32::from_le_bytes(bytes[at + 4..at + 8].try_into()?), 40);
+        assert_eq!(
+            u64::from_le_bytes(bytes[at + 8..at + 16].try_into()?),
+            0,
+            "no timestamp"
+        );
+        let edge = RollEdge::decode(&bytes[at + 16..at + 56])?;
+        let (parent, child) = (identity_on_disk(base, 0)?, identity_on_disk(base, 1)?);
+        assert!(edge.names(0, parent.instance, &child));
+        assert_eq!(edge.next_base_record_index, 3);
+        assert_ne!(child.instance, parent.instance);
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// A writer died after installing the next segment but before publishing it: the newest
+    /// file is `PREPARED`, and the old segment's Roll staged. Readers see no newer history,
+    /// and the next writer discards that file and goes on writing in the old segment.
+    #[test]
+    fn an_unpublished_newest_segment_is_not_history() -> anyhow::Result<()> {
+        let base = "test_unpublished_newest";
+        let roll_at = rolled_once(base)?;
+        // Back to the moment before publication: Roll staged, successor PREPARED and empty.
+        cleanup_from(base, 1)?;
+        let mut w = WriterBuilder::new(base).build()?;
+        w.roll_file()?;
+        drop(w);
+        poke_on_disk(base, 0, roll_at, &[0])?;
+        poke_on_disk(
+            base,
+            0,
+            WP_AT,
+            &(roll_at + HEADER_SLOT as u64).to_le_bytes(),
+        )?;
+        poke_on_disk(base, 1, STATE_AT, &[v4::PREPARED])?;
+        let prepared = identity_on_disk(base, 1)?;
+
+        let mut live = ReaderBuilder::new(base).live().build()?;
+        assert_eq!((live.file_sequence(), live.position()), (0, 3));
+        assert_eq!(live.head_record_index()?, 3);
+        let err = ReaderBuilder::new(base)
+            .start_at(4)
+            .build()
+            .err()
+            .expect("past head");
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        let mut from_start = ReaderBuilder::new(base).build()?;
+        for i in 0..3 {
+            assert_eq!(
+                from_start
+                    .try_read()?
+                    .expect("record")
+                    .header()
+                    .user_meta_u64,
+                i
+            );
+        }
+        assert!(from_start.try_read()?.is_none(), "waits on the staged Roll");
+
+        let mut w = WriterBuilder::new(base).build()?;
+        assert_eq!(w.file_sequence, 0, "resumed in the old segment");
+        assert!(
+            !make_channel_file_path(Path::new(base), 1)?.exists(),
+            "unpublished file discarded"
+        );
+        write_indexed(&mut w, 3..4)?;
+        w.roll_file()?;
+        write_indexed(&mut w, 4..5)?;
+        assert_ne!(
+            identity_on_disk(base, 1)?.instance,
+            prepared.instance,
+            "a new file"
+        );
+        for r in [&mut live, &mut from_start] {
+            for i in r.position()..5 {
+                assert_eq!(r.try_read()?.expect("record").header().user_meta_u64, i);
+            }
+        }
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// Remove segments `from..` of `base`.
+    fn cleanup_from(base: &str, from: u64) -> anyhow::Result<()> {
+        for seq in find_all_sequences(Path::new(base))? {
+            if seq >= from {
+                std::fs::remove_file(make_channel_file_path(Path::new(base), seq)?)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// A committed Roll is written only after its successor is published, so one that leads
+    /// to an unpublished file is a broken protocol, reported, not waited on.
+    #[test]
+    fn a_committed_roll_to_an_unpublished_segment_is_reported() -> anyhow::Result<()> {
+        let base = "test_roll_to_unpublished";
+        rolled_once(base)?;
+        poke_on_disk(base, 1, STATE_AT, &[v4::PREPARED])?;
+        let mut r = ReaderBuilder::new(base).build()?;
+        for i in 0..3 {
+            assert_eq!(r.try_read()?.expect("record").header().user_meta_u64, i);
+        }
+        let err = r.try_read().err().expect("refused");
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert!(err.to_string().contains("not published"), "{err}");
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// A channel's initial file installed but never published (its first writer died in
+    /// between) has no history for readers; the next writer publishes it.
+    #[test]
+    fn an_unpublished_initial_segment_is_published_by_the_next_writer() -> anyhow::Result<()> {
+        let base = "test_unpublished_initial";
+        cleanup_channel_files(base);
+        WriterBuilder::new(base).base_record_index(7).precreate()?;
+        poke_on_disk(base, 0, STATE_AT, &[v4::PREPARED])?;
+        let err = ReaderBuilder::new(base)
+            .build()
+            .err()
+            .expect("nothing published");
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+        assert!(err.to_string().contains("not published"), "{err}");
+        let mut w = WriterBuilder::new(base).build()?;
+        assert_eq!(w.next_record_index(), 7, "its base kept");
+        write_indexed(&mut w, 7..8)?;
+        let mut r = ReaderBuilder::new(base).build()?;
+        assert_eq!(r.try_read()?.expect("record").header().user_meta_u64, 7);
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// Installation never replaces a file already under the final name.
+    #[test]
+    fn install_never_replaces() -> anyhow::Result<()> {
+        let (from, to) = ("test_install_from", "test_install_to");
+        std::fs::write(from, b"new")?;
+        std::fs::write(to, b"old")?;
+        let err = v4::install_no_replace(Path::new(from), Path::new(to)).expect_err("refused");
+        assert_eq!(err.kind(), ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(to)?, b"old");
+        std::fs::remove_file(to)?;
+        v4::install_no_replace(Path::new(from), Path::new(to))?;
+        assert_eq!(std::fs::read(to)?, b"new");
+        assert!(!Path::new(from).exists());
+        std::fs::remove_file(to)?;
         Ok(())
     }
 }

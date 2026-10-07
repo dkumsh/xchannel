@@ -89,6 +89,13 @@ impl HeaderType {
 
 /// Wire format version emitted and accepted by this crate. See `FORMAT.md`.
 ///
+/// v4 separates a file's preparation from its publication. The Channel record grows to 192
+/// bytes with a 64-byte extension (`v4::ChannelHeaderExt`: the file's instance ID, its
+/// predecessor's, and a `PREPARED`/`PUBLISHED` state), so the first record moves from offset
+/// 144 to 208, and a `Roll` carries a 40-byte body naming its successor exactly. A file under
+/// its final name may now be unpublished, which a v3 reader would take for history, so v3 files
+/// are not read, and v4 is greenfield.
+///
 /// v3 widened `channel_name` from 20 to 48 bytes, taking the space from `_reserved2`.
 /// The header stays 128 bytes and every other field keeps its offset, so v2 files are
 /// *structurally* readable — but a v3 writer can store a name a v2 reader would silently
@@ -101,7 +108,7 @@ impl HeaderType {
 /// longer counts the Channel header or Skip markers). The records area consequently
 /// starts later in region 0, so v1 files are not read in place — there is no v1->v2
 /// migration; v2 is greenfield.
-pub(crate) const FORMAT_VERSION: u16 = 3;
+pub(crate) const FORMAT_VERSION: u16 = crate::v4::FORMAT_VERSION_V4;
 /// Endianness discriminant for `ChannelHeader::endianness`. Only LE is defined.
 pub(crate) const ENDIANNESS_LE: u8 = 0x01;
 /// Default user-metadata layout: `{message_type:u16 @ 2, user_meta_u64:u64 @ 8}`.

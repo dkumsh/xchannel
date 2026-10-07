@@ -8,16 +8,17 @@
 //! nothing, and drops the regions the reader hands back. A region not ready in time is mapped by
 //! the reader as before.
 //!
-//! Near the end of a segment the thread also opens the next one, under its final name or still
-//! under the `.partial` name the writer prepares it at, and maps and populates its first region.
-//! The reader takes it at the roll once the final name is confirmed to be the same file.
+//! Near the end of a segment the thread also opens the next one, once it is installed under its
+//! final name (published or still `PREPARED`), and maps and populates its first region. The reader
+//! takes it at the roll if it is the file the committed `Roll` names: its instance ID and parent,
+//! read from its header here, checked in memory there, with no `stat`.
 
 use crate::helper::{Failure, Thread, drop_page_tables};
 use crate::region::{ReadOnly, RegionMapping, page_size};
-use crate::{Helper, MappedRegion, make_channel_file_path, make_partial_channel_file_path};
+use crate::v4::Identity;
+use crate::{Helper, MappedRegion, make_channel_file_path};
 use std::fs::File;
 use std::io;
-use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -39,15 +40,8 @@ pub(crate) struct NextSegment {
     pub(crate) file: File,
     pub(crate) region0: RegionMapping<ReadOnly>,
     pub(crate) header: RegionMapping<ReadOnly>,
-    dev: u64,
-    ino: u64,
-}
-
-impl NextSegment {
-    /// Whether `path` names this file.
-    pub(crate) fn is_at(&self, path: &std::path::Path) -> bool {
-        std::fs::metadata(path).is_ok_and(|m| (m.dev(), m.ino()) == (self.dev, self.ino))
-    }
+    /// Who the file says it is, which never changes once it is installed.
+    pub(crate) identity: Identity,
 }
 
 /// What the reader leaves behind for the thread to release; held only to be dropped there.
@@ -201,8 +195,8 @@ fn run(shared: &Shared) -> io::Result<()> {
     while !shared.stop.load(Ordering::Acquire) {
         #[cfg(test)]
         shared.inject.fire()?;
-        // Only the reader says which file a segment is: a file opened ahead under the `.partial`
-        // name may have been abandoned and replaced, and only the reader checks that at the roll.
+        // Only the reader says which file a segment is: a file opened ahead may be an unpublished
+        // attempt that was abandoned and replaced, and only the reader checks that at the roll.
         if let Some((seq, file)) = lock(&shared.rolled).take() {
             segment = match file {
                 Some(file) => Some((seq, file)),
@@ -259,19 +253,16 @@ fn run(shared: &Shared) -> io::Result<()> {
     Ok(())
 }
 
-/// Segment `sequence` opened, its first region mapped and populated, if it exists yet.
+/// Segment `sequence` opened, its first region mapped and populated, if it is installed yet.
+/// A file under the final name is complete, published or not; its identity is read once here.
 fn open_next(shared: &Shared, sequence: u64) -> Option<NextSegment> {
     let size = shared.region_size;
-    let paths = [
-        make_channel_file_path(&shared.base_path, sequence).ok()?,
-        make_partial_channel_file_path(&shared.base_path, sequence).ok()?,
-    ];
-    let file = paths.iter().find_map(|p| File::open(p).ok())?;
-    let meta = file.metadata().ok()?;
-    if meta.len() < size as u64 {
+    let file = File::open(make_channel_file_path(&shared.base_path, sequence).ok()?).ok()?;
+    if file.metadata().ok()?.len() < size as u64 {
         return None;
     }
     let region0 = RegionMapping::create_read_only(&file, 0, size).ok()?;
+    let identity = crate::validate_v4_prefix(region0.as_ptr()).ok()?;
     populate(&region0).ok()?;
     let header = RegionMapping::create_read_only(&file, 0, page_size()).ok()?;
     Some(NextSegment {
@@ -279,8 +270,7 @@ fn open_next(shared: &Shared, sequence: u64) -> Option<NextSegment> {
         file,
         region0,
         header,
-        dev: meta.dev(),
-        ino: meta.ino(),
+        identity,
     })
 }
 
