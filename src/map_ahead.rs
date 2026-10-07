@@ -13,7 +13,7 @@
 //! takes it at the roll if it is the file the committed `Roll` names: its instance ID and parent,
 //! read from its header here, checked in memory there, with no `stat`.
 
-use crate::helper::{Failure, Thread, drop_page_tables};
+use crate::helper::{Bounded, Failure, Thread, drop_page_tables};
 use crate::region::{ReadOnly, RegionMapping, page_size};
 use crate::v4::Identity;
 use crate::{Helper, MappedRegion, make_channel_file_path};
@@ -68,7 +68,9 @@ pub(crate) struct Shared {
     rolled: Mutex<Option<(u64, Option<File>)>>,
     ready: Mutex<Option<Ready>>,
     next_segment: Mutex<Option<NextSegment>>,
-    retired: Mutex<Vec<Retired>>,
+    pub(crate) retired: Mutex<Bounded<Retired>>,
+    /// Hand-overs the reader did itself because the queue was full.
+    pub(crate) saturated: AtomicU64,
     /// Tests: make the thread stop as it would on an old kernel or a bug.
     #[cfg(test)]
     pub(crate) inject: crate::helper::Inject,
@@ -79,7 +81,7 @@ pub(crate) struct MapAhead {
     thread: Thread,
 }
 
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -92,6 +94,9 @@ impl MapAhead {
         region_idx: u64,
         region_size: usize,
     ) -> io::Result<Self> {
+        // A file's worth and the next's, held under `Unmap::AtFileRoll` until the roll.
+        let regions = file.metadata()?.len() / region_size as u64;
+        let retire_bound = (2 * regions as usize + 8).max(64);
         let shared = Arc::new(Shared {
             stop: AtomicBool::new(false),
             failure: Arc::default(),
@@ -102,7 +107,8 @@ impl MapAhead {
             rolled: Mutex::new(Some((file_sequence, Some(file.try_clone()?)))),
             ready: Mutex::new(None),
             next_segment: Mutex::new(None),
-            retired: Mutex::new(Vec::with_capacity(64)),
+            retired: Mutex::new(Bounded::new(retire_bound)),
+            saturated: AtomicU64::new(0),
             #[cfg(test)]
             inject: Default::default(),
         });
@@ -170,12 +176,18 @@ impl MapAhead {
     pub(crate) fn retire(&self, left: impl IntoIterator<Item = Retired>) {
         let mut retired = lock(&self.shared.retired);
         if self.shared.failure.stopped() {
-            retired.clear();
+            retired.items().clear();
             drop(retired);
             left.into_iter().for_each(drop);
             return;
         }
-        retired.extend(left);
+        let mut full = false;
+        for item in left {
+            full |= retired.push(item).is_err(); // released here, on drop
+        }
+        if full {
+            self.shared.saturated.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -190,10 +202,15 @@ fn run(shared: &Shared) -> io::Result<()> {
     let size = shared.region_size as u64;
     let mut segment: Option<(u64, File)> = None;
     let mut upcoming: Option<(u64, File)> = None;
-    let mut releasing = Vec::with_capacity(64);
+    let mut releasing = Vec::with_capacity(lock(&shared.retired).items().capacity());
     let mut done = (u64::MAX, u64::MAX);
     let mut looked_for_next = Instant::now() - LOOK_FOR_NEXT;
     while !shared.stop.load(Ordering::Acquire) {
+        #[cfg(test)]
+        if shared.inject.stalled() {
+            std::thread::sleep(POLL);
+            continue;
+        }
         #[cfg(test)]
         shared.inject.fire()?;
         // Only the reader says which file a segment is: a file opened ahead may be an unpublished
@@ -235,7 +252,7 @@ fn run(shared: &Shared) -> io::Result<()> {
                 }
             }
         }
-        std::mem::swap(&mut *lock(&shared.retired), &mut releasing);
+        lock(&shared.retired).swap(&mut releasing);
         for left in &releasing {
             match left {
                 Retired::Region(region) if Arc::strong_count(region) == 1 => {

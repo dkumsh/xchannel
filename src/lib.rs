@@ -8252,13 +8252,13 @@ mod tests {
             (1..=rolls + 1).contains(&attempts),
             "{attempts} attempts at creating segments ahead over {rolls} rolls"
         );
+        assert!(w.helper_error().is_none(), "the helper carries on");
+        drop(w); // the helper may be mid-attempt until then
         let partials = std::fs::read_dir(".")?
             .filter_map(|e| e.ok()?.file_name().into_string().ok())
             .filter(|n| n.starts_with(base) && n.ends_with(PARTIAL_SUFFIX))
             .count();
         assert_eq!(partials, 0, "a failed attempt leaves no .partial");
-        assert!(w.helper_error().is_none(), "the helper carries on");
-        drop(w);
         assert_eq!(records_in(base)?, 20_000);
         cleanup_channel_files(base);
         Ok(())
@@ -8644,5 +8644,100 @@ mod tests {
         ] {
             assert!(!is_partial_segment_name(&name, "c"), "{name}");
         }
+    }
+
+    // ---------- bounded hand-over queues ----------
+
+    /// With its helper stalled, the writer queues no more than the bounds and does the rest
+    /// itself; nothing is lost, and the helper catches up once it runs again.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_stalled_writer_helper_never_grows_its_queues() -> anyhow::Result<()> {
+        let base = "test_stalled_writer_helper";
+        cleanup_channel_files(base);
+        let mut w = WriterBuilder::new(base)
+            .region_size(page_size())
+            .file_roll_size(page_size() as u64 * 4)
+            .keep_files(2)
+            .helper(Helper::inherit())
+            .build()?;
+        let shared = w.prefault.as_ref().unwrap().shared.clone();
+        shared.inject.stall();
+        let capacities = || {
+            (
+                prefault::lock(&shared.retired).capacity(),
+                prefault::lock(&shared.retired_files).capacity(),
+                prefault::lock(&shared.doomed).capacity(),
+            )
+        };
+        let before = capacities();
+        write_indexed(&mut w, 0..20_000)?;
+        assert!(w.file_sequence > 20, "rolled {} times", w.file_sequence);
+        assert_eq!(capacities(), before, "no queue grew");
+        assert!(
+            shared.saturated.load(Ordering::Relaxed) > 0,
+            "the writer did it itself"
+        );
+        assert!(
+            segment_mappings(base) <= 64 + 8,
+            "{} mappings",
+            segment_mappings(base)
+        );
+        // keep_files, the deletion queue, and the successor being installed.
+        assert!(
+            segment_files(base) <= 2 + 2 + 1,
+            "{} files",
+            segment_files(base)
+        );
+        shared.inject.resume();
+        let kept = w.file_sequence - 1;
+        assert!(
+            until(|| find_earliest_sequence(Path::new(base)).is_ok_and(|e| e >= kept)),
+            "the helper catches up"
+        );
+        let mut r = ReaderBuilder::new(base).build()?;
+        let first = r.position();
+        let mut next = first;
+        while let Some(m) = r.try_read()? {
+            assert_eq!(m.header().user_meta_u64, next);
+            next += 1;
+        }
+        assert_eq!(next, 20_000);
+        drop((r, w, shared));
+        assert_eq!(segment_mappings(base), 0);
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// The reader's side: a stalled helper's queue stays within its bound.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_stalled_reader_helper_never_grows_its_queue() -> anyhow::Result<()> {
+        let base = "test_stalled_reader_helper";
+        cleanup_channel_files(base);
+        let mut w = WriterBuilder::new(base)
+            .region_size(page_size())
+            .file_roll_size(page_size() as u64 * 4)
+            .build()?;
+        write_indexed(&mut w, 0..20_000)?;
+        let mut r = ReaderBuilder::new(base).helper(Helper::inherit()).build()?;
+        let shared = r.map_ahead.as_ref().unwrap().shared.clone();
+        shared.inject.stall();
+        let before = map_ahead::lock(&shared.retired).capacity();
+        for i in 0..20_000 {
+            assert_eq!(r.try_read()?.expect("record").header().user_meta_u64, i);
+        }
+        assert_eq!(map_ahead::lock(&shared.retired).capacity(), before);
+        assert!(shared.saturated.load(Ordering::Relaxed) > 0);
+        assert!(
+            segment_mappings(base) <= before + 8,
+            "{} mappings",
+            segment_mappings(base)
+        );
+        shared.inject.resume();
+        drop((r, w, shared));
+        assert_eq!(segment_mappings(base), 0);
+        cleanup_channel_files(base);
+        Ok(())
     }
 }

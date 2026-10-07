@@ -133,6 +133,19 @@ pub(crate) struct Inject(std::sync::atomic::AtomicU8);
 
 #[cfg(test)]
 impl Inject {
+    /// Stop draining until `resume`.
+    pub(crate) fn stall(&self) {
+        self.0.store(3, Ordering::Release);
+    }
+
+    pub(crate) fn resume(&self) {
+        self.0.store(0, Ordering::Release);
+    }
+
+    pub(crate) fn stalled(&self) -> bool {
+        self.0.load(Ordering::Acquire) == 3
+    }
+
     pub(crate) fn error(&self) {
         self.0.store(1, Ordering::Release);
     }
@@ -147,6 +160,46 @@ impl Inject {
             2 => panic!("injected"),
             _ => Ok(()),
         }
+    }
+}
+
+/// A queue of work handed to a helper, never grown past its bound on the hot thread: when full,
+/// the caller does the work itself.
+pub(crate) struct Bounded<T> {
+    items: Vec<T>,
+    bound: usize,
+}
+
+impl<T> Bounded<T> {
+    /// `bound` items fit without allocating; `usize::MAX` grows as needed.
+    pub(crate) fn new(bound: usize) -> Self {
+        Self {
+            items: Vec::with_capacity(bound.min(4096)),
+            bound,
+        }
+    }
+
+    /// Queue `item`, or hand it back if the queue is full.
+    pub(crate) fn push(&mut self, item: T) -> Result<(), T> {
+        if self.items.len() >= self.bound {
+            return Err(item);
+        }
+        self.items.push(item);
+        Ok(())
+    }
+
+    pub(crate) fn items(&mut self) -> &mut Vec<T> {
+        &mut self.items
+    }
+
+    /// Swap contents with `other`, which must hold `bound` without allocating.
+    pub(crate) fn swap(&mut self, other: &mut Vec<T>) {
+        std::mem::swap(&mut self.items, other);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn capacity(&self) -> usize {
+        self.items.capacity()
     }
 }
 

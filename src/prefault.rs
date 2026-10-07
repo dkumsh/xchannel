@@ -21,7 +21,7 @@
 //! panic), the writer notices at its next hand-over and from then on unmaps and deletes for itself,
 //! what it queued before included, as it does without a helper.
 
-use crate::helper::{Failure, Thread};
+use crate::helper::{Bounded, Failure, Thread};
 use crate::region::{RegionMapping, Writable, page_size};
 use crate::v4::{Identity, InstanceId};
 use crate::{
@@ -40,6 +40,22 @@ const AHEAD_TIME: Duration = Duration::from_millis(100);
 const AHEAD_MIN: usize = 64 << 10;
 const AHEAD_MAX: usize = 1 << 20;
 const POLL: Duration = Duration::from_micros(50);
+/// Bound of the queues of descriptors to close.
+const SMALL_QUEUE: usize = 8;
+/// Bound of the queue of segments to delete: past it, retention deletes on the writer, so
+/// `keep_files` is exceeded by at most this many.
+const DOOMED_QUEUE: usize = 2;
+
+/// Bound of the queue of mappings to unmap: a file's worth and the next's under
+/// `Unmap::AtFileRoll`, unbounded if the file never rolls (the user's choice).
+fn retire_bound(unmap: Unmap, regions_per_file: Option<u64>) -> usize {
+    match (unmap, regions_per_file) {
+        (Unmap::Immediate, _) => 64,
+        (Unmap::AtFileRoll, Some(n)) => 2 * n as usize + 8,
+        (Unmap::AtFileRoll, None) => usize::MAX,
+    }
+}
+
 /// `in_flight` when nothing is being installed.
 pub(crate) const NONE: u64 = u64::MAX;
 
@@ -112,7 +128,9 @@ pub(crate) struct Shared {
     current_sequence: AtomicU64,
     next: Mutex<Option<Next>>,
     /// Mappings the writer left, with the segment they belong to.
-    retired: Mutex<Vec<(u64, RegionMapping<Writable>)>>,
+    pub(crate) retired: Mutex<Bounded<(u64, RegionMapping<Writable>)>>,
+    /// Hand-overs the writer did itself because a queue was full.
+    pub(crate) saturated: AtomicU64,
     /// Set for a rolling channel: its next segment is prepared ahead.
     spec: Option<SegmentSpec>,
     /// Held only to hand a segment over; the writer only `try_lock`s it.
@@ -124,11 +142,11 @@ pub(crate) struct Shared {
     pub(crate) in_flight: AtomicU64,
     base_path: PathBuf,
     /// Segments retention dropped, to delete.
-    doomed: Mutex<Vec<u64>>,
+    pub(crate) doomed: Mutex<Bounded<u64>>,
     /// Descriptors the writer left, to close.
-    retired_files: Mutex<Vec<File>>,
+    pub(crate) retired_files: Mutex<Bounded<File>>,
     /// The thread's handles on segments the writer left, to close.
-    retired_workers: Mutex<Vec<Arc<File>>>,
+    retired_workers: Mutex<Bounded<Arc<File>>>,
     /// A segment the writer rolled to, waiting for `segment` to be free. Writer-side only.
     handoff: Mutex<Option<Segment>>,
     /// Tests: make the thread stop as it would on an old kernel or a bug.
@@ -189,7 +207,8 @@ impl Prefaulter {
             current_index: AtomicU64::new(at.index),
             current_sequence: AtomicU64::new(at.sequence),
             next: Mutex::new(None),
-            retired: Mutex::new(Vec::with_capacity(64)),
+            retired: Mutex::new(Bounded::new(retire_bound(unmap, regions_per_file))),
+            saturated: AtomicU64::new(0),
             spec,
             next_segment: Mutex::new(NextSegments {
                 ready: None,
@@ -198,9 +217,9 @@ impl Prefaulter {
             claimed: AtomicU64::new(at.sequence),
             in_flight: AtomicU64::new(NONE),
             base_path,
-            doomed: Mutex::new(Vec::with_capacity(4)),
-            retired_files: Mutex::new(Vec::with_capacity(4)),
-            retired_workers: Mutex::new(Vec::with_capacity(4)),
+            doomed: Mutex::new(Bounded::new(DOOMED_QUEUE)),
+            retired_files: Mutex::new(Bounded::new(SMALL_QUEUE)),
+            retired_workers: Mutex::new(Bounded::new(SMALL_QUEUE)),
             handoff: Mutex::new(None),
             #[cfg(test)]
             inject: Default::default(),
@@ -262,8 +281,16 @@ impl Prefaulter {
 
     /// Delete segment `sequence` here rather than on the writer.
     pub(crate) fn unlink(&self, sequence: u64) {
-        lock(&self.shared.doomed).push(sequence);
+        let full = lock(&self.shared.doomed).push(sequence);
+        if let Err(sequence) = full {
+            self.saturated();
+            delete(&self.shared, &mut vec![sequence]);
+        }
         self.release_if_stopped();
+    }
+
+    fn saturated(&self) {
+        self.shared.saturated.fetch_add(1, Ordering::Relaxed);
     }
 
     /// If the thread has stopped, do what it did at the top of each iteration, on the writer:
@@ -278,13 +305,13 @@ impl Prefaulter {
         let current = shared.current_sequence.load(Ordering::Relaxed);
         let mut retired = lock(&shared.retired);
         match shared.unmap {
-            Unmap::Immediate => retired.clear(),
-            Unmap::AtFileRoll => retired.retain(|(s, _)| *s >= current),
+            Unmap::Immediate => retired.items().clear(),
+            Unmap::AtFileRoll => retired.items().retain(|(s, _)| *s >= current),
         }
         drop(retired);
-        lock(&shared.retired_files).clear();
-        lock(&shared.retired_workers).clear();
-        delete(shared, &mut lock(&shared.doomed));
+        lock(&shared.retired_files).items().clear();
+        lock(&shared.retired_workers).items().clear();
+        delete(shared, lock(&shared.doomed).items());
     }
 
     /// The writer moved to `region`; `left` is unmapped here rather than on the writer.
@@ -300,7 +327,10 @@ impl Prefaulter {
             .store(region.as_mut_ptr(), Ordering::Release);
         shared.current_index.store(index, Ordering::Release);
         let sequence = shared.current_sequence.load(Ordering::Relaxed);
-        lock(&shared.retired).push((sequence, left));
+        let full = lock(&shared.retired).push((sequence, left));
+        if full.is_err() {
+            self.saturated(); // unmapped here, on drop
+        }
         self.hand_off();
         self.release_if_stopped();
     }
@@ -317,7 +347,10 @@ impl Prefaulter {
             Err(std::sync::TryLockError::WouldBlock) => return,
         };
         let left = std::mem::replace(&mut *segment, handoff.take().expect("checked"));
-        lock(&self.shared.retired_workers).push(left.file);
+        drop(segment);
+        if lock(&self.shared.retired_workers).push(left.file).is_err() {
+            self.saturated();
+        }
     }
 
     /// The writer rolled to the segment at `at`, leaving the old segment's mappings `left` and its
@@ -350,7 +383,9 @@ impl Prefaulter {
             });
             self.hand_off();
         }
-        lock(&shared.retired_files).push(left_file);
+        if lock(&shared.retired_files).push(left_file).is_err() {
+            self.saturated();
+        }
         shared.write_position.store(
             at.write_position as *const AtomicU64 as *mut _,
             Ordering::Release,
@@ -364,9 +399,14 @@ impl Prefaulter {
             .store(at.sequence, Ordering::Release);
         let stale = lock(&shared.next).take();
         let mut retired = lock(&shared.retired);
-        retired.extend(left.into_iter().map(|region| (old, region)));
-        retired.extend(stale.map(|n| (old, n.region)));
+        let mut full = false;
+        for region in left.into_iter().chain(stale.map(|n| n.region)) {
+            full |= retired.push((old, region)).is_err();
+        }
         drop(retired);
+        if full {
+            self.saturated();
+        }
         self.release_if_stopped();
     }
 }
@@ -381,7 +421,7 @@ impl Drop for Prefaulter {
         {
             let _ = std::fs::remove_file(unused.path);
         }
-        delete(&self.shared, &mut lock(&self.shared.doomed));
+        delete(&self.shared, lock(&self.shared.doomed).items());
     }
 }
 
@@ -401,22 +441,31 @@ fn delete(shared: &Shared, doomed: &mut Vec<u64>) {
 fn run(shared: &Shared) -> io::Result<()> {
     let size = shared.region_size;
     let page = page_size();
-    let mut unmapping = Vec::with_capacity(64);
-    let mut deleting = Vec::with_capacity(4);
-    let mut closing = Vec::with_capacity(4);
-    let mut releasing = Vec::with_capacity(4);
+    let mut unmapping =
+        Vec::with_capacity(retire_bound(shared.unmap, shared.regions_per_file).min(4096));
+    let mut deleting = Vec::with_capacity(DOOMED_QUEUE);
+    let mut closing = Vec::with_capacity(SMALL_QUEUE);
+    let mut releasing = Vec::with_capacity(SMALL_QUEUE);
     let (mut done_at, mut done_to) = ((u64::MAX, u64::MAX), 0usize);
     let mut next_head_done = (u64::MAX, u64::MAX);
     let (mut since, mut since_at) = (Instant::now(), (u64::MAX, 0u64));
     let mut ahead = AHEAD_MIN;
     loop {
+        #[cfg(test)]
+        if shared.inject.stalled() {
+            if shared.stop.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            std::thread::sleep(POLL);
+            continue;
+        }
         {
             let current = shared.current_sequence.load(Ordering::Acquire);
             let mut retired = lock(&shared.retired);
             match shared.unmap {
-                Unmap::Immediate => std::mem::swap(&mut *retired, &mut unmapping),
+                Unmap::Immediate => retired.swap(&mut unmapping),
                 Unmap::AtFileRoll => {
-                    unmapping.extend(retired.extract_if(.., |(s, _)| *s < current))
+                    unmapping.extend(retired.items().extract_if(.., |(s, _)| *s < current))
                 }
             }
         }
@@ -424,11 +473,11 @@ fn run(shared: &Shared) -> io::Result<()> {
             crate::helper::drop_page_tables(region.as_ptr(), region.region_size());
         }
         unmapping.clear();
-        std::mem::swap(&mut *lock(&shared.doomed), &mut deleting);
+        lock(&shared.doomed).swap(&mut deleting);
         delete(shared, &mut deleting);
-        std::mem::swap(&mut *lock(&shared.retired_files), &mut closing);
+        lock(&shared.retired_files).swap(&mut closing);
         closing.clear();
-        std::mem::swap(&mut *lock(&shared.retired_workers), &mut releasing);
+        lock(&shared.retired_workers).swap(&mut releasing);
         releasing.clear();
         if shared.stop.load(Ordering::Acquire) {
             return Ok(());

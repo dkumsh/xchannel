@@ -453,7 +453,7 @@ fn a_live_reader_follows_rolls_with_both_helpers() {
     let path = channel("live-rolls");
     let mut writer = writer_builder(&path, Some(Helper::inherit()))
         .unmap(Unmap::AtFileRoll)
-        .keep_files(3)
+        .keep_files(8) // room for a reader descheduled under load
         .build()
         .unwrap();
     let mut reader = ReaderBuilder::new(&path)
@@ -655,4 +655,67 @@ fn a_reader_that_opened_an_abandoned_segment_ahead_reads_the_real_one() {
         drop(reader);
         cleanup_channel_files(&path);
     }
+}
+
+fn open_fds() -> usize {
+    std::fs::read_dir("/proc/self/fd").unwrap().count()
+}
+
+/// Over many rolls with both helpers and retention, descriptors, mappings and files stay flat,
+/// and all of it is released when the writer and reader are dropped.
+#[test]
+fn resources_stay_bounded_over_many_rolls_and_are_released() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let path = channel("bounded");
+    assert!(eventually(|| threads_named("xch-prefault") == 0));
+    let fds = open_fds();
+    let mut writer = writer_builder(&path, Some(Helper::inherit()))
+        .keep_files(3)
+        .build()
+        .unwrap();
+    let mut reader = ReaderBuilder::new(&path)
+        .live()
+        .helper(Helper::inherit())
+        .build()
+        .unwrap();
+    let (mut written, mut peak) = (0u64, (0, 0, 0));
+    for round in 0..40 {
+        written = write_from(&mut writer, written, 2_000);
+        while let Some(msg) = reader.try_read().unwrap() {
+            assert_eq!(msg.header().user_meta_u64 + 1, reader.position());
+        }
+        assert_eq!(reader.position(), written);
+        if round >= 5 {
+            let files = std::fs::read_dir(std::path::Path::new(&path).parent().unwrap())
+                .unwrap()
+                .count();
+            peak = (
+                peak.0.max(open_fds() - fds),
+                peak.1.max(
+                    mappings_of(&path)
+                        + (1..=writer.file_sequence())
+                            .map(|s| mappings_of(&format!("{path}.{s}")))
+                            .sum::<usize>(),
+                ),
+                peak.2.max(files),
+            );
+        }
+    }
+    assert!(
+        writer.file_sequence() > 30,
+        "rolled {}",
+        writer.file_sequence()
+    );
+    assert!(peak.0 <= 12, "{} descriptors over the baseline", peak.0);
+    assert!(peak.1 <= 12, "{} mappings", peak.1);
+    assert!(peak.2 <= 3 + 2 + 1, "{} files", peak.2);
+    drop(writer);
+    drop(reader);
+    assert!(
+        eventually(|| open_fds() == fds),
+        "{} descriptors left",
+        open_fds() - fds
+    );
+    assert_eq!(partials(&path), 0);
+    cleanup_channel_files(&path);
 }
