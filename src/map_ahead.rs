@@ -74,6 +74,9 @@ pub(crate) struct Shared {
     /// Tests: make the thread stop as it would on an old kernel or a bug.
     #[cfg(test)]
     pub(crate) inject: crate::helper::Inject,
+    /// Tests: stop with an error once the next segment is opened ahead.
+    #[cfg(test)]
+    pub(crate) fail_after_open: AtomicBool,
 }
 
 pub(crate) struct MapAhead {
@@ -111,6 +114,8 @@ impl MapAhead {
             saturated: AtomicU64::new(0),
             #[cfg(test)]
             inject: Default::default(),
+            #[cfg(test)]
+            fail_after_open: AtomicBool::new(false),
         });
         let for_thread = shared.clone();
         let thread = helper.spawn("xch-map-ahead", shared.failure.clone(), move || {
@@ -249,6 +254,10 @@ fn run(shared: &Shared) -> io::Result<()> {
                     upcoming = next.file.try_clone().ok().map(|f| (next.sequence, f));
                     let stale = lock(&shared.next_segment).replace(next);
                     drop(stale);
+                    #[cfg(test)]
+                    if shared.fail_after_open.load(Ordering::Acquire) {
+                        return Err(io::Error::from_raw_os_error(libc::EINVAL));
+                    }
                 }
             }
         }

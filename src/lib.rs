@@ -180,6 +180,18 @@ fn find_latest_published_sequence(base_path: &Path) -> io::Result<u64> {
     Ok(seqs.first().copied().unwrap_or(0))
 }
 
+/// Tests: abort the process at `point` if `XCH_CRASH_AT` names it.
+#[cfg(test)]
+fn crash_point(point: &str) {
+    if std::env::var("XCH_CRASH_AT").is_ok_and(|p| p == point) {
+        std::process::abort();
+    }
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn crash_point(_: &str) {}
+
 /// A "pre-installed" header is what `try_reserve()` lays down one
 /// slot ahead of itself before returning the buffer:
 /// `{committed: 0, header_type: User, length: 0, message_type: 0, user_meta_u64: 0}`.
@@ -1649,6 +1661,7 @@ impl Writer {
                 (identity, prepared, None)
             }
         };
+        crash_point("installed");
         let (
             new_file,
             mut new_channel_region,
@@ -1677,6 +1690,7 @@ impl Writer {
                 user_meta_u64: 0,
             };
         }
+        crash_point("staged");
 
         // 3) Stamp the base and publish. Nothing below fails.
         unsafe {
@@ -1684,11 +1698,15 @@ impl Writer {
                 .base_record_index = edge.next_base_record_index;
         }
         set_wake_flag(&new_channel_region, self.wake);
+        crash_point("stamped");
         unsafe { v4::ext_at(new_channel_region.as_ptr()) }.publish();
+        crash_point("published");
 
         // 4) Commit the Roll; then the terminal hint, one slot past it.
         MessageHeader::commit(roll_hdr_ptr);
+        crash_point("committed");
         self.store_wp_local((roll_pos + ROLL_TOTAL + HEADER_SLOT) as u64);
+        crash_point("positioned");
 
         if self.wake {
             wake::wake_all(&self.channel_header().wake_word);
@@ -1770,6 +1788,7 @@ impl Writer {
             generation,
             &identity,
         )?;
+        crash_point("attempt");
         match v4::install_no_replace(&attempt, &final_path) {
             Ok(()) => Ok((identity, segment)),
             Err(e) => {
@@ -8738,6 +8757,277 @@ mod tests {
         drop((r, w, shared));
         assert_eq!(segment_mappings(base), 0);
         cleanup_channel_files(base);
+        Ok(())
+    }
+
+    // ---------- a writer killed at each step of a roll ----------
+
+    const CRASH_POINTS: [&str; 7] = [
+        "attempt",
+        "installed",
+        "staged",
+        "stamped",
+        "published",
+        "committed",
+        "positioned",
+    ];
+
+    /// Run by `a_writer_killed_at_any_step_of_a_roll_recovers`: fill most of segment 0, then
+    /// roll, dying at `XCH_CRASH_AT`.
+    #[test]
+    #[ignore]
+    fn crash_child() -> anyhow::Result<()> {
+        let (Ok(base), Ok(helper)) = (
+            std::env::var("XCH_CRASH_BASE"),
+            std::env::var("XCH_CRASH_HELPER"),
+        ) else {
+            return Ok(());
+        };
+        let mut b = rolling_writer(&base)?;
+        if helper == "1" {
+            b = b.helper(Helper::inherit());
+        }
+        let mut w = b.build()?;
+        let mut i = 0;
+        while w.next_hdr_pos < w.region_size * 3 / 2 {
+            write_indexed(&mut w, i..i + 1)?;
+            i += 1;
+        }
+        #[cfg(target_os = "linux")]
+        if helper == "1" {
+            assert!(until(|| lock_ready(&w)));
+        }
+        w.roll_file()?;
+        Ok(())
+    }
+
+    /// Every segment file's bytes, to tell whether a recovery changed anything.
+    fn snapshot(base: &str) -> anyhow::Result<Vec<(u64, Vec<u8>)>> {
+        find_all_sequences(Path::new(base))?
+            .into_iter()
+            .map(|seq| {
+                Ok((
+                    seq,
+                    std::fs::read(make_channel_file_path(Path::new(base), seq)?)?,
+                ))
+            })
+            .collect()
+    }
+
+    /// A writer killed at each step of a roll, with or without its helper: readers already there
+    /// carry on, recovery keeps exactly the history written and a published successor's
+    /// identity, a second recovery changes nothing, and writing goes on.
+    #[test]
+    fn a_writer_killed_at_any_step_of_a_roll_recovers() -> anyhow::Result<()> {
+        let helpers: &[&str] = if cfg!(target_os = "linux") {
+            &["0", "1"]
+        } else {
+            &["0"]
+        };
+        for &helper in helpers {
+            for point in CRASH_POINTS {
+                if helper == "1" && point == "attempt" {
+                    continue; // the helper's successor is taken, never attempted
+                }
+                let base = format!("test_crash_{point}_{helper}");
+                let base = base.as_str();
+                cleanup_channel_files(base);
+                let status = std::process::Command::new(std::env::current_exe()?)
+                    .args(["--ignored", "--exact", "tests::crash_child"])
+                    .env("XCH_CRASH_AT", point)
+                    .env("XCH_CRASH_BASE", base)
+                    .env("XCH_CRASH_HELPER", helper)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()?;
+                let at = format!("{point} with helper {helper}");
+                use std::os::unix::process::ExitStatusExt;
+                assert_eq!(status.signal(), Some(libc::SIGABRT), "{at}: {status}");
+
+                let mut early = ReaderBuilder::new(base).build()?;
+                let mut written = 0;
+                while let Some(m) = early.try_read()? {
+                    assert_eq!(m.header().user_meta_u64, written, "{at}");
+                    written += 1;
+                }
+                let mut live = ReaderBuilder::new(base).live().build()?;
+                let published = segment_is_published(Path::new(base), 1)?
+                    .then(|| identity_on_disk(base, 1))
+                    .transpose()?;
+
+                let w = rolling_writer(base)?.build()?;
+                assert_eq!(w.next_record_index(), written, "{at}");
+                drop(w);
+                let recovered = snapshot(base)?;
+                drop(rolling_writer(base)?.build()?);
+                assert!(
+                    snapshot(base)? == recovered,
+                    "{at}: a second recovery changed bytes"
+                );
+                if let Some(identity) = published {
+                    assert_eq!(identity_on_disk(base, 1)?, identity, "{at}: kept");
+                }
+
+                let mut b = rolling_writer(base)?;
+                if helper == "1" {
+                    b = b.helper(Helper::inherit());
+                }
+                let mut w = b.build()?;
+                write_indexed(&mut w, written..written + 300)?;
+                let total = written + 300;
+                drop(w);
+                for r in [&mut early, &mut live] {
+                    while let Some(m) = r.try_read()? {
+                        assert_eq!(m.header().user_meta_u64 + 1, r.position(), "{at}");
+                    }
+                    assert_eq!(r.position(), total, "{at}");
+                }
+                let mut fresh = ReaderBuilder::new(base).build()?;
+                for i in 0..total {
+                    assert_eq!(fresh.try_read()?.expect("record").header().user_meta_u64, i);
+                }
+                fresh.seek(written)?;
+                assert_eq!(
+                    fresh.try_read()?.expect("record").header().user_meta_u64,
+                    written
+                );
+                let attempts = std::fs::read_dir(".")?
+                    .filter_map(|e| e.ok()?.file_name().into_string().ok())
+                    .filter(|n| n.starts_with(base) && n.ends_with(PARTIAL_SUFFIX))
+                    .count();
+                assert_eq!(attempts, 0, "{at}");
+                cleanup_channel_files(base);
+            }
+        }
+        Ok(())
+    }
+
+    // ---------- helper configurations against many readers ----------
+
+    #[cfg(target_os = "linux")]
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum HelperCase {
+        Off,
+        On,
+        FailsAtOnce,
+        FailsLate,
+    }
+
+    #[cfg(target_os = "linux")]
+    const HELPER_CASES: [HelperCase; 4] = [
+        HelperCase::Off,
+        HelperCase::On,
+        HelperCase::FailsAtOnce,
+        HelperCase::FailsLate,
+    ];
+
+    #[cfg(target_os = "linux")]
+    fn matrix_writer(base: &str, case: HelperCase) -> io::Result<Writer> {
+        let mut b = WriterBuilder::new(base)
+            .region_size(page_size())
+            .file_roll_size(page_size() as u64 * 4);
+        if case != HelperCase::Off {
+            b = b.helper(Helper::inherit());
+        }
+        let w = b.build()?;
+        if let Some(p) = &w.prefault {
+            match case {
+                HelperCase::FailsAtOnce => p.shared.inject.error(),
+                HelperCase::FailsLate => p.shared.fail_after_install.store(true, Ordering::Release),
+                _ => {}
+            }
+        }
+        Ok(w)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn matrix_reader(base: &str, case: HelperCase) -> io::Result<Reader> {
+        let mut b = ReaderBuilder::new(base);
+        if case != HelperCase::Off {
+            b = b.helper(Helper::inherit());
+        }
+        let r = b.build()?;
+        if let Some(a) = &r.map_ahead {
+            match case {
+                HelperCase::FailsAtOnce => a.shared.inject.error(),
+                HelperCase::FailsLate => a.shared.fail_after_open.store(true, Ordering::Release),
+                _ => {}
+            }
+        }
+        Ok(r)
+    }
+
+    /// Every writer helper case against 1, 2, 16 and 64 readers with mixed helper cases: each
+    /// reader gets every record once, in order, across regions and rolls.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn every_helper_case_delivers_every_record_to_every_reader() -> anyhow::Result<()> {
+        const TOTAL: u64 = 4_000;
+        for writer_case in HELPER_CASES {
+            for readers in [1usize, 2, 16, 64] {
+                let base = format!("test_matrix_{writer_case:?}_{readers}");
+                let base = base.as_str();
+                cleanup_channel_files(base);
+                let mut w = matrix_writer(base, writer_case)?;
+                let rs = (0..readers)
+                    .map(|i| matrix_reader(base, HELPER_CASES[i % 4]))
+                    .collect::<io::Result<Vec<_>>>()?;
+                thread::scope(|s| -> anyhow::Result<()> {
+                    let handles: Vec<_> = rs
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, mut r)| {
+                            s.spawn(move || -> anyhow::Result<(HelperCase, bool)> {
+                                let deadline = Instant::now() + Duration::from_secs(20);
+                                while r.position() < TOTAL {
+                                    match r.try_read()? {
+                                        Some(m) => assert_eq!(
+                                            m.header().user_meta_u64 + 1,
+                                            r.position(),
+                                            "reader {i}"
+                                        ),
+                                        None => {
+                                            assert!(Instant::now() < deadline, "reader {i}");
+                                            thread::yield_now();
+                                        }
+                                    }
+                                }
+                                let case = HELPER_CASES[i % 4];
+                                let failed = r.helper_error().is_some();
+                                match case {
+                                    HelperCase::Off | HelperCase::On => assert!(!failed),
+                                    HelperCase::FailsAtOnce => assert!(failed),
+                                    // Only if it opened a successor ahead in time.
+                                    HelperCase::FailsLate => {}
+                                }
+                                Ok((case, failed))
+                            })
+                        })
+                        .collect();
+                    // Slow enough that a file lasts longer than a reader helper's 5 ms look-ahead.
+                    for chunk in (0..TOTAL).step_by(100) {
+                        write_indexed(&mut w, chunk..chunk + 100)?;
+                        thread::sleep(Duration::from_millis(3));
+                    }
+                    let mut late_failed = false;
+                    for r in handles {
+                        let (case, failed) = r.join().expect("reader thread")?;
+                        late_failed |= case == HelperCase::FailsLate && failed;
+                    }
+                    if writer_case == HelperCase::On && readers >= 16 {
+                        assert!(late_failed, "a reader helper opened a successor ahead");
+                    }
+                    Ok(())
+                })
+                .map_err(|e| e.context(format!("writer {writer_case:?}, {readers} readers")))?;
+                assert!(w.file_sequence > 5, "rolled");
+                let failing =
+                    matches!(writer_case, HelperCase::FailsAtOnce | HelperCase::FailsLate);
+                assert_eq!(w.helper_error().is_some(), failing, "{writer_case:?}");
+                drop(w);
+                cleanup_channel_files(base);
+            }
+        }
         Ok(())
     }
 }

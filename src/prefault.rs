@@ -160,6 +160,9 @@ pub(crate) struct Shared {
     pub(crate) fail_prepare: AtomicBool,
     #[cfg(test)]
     pub(crate) prepare_attempts: AtomicU64,
+    /// Tests: stop with an error once a successor is installed and handed over.
+    #[cfg(test)]
+    pub(crate) fail_after_install: AtomicBool,
 }
 
 pub(crate) struct Prefaulter {
@@ -229,6 +232,8 @@ impl Prefaulter {
             fail_prepare: AtomicBool::new(false),
             #[cfg(test)]
             prepare_attempts: AtomicU64::new(0),
+            #[cfg(test)]
+            fail_after_install: AtomicBool::new(false),
         });
         let for_thread = shared.clone();
         let thread = helper.spawn("xch-prefault", shared.failure.clone(), move || {
@@ -589,6 +594,10 @@ fn prepare_segment(
             segment,
             worker,
         });
+    }
+    #[cfg(test)]
+    if shared.fail_after_install.load(Ordering::Acquire) {
+        return Err(io::Error::from_raw_os_error(libc::EINVAL));
     }
     Ok(())
 }
