@@ -1640,11 +1640,14 @@ impl Writer {
             p.claim(next_seq);
             p.try_take_segment(next_seq)
         });
-        let (identity, prepared) = match taken.filter(|(identity, _)| {
+        let (identity, prepared, worker) = match taken.filter(|(identity, _, _)| {
             identity.predecessor == self.instance && identity.predecessor_sequence == old_seq
         }) {
-            Some(taken) => taken,
-            None => self.prepare_successor(next_seq, generation)?,
+            Some((identity, prepared, worker)) => (identity, prepared, Some(worker)),
+            None => {
+                let (identity, prepared) = self.prepare_successor(next_seq, generation)?;
+                (identity, prepared, None)
+            }
         };
         let (
             new_file,
@@ -1693,7 +1696,7 @@ impl Writer {
 
         self.file_sequence = next_seq;
         self.instance = identity.instance;
-        self.file = new_file;
+        let old_file = std::mem::replace(&mut self.file, new_file);
         let old_channel = std::mem::replace(&mut self.channel_region, new_channel_region);
         let old_current = std::mem::replace(&mut self.current_region, new_current_region);
         self.current_region_index = new_index;
@@ -1713,13 +1716,16 @@ impl Writer {
                     write_position: unsafe { &*wp },
                 },
                 [old_channel, old_current],
+                old_file,
+                worker,
             );
         } else {
             self.held.clear();
         }
 
         // Retention: best-effort; the roll has happened, so its errors are not the roll's.
-        for seq in std::mem::take(&mut self.deferred_prune) {
+        for _ in 0..self.deferred_prune.len() {
+            let seq = self.deferred_prune.remove(0);
             self.prune(seq);
         }
         if let Some(n) = self.keep_files
@@ -1733,14 +1739,11 @@ impl Writer {
 
     /// Unlink segment `seq`, unless the helper may still install it: then on a later roll.
     fn prune(&mut self, seq: u64) {
-        if self.prefault.as_ref().is_some_and(|p| p.installing(seq)) {
-            self.deferred_prune.push(seq);
-            return;
-        }
-        if let Ok(path) = make_channel_file_path(&self.base_path, seq) {
-            match &self.prefault {
-                Some(prefault) => prefault.unlink(path),
-                None => {
+        match &self.prefault {
+            Some(p) if p.installing(seq) => self.deferred_prune.push(seq),
+            Some(p) => p.unlink(seq),
+            None => {
+                if let Ok(path) = make_channel_file_path(&self.base_path, seq) {
                     let _ = std::fs::remove_file(&path);
                 }
             }
@@ -1931,6 +1934,7 @@ impl Writer {
             generation: self.channel_header().generation,
         });
         let prefaulter = prefault::Prefaulter::start(
+            self.base_path.clone(),
             prefault::Position {
                 sequence: self.file_sequence,
                 instance: self.instance,
@@ -3234,11 +3238,7 @@ impl Reader {
                         scan_file_sequence = next.sequence;
                         position = next.base_record_index;
                         // Its region 0 is already mapped; hand it to the next segment's scan.
-                        self.maps.push(Arc::new(MappedRegion {
-                            file_sequence: next.sequence,
-                            region_idx: 0,
-                            mapping: next.region0,
-                        }));
+                        self.maps.push(next.region0);
                         rolled = Some(BatchRoll {
                             opened_ahead: next.opened_ahead,
                             file: next.file,
@@ -3816,11 +3816,7 @@ impl Reader {
         self.wake_untrusted = false;
         self.wake_miss = None;
         self.read_position = 0;
-        self.maps.push(Arc::new(MappedRegion {
-            file_sequence: next.sequence,
-            region_idx: 0,
-            mapping: next.region0,
-        }));
+        self.maps.push(next.region0);
         self.retire_all_but_last();
         self.rolled(next.opened_ahead, old_file, old_header);
         Ok(())
@@ -3881,17 +3877,22 @@ impl Reader {
                     .read(true)
                     .write(false)
                     .open(&file_path)?;
-                let region0 = RegionMapping::create_read_only(&file, 0, region_size)?;
+                let region0 = Arc::new(MappedRegion {
+                    file_sequence: next_sequence,
+                    region_idx: 0,
+                    mapping: RegionMapping::create_read_only(&file, 0, region_size)?,
+                });
                 (file, region0, None, false)
             }
         };
-        let mh = unsafe { &*(region0.as_ptr() as *const MessageHeader) };
+        let page0 = region0.mapping.as_ptr();
+        let mh = unsafe { &*(page0 as *const MessageHeader) };
         if mh.parsed_header_type()? != HeaderType::Channel {
             return Err(err_other("next file missing Channel header"));
         }
-        let ch = get_channel_header(region0.as_ptr());
+        let ch = get_channel_header(page0);
         validate_channel_header(ch, region_size, next_sequence)?;
-        let identity = validate_v4_prefix(region0.as_ptr())?;
+        let identity = validate_v4_prefix(page0)?;
         if !edge.names(prev_sequence, prev_instance, &identity) {
             return Err(err_invalid_data(format!(
                 "segment {next_sequence} is instance {:?} of parent {:?}, but the Roll that \
@@ -3899,7 +3900,7 @@ impl Reader {
                 identity.instance, identity.predecessor, edge.next_instance
             )));
         }
-        if !is_published(region0.as_ptr())? {
+        if !is_published(page0)? {
             return Err(err_invalid_data(format!(
                 "segment {next_sequence} is not published, but a committed Roll leads to it"
             )));
@@ -3968,7 +3969,7 @@ struct Successor {
     /// The helper opened it ahead of the roll.
     opened_ahead: bool,
     file: File,
-    region0: RegionMapping<ReadOnly>,
+    region0: Arc<MappedRegion>,
     /// Page 0, kept for the wake flag and word.
     header: RegionMapping<ReadOnly>,
     channel_name: [u8; CHANNEL_NAME_MAX],

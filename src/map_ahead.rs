@@ -38,7 +38,8 @@ struct Ready {
 pub(crate) struct NextSegment {
     pub(crate) sequence: u64,
     pub(crate) file: File,
-    pub(crate) region0: RegionMapping<ReadOnly>,
+    /// Region 0, ready to push onto the reader's maps.
+    pub(crate) region0: Arc<MappedRegion>,
     pub(crate) header: RegionMapping<ReadOnly>,
     /// Who the file says it is, which never changes once it is installed.
     pub(crate) identity: Identity,
@@ -241,9 +242,10 @@ fn run(shared: &Shared) -> io::Result<()> {
                     let mapping = &region.mapping;
                     drop_page_tables(mapping.as_ptr(), mapping.region_size());
                 }
-                Retired::Segment(next) => {
-                    drop_page_tables(next.region0.as_ptr(), next.region0.region_size())
-                }
+                Retired::Segment(next) => drop_page_tables(
+                    next.region0.mapping.as_ptr(),
+                    next.region0.mapping.region_size(),
+                ),
                 _ => {}
             }
         }
@@ -268,7 +270,11 @@ fn open_next(shared: &Shared, sequence: u64) -> Option<NextSegment> {
     Some(NextSegment {
         sequence,
         file,
-        region0,
+        region0: Arc::new(MappedRegion {
+            file_sequence: sequence,
+            region_idx: 0,
+            mapping: region0,
+        }),
         header,
         identity,
     })

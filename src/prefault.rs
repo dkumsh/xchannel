@@ -50,7 +50,7 @@ pub(crate) struct Segment {
     pub(crate) sequence: u64,
     /// Its instance ID: the parent its successor names.
     instance: InstanceId,
-    pub(crate) file: File,
+    pub(crate) file: Arc<File>,
     pub(crate) len: u64,
 }
 
@@ -84,6 +84,8 @@ pub(crate) struct NextSegment {
     identity: Identity,
     path: PathBuf,
     segment: PreparedSegment,
+    /// The thread's own handle, so the roll needs no `dup`.
+    worker: Arc<File>,
 }
 
 pub(crate) struct NextSegments {
@@ -120,8 +122,15 @@ pub(crate) struct Shared {
     /// The segment the thread may be installing, or `NONE`. With `claimed` (both SeqCst), it
     /// keeps a late install from bringing back a segment retention has removed.
     pub(crate) in_flight: AtomicU64,
+    base_path: PathBuf,
     /// Segments retention dropped, to delete.
-    doomed: Mutex<Vec<PathBuf>>,
+    doomed: Mutex<Vec<u64>>,
+    /// Descriptors the writer left, to close.
+    retired_files: Mutex<Vec<File>>,
+    /// The thread's handles on segments the writer left, to close.
+    retired_workers: Mutex<Vec<Arc<File>>>,
+    /// A segment the writer rolled to, waiting for `segment` to be free. Writer-side only.
+    handoff: Mutex<Option<Segment>>,
     /// Tests: make the thread stop as it would on an old kernel or a bug.
     #[cfg(test)]
     pub(crate) inject: crate::helper::Inject,
@@ -153,7 +162,9 @@ pub(crate) struct Position<'a> {
 }
 
 impl Prefaulter {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn start(
+        base_path: PathBuf,
         at: Position<'_>,
         region_size: usize,
         regions_per_file: Option<u64>,
@@ -170,7 +181,7 @@ impl Prefaulter {
             segment: Mutex::new(Segment {
                 sequence: at.sequence,
                 instance: at.instance,
-                file: at.file.try_clone()?,
+                file: Arc::new(at.file.try_clone()?),
                 len: at.file_len,
             }),
             write_position: AtomicPtr::new(at.write_position as *const AtomicU64 as *mut _),
@@ -186,7 +197,11 @@ impl Prefaulter {
             }),
             claimed: AtomicU64::new(at.sequence),
             in_flight: AtomicU64::new(NONE),
+            base_path,
             doomed: Mutex::new(Vec::with_capacity(4)),
+            retired_files: Mutex::new(Vec::with_capacity(4)),
+            retired_workers: Mutex::new(Vec::with_capacity(4)),
+            handoff: Mutex::new(None),
             #[cfg(test)]
             inject: Default::default(),
             #[cfg(test)]
@@ -220,16 +235,19 @@ impl Prefaulter {
         self.shared.claimed.store(sequence, Ordering::SeqCst);
     }
 
-    /// Segment `sequence`, if it was installed ahead, with its identity. Never waits: a busy
-    /// hand-over is a miss.
-    pub(crate) fn try_take_segment(&self, sequence: u64) -> Option<(Identity, PreparedSegment)> {
+    /// Segment `sequence`, if it was installed ahead, with its identity and the thread's handle on
+    /// it. Never waits: a busy hand-over is a miss.
+    pub(crate) fn try_take_segment(
+        &self,
+        sequence: u64,
+    ) -> Option<(Identity, PreparedSegment, Arc<File>)> {
         let mut next = match self.shared.next_segment.try_lock() {
             Ok(next) => next,
             Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
             Err(std::sync::TryLockError::WouldBlock) => return None,
         };
         match next.ready.take() {
-            Some(n) if n.sequence == sequence => Some((n.identity, n.segment)),
+            Some(n) if n.sequence == sequence => Some((n.identity, n.segment, n.worker)),
             other => {
                 next.ready = other;
                 None
@@ -242,9 +260,9 @@ impl Prefaulter {
         self.shared.in_flight.load(Ordering::SeqCst) == sequence
     }
 
-    /// Delete `path` here rather than on the writer: freeing a large file's blocks takes time.
-    pub(crate) fn unlink(&self, path: PathBuf) {
-        lock(&self.shared.doomed).push(path);
+    /// Delete segment `sequence` here rather than on the writer.
+    pub(crate) fn unlink(&self, sequence: u64) {
+        lock(&self.shared.doomed).push(sequence);
         self.release_if_stopped();
     }
 
@@ -264,9 +282,9 @@ impl Prefaulter {
             Unmap::AtFileRoll => retired.retain(|(s, _)| *s >= current),
         }
         drop(retired);
-        for path in lock(&shared.doomed).drain(..) {
-            let _ = std::fs::remove_file(path);
-        }
+        lock(&shared.retired_files).clear();
+        lock(&shared.retired_workers).clear();
+        delete(shared, &mut lock(&shared.doomed));
     }
 
     /// The writer moved to `region`; `left` is unmapped here rather than on the writer.
@@ -283,33 +301,56 @@ impl Prefaulter {
         shared.current_index.store(index, Ordering::Release);
         let sequence = shared.current_sequence.load(Ordering::Relaxed);
         lock(&shared.retired).push((sequence, left));
+        self.hand_off();
         self.release_if_stopped();
     }
 
-    /// The writer rolled to the segment at `at`, leaving the old segment's mappings `left`.
+    /// Give the thread the segment the writer rolled to, if `segment` is free now.
+    fn hand_off(&self) {
+        let mut handoff = lock(&self.shared.handoff);
+        if handoff.is_none() {
+            return;
+        }
+        let mut segment = match self.shared.segment.try_lock() {
+            Ok(segment) => segment,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return,
+        };
+        let left = std::mem::replace(&mut *segment, handoff.take().expect("checked"));
+        lock(&self.shared.retired_workers).push(left.file);
+    }
+
+    /// The writer rolled to the segment at `at`, leaving the old segment's mappings `left` and its
+    /// descriptor `left_file`. `worker` is the thread's handle on the new one, if it made it.
     pub(crate) fn rolled(
         &self,
         at: Position<'_>,
         left: impl IntoIterator<Item = RegionMapping<Writable>>,
+        left_file: File,
+        worker: Option<Arc<File>>,
     ) {
         let shared = &self.shared;
         let old = shared.current_sequence.load(Ordering::Relaxed);
-        let file = at.file.try_clone();
+        let file = match worker {
+            Some(worker) => Ok(worker),
+            None => at.file.try_clone().map(Arc::new),
+        };
         #[cfg(test)]
         let file = file.and_then(|f| match shared.fail_clone.load(Ordering::Acquire) {
             true => Err(io::Error::from_raw_os_error(libc::EMFILE)),
             false => Ok(f),
         });
-        // Without a handle of its own (out of file descriptors), the thread stays on the old
-        // segment: it prepares nothing in the new one, and the writer grows it itself.
+        // Without a handle (out of descriptors) the thread stays on the old segment.
         if let Ok(file) = file {
-            *lock(&shared.segment) = Segment {
+            *lock(&shared.handoff) = Some(Segment {
                 sequence: at.sequence,
                 instance: at.instance,
                 file,
                 len: at.file_len,
-            };
+            });
+            self.hand_off();
         }
+        lock(&shared.retired_files).push(left_file);
         shared.write_position.store(
             at.write_position as *const AtomicU64 as *mut _,
             Ordering::Release,
@@ -340,9 +381,7 @@ impl Drop for Prefaulter {
         {
             let _ = std::fs::remove_file(unused.path);
         }
-        for path in lock(&self.shared.doomed).drain(..) {
-            let _ = std::fs::remove_file(path);
-        }
+        delete(&self.shared, &mut lock(&self.shared.doomed));
     }
 }
 
@@ -350,11 +389,22 @@ pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Unlink the segments in `doomed`, emptying it.
+fn delete(shared: &Shared, doomed: &mut Vec<u64>) {
+    for sequence in doomed.drain(..) {
+        if let Ok(path) = make_channel_file_path(&shared.base_path, sequence) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
 fn run(shared: &Shared) -> io::Result<()> {
     let size = shared.region_size;
     let page = page_size();
     let mut unmapping = Vec::with_capacity(64);
     let mut deleting = Vec::with_capacity(4);
+    let mut closing = Vec::with_capacity(4);
+    let mut releasing = Vec::with_capacity(4);
     let (mut done_at, mut done_to) = ((u64::MAX, u64::MAX), 0usize);
     let mut next_head_done = (u64::MAX, u64::MAX);
     let (mut since, mut since_at) = (Instant::now(), (u64::MAX, 0u64));
@@ -375,9 +425,11 @@ fn run(shared: &Shared) -> io::Result<()> {
         }
         unmapping.clear();
         std::mem::swap(&mut *lock(&shared.doomed), &mut deleting);
-        for path in deleting.drain(..) {
-            let _ = std::fs::remove_file(path);
-        }
+        delete(shared, &mut deleting);
+        std::mem::swap(&mut *lock(&shared.retired_files), &mut closing);
+        closing.clear();
+        std::mem::swap(&mut *lock(&shared.retired_workers), &mut releasing);
+        releasing.clear();
         if shared.stop.load(Ordering::Acquire) {
             return Ok(());
         }
@@ -476,7 +528,7 @@ fn prepare_segment(
         install_ahead(shared, spec, sequence, parent, ahead)
     };
     shared.in_flight.store(NONE, Ordering::SeqCst);
-    let Some((identity, path, segment)) = installed? else {
+    let Some((identity, path, segment, worker)) = installed? else {
         return Ok(());
     };
     let mut next = lock(&shared.next_segment);
@@ -486,6 +538,7 @@ fn prepare_segment(
             identity,
             path,
             segment,
+            worker,
         });
     }
     Ok(())
@@ -500,7 +553,7 @@ fn install_ahead(
     sequence: u64,
     parent: InstanceId,
     ahead: usize,
-) -> io::Result<Option<(Identity, PathBuf, PreparedSegment)>> {
+) -> io::Result<Option<(Identity, PathBuf, PreparedSegment, Arc<File>)>> {
     let identity = Identity::successor(InstanceId::fresh()?, parent, sequence - 1);
     let attempt = make_attempt_path(&spec.base_path, sequence, identity.instance)?;
     let path = make_channel_file_path(&spec.base_path, sequence)?;
@@ -540,7 +593,8 @@ fn install_ahead(
         Err(_) => return refuse(),
     }
     populated?;
-    Ok(Some((identity, path, segment)))
+    let worker = Arc::new(segment.0.try_clone()?);
+    Ok(Some((identity, path, segment, worker)))
 }
 
 fn prepare(shared: &Shared, sequence: u64, index: u64) {
@@ -551,7 +605,7 @@ fn prepare(shared: &Shared, sequence: u64, index: u64) {
         return;
     }
     let size = shared.region_size;
-    let mapped = {
+    let file = {
         let mut segment = lock(&shared.segment);
         if segment.sequence != sequence {
             return;
@@ -563,9 +617,9 @@ fn prepare(shared: &Shared, sequence: u64, index: u64) {
             }
             segment.len = needed;
         }
-        RegionMapping::create_writable(&segment.file, index * size as u64, size)
+        segment.file.clone()
     };
-    let Ok(region) = mapped else {
+    let Ok(region) = RegionMapping::create_writable(&file, index * size as u64, size) else {
         return;
     };
     let stale = lock(&shared.next).replace(Next {
