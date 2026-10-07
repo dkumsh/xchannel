@@ -1,25 +1,5 @@
-//! Format v4: a file's physical preparation is separate from its logical publication, and a
-//! `Roll` names its successor exactly.
-//!
-//! A v4 file carries a 64-byte extension after the 128-byte `ChannelHeader`: an opaque 128-bit
-//! instance ID for this physical file, its predecessor's ID and sequence, and a publication state
-//! (`PREPARED`, then `PUBLISHED`). A helper can then create, size, initialise and install the next
-//! file under its final name well ahead of the roll, and the writer publishes it with one release
-//! store. A v4 `Roll` carries a 40-byte body naming the successor's sequence, instance ID and base
-//! record index, so a reader can check a file it opened ahead against the committed `Roll` in
-//! mapped memory, without asking the filesystem whether the name still points at it.
-//!
-//! Layout (file offsets; see `FORMAT.md`):
-//!
-//! | offset | size | what |
-//! |-------:|-----:|------|
-//! |      0 |   16 | `MessageHeader(Channel)`, `length` 192 |
-//! |     16 |  128 | `ChannelHeader`, as in v3 |
-//! |    144 |   64 | [`ChannelHeaderExt`] |
-//! |    208 |   16 | first record header |
-//!
-//! Nothing here is wired into the writer or reader yet; the `allow` goes when it is.
-#![allow(dead_code)]
+//! Format v4: the header extension (instance ID, parent, publication state) and the `Roll` body
+//! that names a successor. Layout in FORMAT.md.
 
 use std::io::{self, ErrorKind};
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -302,10 +282,7 @@ pub(crate) unsafe fn ext_at_mut<'a>(region0: *mut u8) -> &'a mut ChannelHeaderEx
 
 // ---------- installation ----------
 
-/// Give the complete file at `from` its final name `to`, atomically, and only if `to` does not
-/// exist: [`ErrorKind::AlreadyExists`] if it does. Never replaces a file another writer, helper or
-/// recovery installed. On Linux `renameat2(RENAME_NOREPLACE)`; where that is missing, or the
-/// filesystem refuses it, a hard link and an unlink, which is atomic and no-replace as well.
+/// Rename `from` to `to` atomically, never replacing: `AlreadyExists` if `to` exists.
 pub(crate) fn install_no_replace(from: &std::path::Path, to: &std::path::Path) -> io::Result<()> {
     #[cfg(target_os = "linux")]
     {

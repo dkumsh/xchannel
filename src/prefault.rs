@@ -9,9 +9,9 @@
 //! regions the writer has left. Data and format are untouched; a region not ready in time is
 //! mapped by the writer as before.
 //!
-//! Halfway through a rolling segment's last region the thread also creates the next segment under
-//! its `.partial` name, which is the slow part of a roll, so the writer only has to stamp its base
-//! and rename it. It also deletes the segments retention drops.
+//! Halfway through a rolling segment's last region the thread also creates the next segment and
+//! installs it under its final name, still `PREPARED`, so the writer's roll only stamps its base
+//! and publishes it. It also deletes the segments retention drops.
 //!
 //! The thread follows the writer across file rolls. Mappings the writer leaves, the old segment's
 //! included, are unmapped only here and only at the top of an iteration, before the thread reads
@@ -24,7 +24,9 @@
 use crate::helper::{Failure, Thread};
 use crate::region::{RegionMapping, Writable, page_size};
 use crate::v4::{Identity, InstanceId};
-use crate::{CHANNEL_NAME_MAX, Helper, Unmap, Writer, make_partial_channel_file_path};
+use crate::{
+    CHANNEL_NAME_MAX, Helper, Unmap, Writer, make_attempt_path, make_channel_file_path, v4,
+};
 use std::fs::File;
 use std::io;
 use std::path::PathBuf;
@@ -38,6 +40,8 @@ const AHEAD_TIME: Duration = Duration::from_millis(100);
 const AHEAD_MIN: usize = 64 << 10;
 const AHEAD_MAX: usize = 1 << 20;
 const POLL: Duration = Duration::from_micros(50);
+/// `in_flight` when nothing is being installed.
+pub(crate) const NONE: u64 = u64::MAX;
 
 /// The segment being written, and the lock both threads take to grow it: a grow from a stale view
 /// would truncate what the other mapped. If the thread could not open the segment the writer
@@ -75,17 +79,16 @@ pub(crate) struct SegmentSpec {
     pub(crate) generation: u64,
 }
 
-struct NextSegment {
+pub(crate) struct NextSegment {
     sequence: u64,
     identity: Identity,
     path: PathBuf,
     segment: PreparedSegment,
 }
 
-struct NextSegments {
-    /// Segments up to this one belong to the writer: taken, or created by it.
-    claimed: u64,
-    ready: Option<NextSegment>,
+pub(crate) struct NextSegments {
+    /// Installed ahead, not yet taken.
+    pub(crate) ready: Option<NextSegment>,
     /// A segment that could not be created ahead (no space, no permission): not tried again,
     /// the writer creates it at the roll as it does without a helper.
     refused: Option<u64>,
@@ -110,9 +113,13 @@ pub(crate) struct Shared {
     retired: Mutex<Vec<(u64, RegionMapping<Writable>)>>,
     /// Set for a rolling channel: its next segment is prepared ahead.
     spec: Option<SegmentSpec>,
-    /// Held for the whole of a segment's creation, so the writer never creates the same one
-    /// alongside: both would claim the `.partial` name.
-    next_segment: Mutex<NextSegments>,
+    /// Held only to hand a segment over; the writer only `try_lock`s it.
+    pub(crate) next_segment: Mutex<NextSegments>,
+    /// The newest segment the writer has rolled to, or is rolling to.
+    claimed: AtomicU64,
+    /// The segment the thread may be installing, or `NONE`. With `claimed` (both SeqCst), it
+    /// keeps a late install from bringing back a segment retention has removed.
+    pub(crate) in_flight: AtomicU64,
     /// Segments retention dropped, to delete.
     doomed: Mutex<Vec<PathBuf>>,
     /// Tests: make the thread stop as it would on an old kernel or a bug.
@@ -174,10 +181,11 @@ impl Prefaulter {
             retired: Mutex::new(Vec::with_capacity(64)),
             spec,
             next_segment: Mutex::new(NextSegments {
-                claimed: at.sequence,
                 ready: None,
                 refused: None,
             }),
+            claimed: AtomicU64::new(at.sequence),
+            in_flight: AtomicU64::new(NONE),
             doomed: Mutex::new(Vec::with_capacity(4)),
             #[cfg(test)]
             inject: Default::default(),
@@ -207,11 +215,19 @@ impl Prefaulter {
         }
     }
 
-    /// Segment `sequence`, if it was created ahead under its `.partial` name, with the identity
-    /// it was created with.
-    pub(crate) fn take_segment(&self, sequence: u64) -> Option<(Identity, PreparedSegment)> {
-        let mut next = lock(&self.shared.next_segment);
-        next.claimed = next.claimed.max(sequence);
+    /// The writer is rolling to `sequence`.
+    pub(crate) fn claim(&self, sequence: u64) {
+        self.shared.claimed.store(sequence, Ordering::SeqCst);
+    }
+
+    /// Segment `sequence`, if it was installed ahead, with its identity. Never waits: a busy
+    /// hand-over is a miss.
+    pub(crate) fn try_take_segment(&self, sequence: u64) -> Option<(Identity, PreparedSegment)> {
+        let mut next = match self.shared.next_segment.try_lock() {
+            Ok(next) => next,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
         match next.ready.take() {
             Some(n) if n.sequence == sequence => Some((n.identity, n.segment)),
             other => {
@@ -219,6 +235,11 @@ impl Prefaulter {
                 None
             }
         }
+    }
+
+    /// Whether the thread may still install segment `sequence`.
+    pub(crate) fn installing(&self, sequence: u64) -> bool {
+        self.shared.in_flight.load(Ordering::SeqCst) == sequence
     }
 
     /// Delete `path` here rather than on the writer: freeing a large file's blocks takes time.
@@ -313,7 +334,10 @@ impl Drop for Prefaulter {
     fn drop(&mut self) {
         self.shared.stop.store(true, Ordering::Release);
         self.thread.join();
-        if let Some(unused) = lock(&self.shared.next_segment).ready.take() {
+        // An unused successor goes, but only while unpublished: the writer may have adopted it.
+        if let Some(unused) = lock(&self.shared.next_segment).ready.take()
+            && crate::is_published(unused.segment.1.as_ptr()).is_ok_and(|published| !published)
+        {
             let _ = std::fs::remove_file(unused.path);
         }
         for path in lock(&self.shared.doomed).drain(..) {
@@ -422,14 +446,21 @@ fn prepare_segment(
     sequence: u64,
     ahead: usize,
 ) -> io::Result<()> {
-    let mut next = lock(&shared.next_segment);
-    if sequence <= next.claimed
-        || next.refused == Some(sequence)
-        || next.ready.as_ref().is_some_and(|n| n.sequence == sequence)
     {
-        return Ok(());
+        let mut next = lock(&shared.next_segment);
+        if next
+            .ready
+            .as_ref()
+            .is_some_and(|n| n.sequence <= shared.claimed.load(Ordering::SeqCst))
+        {
+            next.ready = None; // passed by the writer
+        }
+        if next.refused == Some(sequence)
+            || next.ready.as_ref().is_some_and(|n| n.sequence == sequence)
+        {
+            return Ok(());
+        }
     }
-    // The parent the new file names: the segment being written, if the thread is still on it.
     let parent = {
         let segment = lock(&shared.segment);
         (segment.sequence + 1 == sequence).then_some(segment.instance)
@@ -437,12 +468,46 @@ fn prepare_segment(
     let Some(parent) = parent else {
         return Ok(());
     };
+    // Announce, then check: the writer claims, then checks before retention unlinks.
+    shared.in_flight.store(sequence, Ordering::SeqCst);
+    let installed = if shared.claimed.load(Ordering::SeqCst) >= sequence {
+        Ok(None)
+    } else {
+        install_ahead(shared, spec, sequence, parent, ahead)
+    };
+    shared.in_flight.store(NONE, Ordering::SeqCst);
+    let Some((identity, path, segment)) = installed? else {
+        return Ok(());
+    };
+    let mut next = lock(&shared.next_segment);
+    if shared.claimed.load(Ordering::SeqCst) < sequence {
+        next.ready = Some(NextSegment {
+            sequence,
+            identity,
+            path,
+            segment,
+        });
+    }
+    Ok(())
+}
+
+/// Create segment `sequence` under a private name and install it under its final name.
+/// `None` if the writer installed it first or it could not be created (not retried).
+#[allow(clippy::type_complexity)]
+fn install_ahead(
+    shared: &Shared,
+    spec: &SegmentSpec,
+    sequence: u64,
+    parent: InstanceId,
+    ahead: usize,
+) -> io::Result<Option<(Identity, PathBuf, PreparedSegment)>> {
     let identity = Identity::successor(InstanceId::fresh()?, parent, sequence - 1);
-    let path = make_partial_channel_file_path(&spec.base_path, sequence)?;
+    let attempt = make_attempt_path(&spec.base_path, sequence, identity.instance)?;
+    let path = make_channel_file_path(&spec.base_path, sequence)?;
     #[cfg(test)]
     shared.prepare_attempts.fetch_add(1, Ordering::Relaxed);
     let prepared = Writer::prepare_segment_at(
-        &path,
+        &attempt,
         sequence,
         shared.region_size,
         spec.file_roll_size,
@@ -457,23 +522,25 @@ fn prepare_segment(
         true => Err(io::Error::from_raw_os_error(libc::ENOSPC)),
         false => Ok(s),
     });
+    let refuse = || {
+        let _ = std::fs::remove_file(&attempt);
+        lock(&shared.next_segment).refused = Some(sequence);
+        Ok(None)
+    };
     let Ok(mut segment) = prepared else {
-        // Out of space or not allowed: retrying every pass would only repeat it. Leave no
-        // `.partial` behind; the writer creates this segment at the roll, and reports its error.
-        let _ = std::fs::remove_file(&path);
-        next.refused = Some(sequence);
-        return Ok(());
+        return refuse(); // no space or permission: the writer creates it at the roll
     };
     let populated = populate(segment.2.as_mut_ptr(), ahead.min(shared.region_size));
-    let stale = next.ready.replace(NextSegment {
-        sequence,
-        identity,
-        path,
-        segment,
-    });
-    drop(next);
-    drop(stale);
-    populated
+    match v4::install_no_replace(&attempt, &path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            let _ = std::fs::remove_file(&attempt);
+            return Ok(None);
+        }
+        Err(_) => return refuse(),
+    }
+    populated?;
+    Ok(Some((identity, path, segment)))
 }
 
 fn prepare(shared: &Shared, sequence: u64, index: u64) {

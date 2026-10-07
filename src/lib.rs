@@ -135,10 +135,7 @@ fn validate_channel_header(
     Ok(())
 }
 
-/// Check what v4 adds to a segment's first record, mapped at `page0`, once
-/// [`validate_channel_header`] has accepted the format version: a Channel record of v4 length
-/// and a well-formed extension. Returns the file's identity, which never changes; says nothing
-/// about whether the file is published.
+/// The v4 Channel record length and extension of the segment mapped at `page0`; its identity.
 fn validate_v4_prefix(page0: *const u8) -> io::Result<Identity> {
     let mh = unsafe { &*(page0 as *const MessageHeader) };
     if mh.length as usize != v4::CHANNEL_PAYLOAD_V4 {
@@ -151,13 +148,12 @@ fn validate_v4_prefix(page0: *const u8) -> io::Result<Identity> {
     unsafe { v4::ext_at(page0) }.identity()
 }
 
-/// Whether the file mapped at `page0` is published, with acquire: its base is final once it is.
+/// Whether the file mapped at `page0` is published (acquire).
 fn is_published(page0: *const u8) -> io::Result<bool> {
     Ok(unsafe { v4::ext_at(page0) }.state()? == v4::State::Published)
 }
 
-/// Whether segment `sequence` exists and is published. A file that is not there yet, or is still
-/// `PREPARED` (installed ahead of its roll), is not part of the channel's history.
+/// Whether segment `sequence` exists and is published.
 fn segment_is_published(base_path: &Path, sequence: u64) -> io::Result<bool> {
     let Some(file) = open_segment_if_present(base_path, sequence)? else {
         return Ok(false);
@@ -172,9 +168,7 @@ fn segment_is_published(base_path: &Path, sequence: u64) -> io::Result<bool> {
     is_published(page0.as_ptr())
 }
 
-/// The newest published segment of `base_path`. Newer final files still `PREPARED` (a successor
-/// installed ahead of its roll) are skipped. A file whose header this build cannot read is
-/// returned as it is, for the caller's open to report why.
+/// The newest published segment; one this build cannot read is returned for its open to report.
 fn find_latest_published_sequence(base_path: &Path) -> io::Result<u64> {
     let seqs = find_all_sequences(base_path)?;
     for &seq in seqs.iter().rev() {
@@ -819,6 +813,8 @@ pub struct Writer {
     /// Wake readers after every commit (`WriterBuilder::wake_readers`). Branched on alone,
     /// never on shared state, so a writer that does not wake pays nothing else.
     wake: bool,
+    /// Segments retention could not unlink yet: the helper might still install them.
+    deferred_prune: Vec<u64>,
 }
 
 impl Writer {
@@ -895,9 +891,6 @@ impl Writer {
         set_wake_flag(&channel_region, wake);
         let identity = validate_v4_prefix(channel_region.as_ptr())?;
         if sequence > 0 {
-            // A writer that died after publishing this file but before committing the `Roll`
-            // that leads to it left that `Roll` staged: finish it before writing anything, so
-            // readers still in the predecessor can follow. Its errors are this open's errors.
             let ch = get_channel_header(channel_region.as_ptr());
             let (generation, base) = (ch.generation, ch.base_record_index);
             Self::commit_stranded_roll(
@@ -931,25 +924,13 @@ impl Writer {
             next_hdr_pos,
             pending_msg_size: None,
             wake,
+            deferred_prune: Vec::with_capacity(2),
         })
     }
 
-    /// Finish a roll that a crashed writer left half done.
-    ///
-    /// `roll_file` stages the old segment's `Roll` in full, publishes the next segment, and only
-    /// then commits the `Roll` and moves the old segment's `write_position` past it. A writer
-    /// that dies after publishing leaves the next segment as the channel's newest, so its
-    /// successor opens that one, while readers still in the old segment wait on a `Roll` that
-    /// is staged but never committed, or committed with its position not yet moved.
-    ///
-    /// This finds the `Roll` by walking the old segment's record chain from the start of the
-    /// region `write_position` names (each region begins with a record), checks that its body
-    /// names `successor` exactly (sequence, instance ID, parent, and base), commits it if it is
-    /// still staged, and moves `write_position` to the terminal hint, both as `roll_file` would
-    /// have. A segment whose roll completed is left as it is. A `Roll` that names any other file,
-    /// or no `Roll` at all behind a published successor, is corruption and is reported, never
-    /// repaired by guessing. Running it twice changes nothing the second time. A predecessor
-    /// already pruned by retention is fine: no reader can still be waiting in it unopened.
+    /// Finish the roll into `successor` that a crashed writer left staged, or committed with its
+    /// position behind, once its `Roll` is checked to name `successor` exactly. Idempotent; a
+    /// mismatch is an error, never repaired.
     fn commit_stranded_roll(
         base_path: &Path,
         sequence: u64,
@@ -964,8 +945,7 @@ impl Writer {
             Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()), // pruned by retention
             Err(e) => return Err(e),
         };
-        // `create_writable` extends a short file; a segment shorter than one region is not a
-        // rolled predecessor, and must not be changed.
+        // Not a rolled predecessor; `create_writable` would grow it.
         if file.metadata()?.len() < region_size as u64 {
             return Ok(());
         }
@@ -1064,18 +1044,12 @@ impl Writer {
             Ordering::Release,
             Ordering::Relaxed,
         );
-        // Readers asleep on this segment's word (its writer woke readers) must wake to
-        // follow the Roll. Unconditional: this writer's own setting is irrelevant here.
-        wake::wake_all(&ch.wake_word);
+        wake::wake_all(&ch.wake_word); // whatever this writer's own setting
         Ok(())
     }
 
-    /// Fresh-segment preparation at an explicit private (partial) path: `set_len`, the Channel
-    /// record with its v4 extension (`identity`, `PREPARED`), and the first user header
-    /// pre-installed. The file is **not** given its final name, and is not published: callers
-    /// install it with [`v4::install_no_replace`] and publish it themselves, which is what lets a
-    /// file be prepared well ahead of its roll. `base_record_index` is final for a channel's
-    /// initial file; a successor's is stamped at its roll, before it is published.
+    /// A new `PREPARED` segment at the private path `partial_path`, for the caller to install
+    /// and publish. A successor's base is stamped at its roll.
     #[allow(clippy::type_complexity, clippy::too_many_arguments)]
     fn prepare_segment_at(
         partial_path: &Path,
@@ -1096,18 +1070,54 @@ impl Writer {
         usize,
     )> {
         let initial_len = preallocation_len(region_size, file_roll_size)?;
-        let _ = std::fs::remove_file(partial_path); // tolerate prior crash
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create_new(true)
             .open(partial_path)?;
+        let remove_on_error = |e: io::Error| {
+            let _ = std::fs::remove_file(partial_path);
+            e
+        };
+        Self::init_segment(
+            file,
+            sequence,
+            region_size,
+            initial_len,
+            mtu,
+            channel_name,
+            base_record_index,
+            generation,
+            identity,
+        )
+        .map_err(remove_on_error)
+    }
+
+    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
+    fn init_segment(
+        file: File,
+        sequence: u64,
+        region_size: usize,
+        initial_len: u64,
+        mtu: u64,
+        channel_name: &[u8; CHANNEL_NAME_MAX],
+        base_record_index: u64,
+        generation: u64,
+        identity: &Identity,
+    ) -> io::Result<(
+        File,
+        RegionMapping<Writable>,
+        RegionMapping<Writable>,
+        u64,
+        u64,
+        usize,
+    )> {
         file.set_len(initial_len).map_err(|e| {
             io::Error::new(
                 e.kind(),
                 format!(
                     "set_len({initial_len}) failed preallocating segment \
-                     (file_roll_size {file_roll_size}, region_size {region_size}): {e}"
+                     (region_size {region_size}): {e}"
                 ),
             )
         })?;
@@ -1209,10 +1219,11 @@ impl Writer {
                 // 0-byte stub at the final path would block create_new.
                 let _ = std::fs::remove_file(&file_path);
             }
-            let partial_path = make_partial_channel_file_path(base_path, sequence)?;
             // Fresh genesis segment: the builder-supplied base (0 for a brand-new
             // channel; the absolute start for a replica). When recovering an
             // existing file below, the on-disk `base_record_index` wins instead.
+            let identity = Identity::initial(InstanceId::fresh()?);
+            let partial_path = make_attempt_path(base_path, sequence, identity.instance)?;
             let prepared = Self::prepare_segment_at(
                 &partial_path,
                 sequence,
@@ -1222,10 +1233,11 @@ impl Writer {
                 channel_name,
                 base_record_index,
                 generation,
-                &Identity::initial(InstanceId::fresh()?),
+                &identity,
             )?;
-            v4::install_no_replace(&partial_path, &file_path)?;
-            // Its base is final already: publish it before the builder hands the writer out.
+            v4::install_no_replace(&partial_path, &file_path).inspect_err(|_| {
+                let _ = std::fs::remove_file(&partial_path);
+            })?;
             unsafe { v4::ext_at(prepared.1.as_ptr()) }.publish();
             Ok(prepared)
         } else {
@@ -1241,9 +1253,7 @@ impl Writer {
             validate_channel_header(ch, region_size, sequence)?;
             validate_v4_prefix(region0.as_ptr())?;
             if !is_published(region0.as_ptr())? {
-                // A channel's initial file installed but never published (its writer died in
-                // between): complete, with its base final, so publish it. A later file in that
-                // state was removed before this open (`discard_unpublished_tail`).
+                // An initial file its writer installed but did not publish.
                 if sequence != 0 {
                     return Err(err_invalid_data(format!(
                         "segment {sequence} is unpublished, but is the newest file a writer resumes"
@@ -1397,6 +1407,12 @@ impl Writer {
         self.channel_header().generation
     }
 
+    /// Ordinal of the segment file the writer is writing.
+    #[inline]
+    pub fn file_sequence(&self) -> u64 {
+        self.file_sequence
+    }
+
     /// Publish the advisory `(message_count, write_position)` pair after a commit.
     ///
     /// Both are Release stores, `message_count` first. That order is what lets a `Live` reader
@@ -1446,16 +1462,8 @@ impl Writer {
             return Err(err_other("MTU exceeded"));
         }
 
-        // Capacity pre-check: the record (header + payload + padding),
-        // and behind it room for a `Roll`, must fit in a single region —
-        // readers and writers always mmap whole regions, a record
-        // straddling a region boundary cannot be expressed in the wire
-        // format, and a writer must be able to stage a `Roll` at its next
-        // header slot whenever it rolls, manually or by size. It must
-        // also fit in a fresh segment when `file_roll_size > 0`,
-        // otherwise no roll can ever satisfy the reservation and the
-        // loop below would roll forever, creating unbounded segment
-        // files.
+        // The record and room for a Roll after it must fit in one region, and in a fresh
+        // segment, or no roll could ever satisfy the reservation.
         let record_size = HEADER_SLOT + msg_size;
         let record_with_padding = align_up(record_size);
         let needed_total = record_with_padding + ROLL_TOTAL;
@@ -1602,41 +1610,19 @@ impl Writer {
         Ok(())
     }
 
-    /// Roll to the next file. The order is the load-bearing part (FORMAT.md §6.2):
-    ///
-    /// 1) Take the successor the helper prepared, or prepare it now: a complete `PREPARED` file
-    ///    under a private `.partial` name, with a fresh instance ID naming this file as parent.
-    /// 2) Stage this file's `Roll` at the next header slot, `committed = 0`, with its full body:
-    ///    the successor's sequence, instance ID and base. The writer always leaves room for it.
-    /// 3) Install the successor under its final name, never replacing a file already there. It
-    ///    is still `PREPARED`: discovery and history ignore it. Last fallible step.
-    /// 4) Stamp the successor's base and wake flag, then publish it (release).
-    /// 5) Commit the `Roll` (release): readers in this file follow it from here.
-    /// 6) Move this file's `write_position` to its terminal hint, wake its sleepers, and switch.
-    /// 7) Retention: unlink the file at sequence `next_seq - keep_files`, if configured.
-    ///
-    /// A failure before (4) leaves `self` on this file with the `Roll` staged but uncommitted,
-    /// which the next record overwrites; a stray `.partial` is swept by the next `build`.
+    /// Roll to the next file, in the order of FORMAT.md §6.2: take or prepare the successor,
+    /// stage the Roll, publish the successor, commit the Roll, switch, retention.
     pub fn roll_file(&mut self) -> io::Result<()> {
-        // Any pending reservation refers to a slot in OLD that's about
-        // to be replaced by a Roll marker (or live elsewhere in OLD
-        // that we won't return to). Invalidate it so a follow-up
-        // `commit` doesn't write into the NEW segment's slot 0 with
-        // stale length state.
         self.pending_msg_size = None;
 
         let old_seq = self.file_sequence;
         let roll_pos = self.next_hdr_pos;
         let roll_off = roll_pos % self.region_size;
         if self.region_size - roll_off < ROLL_TOTAL {
-            // `try_reserve` and recovery keep this room; only a damaged file lacks it.
             return Err(err_invalid_data(format!(
-                "no room for a Roll at {roll_pos}: the writer keeps {ROLL_TOTAL} bytes free"
+                "no room for a Roll at {roll_pos}"
             )));
         }
-        // The new segment's first record continues the absolute numbering: OLD's base plus the
-        // user records written to it. The generation is a property of the channel, stamped into
-        // every segment. `self` is still on OLD, so its channel header carries both.
         let (old_base, old_count, generation) = {
             let ch = self.channel_header();
             (
@@ -1648,34 +1634,17 @@ impl Writer {
         let next_seq = old_seq
             .checked_add(1)
             .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "file sequence exhausted"))?;
-        let new_partial_path = make_partial_channel_file_path(&self.base_path, next_seq)?;
-        let new_final_path = make_channel_file_path(&self.base_path, next_seq)?;
 
-        // 1) The successor.
-        let prepared = self
-            .prefault
-            .as_ref()
-            .and_then(|p| p.take_segment(next_seq))
-            .filter(|(identity, _)| {
-                identity.predecessor == self.instance && identity.predecessor_sequence == old_seq
-            });
-        let (identity, prepared) = match prepared {
-            Some(prepared) => prepared,
-            None => {
-                let identity = Identity::successor(InstanceId::fresh()?, self.instance, old_seq);
-                let segment = Self::prepare_segment_at(
-                    &new_partial_path,
-                    next_seq,
-                    self.region_size,
-                    self.file_roll_size,
-                    self.mtu,
-                    &self.channel_name,
-                    0, // stamped below, before publication
-                    generation,
-                    &identity,
-                )?;
-                (identity, segment)
-            }
+        // 1) The successor, installed under its final name and still PREPARED.
+        let taken = self.prefault.as_ref().and_then(|p| {
+            p.claim(next_seq);
+            p.try_take_segment(next_seq)
+        });
+        let (identity, prepared) = match taken.filter(|(identity, _)| {
+            identity.predecessor == self.instance && identity.predecessor_sequence == old_seq
+        }) {
+            Some(taken) => taken,
+            None => self.prepare_successor(next_seq, generation)?,
         };
         let (
             new_file,
@@ -1687,7 +1656,7 @@ impl Writer {
         ) = prepared;
         let edge = RollEdge::after(old_seq, old_base, old_count, identity.instance)?;
 
-        // 2) Stage the Roll, whole, in the region the writer already holds.
+        // 2) Stage the whole Roll in the region already mapped.
         let roll_hdr_ptr = {
             let bytes = self
                 .current_region
@@ -1706,10 +1675,7 @@ impl Writer {
             };
         }
 
-        // 3) Install under the final name: discoverable, still unpublished. Last fallible step.
-        v4::install_no_replace(&new_partial_path, &new_final_path)?;
-
-        // 4) Finalise and publish the successor. Nothing reads its base before this store.
+        // 3) Stamp the base and publish. Nothing below fails.
         unsafe {
             (*(new_channel_region.as_mut_ptr().add(MESSAGE_HEADER_SIZE) as *mut ChannelHeader))
                 .base_record_index = edge.next_base_record_index;
@@ -1717,14 +1683,10 @@ impl Writer {
         set_wake_flag(&new_channel_region, self.wake);
         unsafe { v4::ext_at(new_channel_region.as_ptr()) }.publish();
 
-        // 5) Commit the Roll, every byte of which was written above. Readers follow it now.
+        // 4) Commit the Roll; then the terminal hint, one slot past it.
         MessageHeader::commit(roll_hdr_ptr);
-
-        // 6) The terminal hint: one slot past the whole Roll. Never a readable record.
         self.store_wp_local((roll_pos + ROLL_TOTAL + HEADER_SLOT) as u64);
 
-        // Readers asleep on OLD's word must wake to follow the Roll: from here on this
-        // writer bumps NEW's word only. `self` is still on OLD.
         if self.wake {
             wake::wake_all(&self.channel_header().wake_word);
         }
@@ -1756,30 +1718,111 @@ impl Writer {
             self.held.clear();
         }
 
-        // Retention: best-effort. The roll itself has already
-        // committed (Roll marker is released, NEW is on disk, `self`
-        // is swapped); a failure to unlink an old segment must not
-        // be returned as `Err` here because callers would interpret
-        // it as "roll failed" and retry, double-rolling. Readers
-        // that still have the pruned file mapped continue via the
-        // inode reference until they finish it; lagging readers
-        // get ENOENT on path-based open, which is the documented
-        // contract for `keep_files`.
+        // Retention: best-effort; the roll has happened, so its errors are not the roll's.
+        for seq in std::mem::take(&mut self.deferred_prune) {
+            self.prune(seq);
+        }
         if let Some(n) = self.keep_files
             && next_seq >= n
         {
-            let prune_seq = next_seq - n;
-            if let Ok(prune_path) = make_channel_file_path(&self.base_path, prune_seq) {
-                match &self.prefault {
-                    Some(prefault) => prefault.unlink(prune_path),
-                    None => {
-                        let _ = std::fs::remove_file(&prune_path);
-                    }
-                }
-            }
+            self.prune(next_seq - n);
         }
 
         Ok(())
+    }
+
+    /// Unlink segment `seq`, unless the helper may still install it: then on a later roll.
+    fn prune(&mut self, seq: u64) {
+        if self.prefault.as_ref().is_some_and(|p| p.installing(seq)) {
+            self.deferred_prune.push(seq);
+            return;
+        }
+        if let Ok(path) = make_channel_file_path(&self.base_path, seq) {
+            match &self.prefault {
+                Some(prefault) => prefault.unlink(path),
+                None => {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+        }
+    }
+
+    /// Prepare and install segment `next_seq` here, or adopt the one the helper installed first.
+    fn prepare_successor(
+        &self,
+        next_seq: u64,
+        generation: u64,
+    ) -> io::Result<(Identity, prefault::PreparedSegment)> {
+        let identity = Identity::successor(InstanceId::fresh()?, self.instance, self.file_sequence);
+        let attempt = make_attempt_path(&self.base_path, next_seq, identity.instance)?;
+        let final_path = make_channel_file_path(&self.base_path, next_seq)?;
+        let segment = Self::prepare_segment_at(
+            &attempt,
+            next_seq,
+            self.region_size,
+            self.file_roll_size,
+            self.mtu,
+            &self.channel_name,
+            0,
+            generation,
+            &identity,
+        )?;
+        match v4::install_no_replace(&attempt, &final_path) {
+            Ok(()) => Ok((identity, segment)),
+            Err(e) => {
+                drop(segment);
+                let _ = std::fs::remove_file(&attempt);
+                if e.kind() != ErrorKind::AlreadyExists {
+                    return Err(e);
+                }
+                self.adopt_successor(next_seq, generation, &final_path)
+            }
+        }
+    }
+
+    /// The successor another attempt installed first: used only if it is an empty, `PREPARED`
+    /// file of this channel naming this file as its parent.
+    fn adopt_successor(
+        &self,
+        next_seq: u64,
+        generation: u64,
+        path: &Path,
+    ) -> io::Result<(Identity, prefault::PreparedSegment)> {
+        let file = OpenOptions::new().read(true).write(true).open(path)?;
+        let len = preallocation_len(self.region_size, self.file_roll_size)?;
+        let refuse = |why: &str| {
+            Err(err_invalid_data(format!(
+                "segment {next_seq} is already installed and {why}"
+            )))
+        };
+        if file.metadata()?.len() != len {
+            return refuse("has another length");
+        }
+        let region0 = RegionMapping::create_writable(&file, 0, self.region_size)?;
+        let ch = get_channel_header(region0.as_ptr());
+        validate_channel_header(ch, self.region_size, next_seq)?;
+        let identity = validate_v4_prefix(region0.as_ptr())?;
+        if is_published(region0.as_ptr())? {
+            return refuse("is published");
+        }
+        if identity.predecessor != self.instance
+            || identity.predecessor_sequence != self.file_sequence
+            || ch.generation != generation
+            || ch.mtu as u64 != self.mtu
+            || ch.channel_name != self.channel_name
+        {
+            return refuse("belongs elsewhere");
+        }
+        if ch.message_count.load(Ordering::Acquire) != 0
+            || ch.write_position.load(Ordering::Acquire) != (FIRST_RECORD + HEADER_SLOT) as u64
+        {
+            return refuse("is not empty");
+        }
+        let current = RegionMapping::create_writable(&file, 0, self.region_size)?;
+        verify_preinstall_signature(unsafe {
+            &*(current.as_ptr().add(FIRST_RECORD) as *const MessageHeader)
+        })?;
+        Ok((identity, (file, region0, current, 0, len, FIRST_RECORD)))
     }
 
     fn roll_over_region(&mut self) -> io::Result<()> {
@@ -2331,7 +2374,6 @@ fn read_segment_header(file: &File, sequence: u64) -> io::Result<SegmentHeader> 
     let ch = get_channel_header(map.as_ptr());
     validate_channel_header(ch, ch.region_size as usize, sequence)?;
     validate_v4_prefix(map.as_ptr())?;
-    // Acquired before the base is read: a published file's base is final.
     if !is_published(map.as_ptr())? {
         return Err(io::Error::new(
             ErrorKind::NotFound,
@@ -2466,7 +2508,7 @@ impl Reader {
         expected_generation: Option<u64>,
     ) -> io::Result<Option<Self>> {
         let mut seqs = find_all_sequences(base_path)?;
-        // A newest file prepared ahead of a roll is not history: no range, no head.
+        // A newest file installed ahead of its roll is not history.
         while seqs.len() > 1
             && let Some(&last) = seqs.last()
             && !segment_is_published(base_path, last)?
@@ -2670,8 +2712,6 @@ impl Reader {
         let region_size = ch.region_size as usize;
         validate_channel_header(ch, region_size, sequence)?;
         validate_v4_prefix(page0.as_ptr())?;
-        // A `PREPARED` file is installed ahead of its roll and is not history yet; only a
-        // channel's initial file, before its first writer published it, is ever opened here so.
         if !is_published(page0.as_ptr())? {
             return Err(io::Error::new(
                 ErrorKind::NotFound,
@@ -2682,10 +2722,7 @@ impl Reader {
         let (read_pos, position) = match start {
             SegmentStart::Beginning => (0, ch.base_record_index),
             SegmentStart::Head => {
-                // No directory listing. A newer segment exists if the next one is published — a
-                // file merely installed under that name may be one prepared ahead of a roll —
-                // or if this one's own path is gone: retention unlinks oldest first, so a pruned
-                // successor means this segment was pruned before it.
+                // Newer: the next segment is published, or this one was pruned (oldest first).
                 let this = make_channel_file_path(&base_path, sequence)?;
                 let newer_segment_exists =
                     || Ok(segment_is_published(&base_path, sequence + 1)? || !this.try_exists()?);
@@ -3800,25 +3837,14 @@ impl Reader {
         RollEdge::decode(body)
     }
 
-    /// Open and validate the segment `edge` leads to from segment `prev_sequence`, open as
-    /// `prev_header`. Touches nothing on `self`; both the single-record roll and the batch scan
-    /// commit the result themselves.
-    ///
-    /// The successor must be exactly the file the committed `Roll` names: its sequence, its own
-    /// instance ID and its parent's, and once published its base. A file the helper opened ahead
-    /// is checked against that in mapped memory, without asking the filesystem whether the name
-    /// still points at it: a file replaced at the same name has another instance ID. One opened
-    /// here, after the roll, is checked the same way.
+    /// Open the published segment the committed `edge` names after `prev_sequence` (mapped as
+    /// `prev_header`), checked by identity in memory, with no `stat`. Touches nothing on `self`.
     fn open_successor(
         &self,
         prev_header: &RegionMapping<ReadOnly>,
         prev_sequence: u64,
         edge: &RollEdge,
     ) -> io::Result<Successor> {
-        // The absolute index the next segment must begin at, computed from the one we are
-        // leaving: a roll stamps the new file's base as the old file's `base + message_count`.
-        // Read from the page we still hold mapped, so this works even after retention unlinked
-        // it (readers finish a pruned file through their inode reference).
         let (prev_instance, expected_base) = {
             let page0 = prev_header.as_ptr();
             let ch = get_channel_header(page0);
@@ -3873,17 +3899,11 @@ impl Reader {
                 identity.instance, identity.predecessor, edge.next_instance
             )));
         }
-        // A committed `Roll` is written only after its successor is published.
         if !is_published(region0.as_ptr())? {
             return Err(err_invalid_data(format!(
                 "segment {next_sequence} is not published, but a committed Roll leads to it"
             )));
         }
-        // The next segment must continue the absolute numbering. Anything else means this
-        // file did not come from the series we have been reading — segments from two
-        // different logs sharing a directory, an out-of-order or hand-copied file, or a
-        // channel that was deleted and rebuilt at the same path while we held an unlinked
-        // file open. Refuse rather than splice.
         if Some(ch.base_record_index) != expected_base
             || ch.base_record_index != edge.next_base_record_index
         {
@@ -4100,21 +4120,18 @@ fn make_channel_file_path(base_path: &Path, sequence: u64) -> io::Result<PathBuf
     })
 }
 
-/// Suffix appended to a segment file while it is being prepared by
-/// the writer; renamed away atomically once initialised. Files with
-/// this suffix are invisible to `find_all_sequences` (its u64
-/// suffix parse rejects anything non-numeric).
+/// Suffix of a segment's private name before installation; `find_all_sequences` skips it.
 const PARTIAL_SUFFIX: &str = "partial";
 
-/// `<base>.partial` (seq 0) or `<base>.<N>.partial` (seq N > 0).
-fn make_partial_channel_file_path(base_path: &Path, sequence: u64) -> io::Result<PathBuf> {
+/// `<base>[.<N>].<instance>.partial`: one attempt's private name for segment `sequence`.
+fn make_attempt_path(base_path: &Path, sequence: u64, attempt: InstanceId) -> io::Result<PathBuf> {
     let final_path = make_channel_file_path(base_path, sequence)?;
     let file_name = final_path
         .file_name()
         .and_then(|s| s.to_str())
         .ok_or_else(|| err_other(format!("Cannot get file name from path {:?}", final_path)))?;
     let mut pb = final_path.clone();
-    pb.set_file_name(format!("{}.{}", file_name, PARTIAL_SUFFIX));
+    pb.set_file_name(format!("{file_name}.{attempt:?}.{PARTIAL_SUFFIX}"));
     Ok(pb)
 }
 
@@ -4160,12 +4177,8 @@ fn preallocation_len(region_size: usize, file_roll_size: u64) -> io::Result<u64>
     Ok(len)
 }
 
-/// The sequence a writer reopening `base_path` resumes: the newest file, once any newer final
-/// files that were never published are removed. Such a file is a successor installed for a roll
-/// its writer did not finish. No committed `Roll` names it, so no reader has taken it as history;
-/// it is unlinked, never truncated, so a mapping a reader's helper made of it ahead stays intact,
-/// and the next roll prepares a new file with a new instance ID. A channel's initial file is
-/// kept: `open_file` publishes it.
+/// The newest segment, after unlinking (never truncating) newer ones left unpublished by an
+/// unfinished roll. An unpublished initial file is kept for `open_file` to publish.
 fn discard_unpublished_tail(base_path: &Path) -> io::Result<u64> {
     loop {
         let seq = find_latest_sequence(base_path)?;
@@ -4176,7 +4189,7 @@ fn discard_unpublished_tail(base_path: &Path) -> io::Result<u64> {
             continue;
         };
         if file.metadata()?.len() < FIRST_RECORD as u64 {
-            return Ok(seq); // not one of ours; `open_file` reports it
+            return Ok(seq); // for `open_file` to report
         }
         let page0 = RegionMapping::create_read_only(&file, 0, region::page_size())?;
         let ch = get_channel_header(page0.as_ptr());
@@ -4216,9 +4229,7 @@ fn sweep_stale_partial_files(base_path: &Path) {
     }
 }
 
-/// Match `<base>.partial` or `<base>.<N>.partial`. The numeric
-/// parse on `<N>` keeps unrelated siblings (e.g.
-/// `<base>.notes.partial`) out of the sweep.
+/// `<base>[.<N>].<instance>.partial`, or the older `<base>[.<N>].partial`.
 fn is_partial_segment_name(name: &str, base_name: &str) -> bool {
     let base_partial = format!("{}.{}", base_name, PARTIAL_SUFFIX);
     if name == base_partial {
@@ -4226,10 +4237,18 @@ fn is_partial_segment_name(name: &str, base_name: &str) -> bool {
     }
     let dotted = format!("{}.", base_name);
     let suffix = format!(".{}", PARTIAL_SUFFIX);
-    name.strip_prefix(&dotted)
+    let Some(middle) = name
+        .strip_prefix(&dotted)
         .and_then(|m| m.strip_suffix(&suffix))
-        .and_then(|n| n.parse::<u64>().ok())
-        .is_some()
+    else {
+        return false;
+    };
+    let is_sequence = |s: &str| s.parse::<u64>().is_ok();
+    let is_instance = |s: &str| s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit());
+    match middle.split_once('.') {
+        None => is_sequence(middle) || is_instance(middle),
+        Some((sequence, instance)) => is_sequence(sequence) && is_instance(instance),
+    }
 }
 
 fn find_earliest_sequence(base_path: &Path) -> io::Result<u64> {
@@ -4294,13 +4313,8 @@ pub fn cleanup_channel_files<P: AsRef<std::path::Path>>(base: P) {
     use std::fs;
     let base_path = base.as_ref();
 
-    // Remove the base file (sequence 0) and the seq-0 partial sibling.
+    // Remove the base file (sequence 0); its attempt names are swept below.
     let _ = fs::remove_file(base_path);
-    if let Some(name) = base_path.file_name().and_then(|s| s.to_str()) {
-        let mut partial0 = base_path.to_path_buf();
-        partial0.set_file_name(format!("{}.{}", name, PARTIAL_SUFFIX));
-        let _ = fs::remove_file(partial0);
-    }
 
     let parent = match base_path.parent() {
         Some(p) if p.as_os_str().is_empty() => std::path::PathBuf::from("."),
@@ -6486,9 +6500,17 @@ mod tests {
             Ok(())
         });
 
-        // Reader joins late-ish and is allowed to lag.
+        // Reader joins late-ish and is allowed to lag. Retention can outrun an open's retries
+        // under load; that is not what this test is about.
         thread::sleep(Duration::from_millis(20));
-        let mut r = Reader::open(base, ReaderMode::LateJoin)?;
+        let open_by = std::time::Instant::now() + Duration::from_secs(5);
+        let mut r = loop {
+            match Reader::open(base, ReaderMode::LateJoin) {
+                Err(e)
+                    if e.kind() == ErrorKind::NotFound && std::time::Instant::now() < open_by => {}
+                opened => break opened?,
+            }
+        };
         let mut seen: u32 = 0;
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while std::time::Instant::now() < deadline {
@@ -8473,5 +8495,153 @@ mod tests {
         assert!(!Path::new(from).exists());
         std::fs::remove_file(to)?;
         Ok(())
+    }
+
+    // ---------- successors installed ahead ----------
+
+    /// Install segment 1 of `w`'s channel as another attempt would: `PREPARED`, naming `parent`.
+    fn install_successor(w: &Writer, parent: InstanceId) -> anyhow::Result<InstanceId> {
+        let identity = Identity::successor(InstanceId::fresh()?, parent, 0);
+        let attempt = make_attempt_path(&w.base_path, 1, identity.instance)?;
+        let segment = Writer::prepare_segment_at(
+            &attempt,
+            1,
+            w.region_size,
+            w.file_roll_size,
+            w.mtu,
+            &w.channel_name,
+            0,
+            w.generation(),
+            &identity,
+        )?;
+        drop(segment);
+        v4::install_no_replace(&attempt, &make_channel_file_path(&w.base_path, 1)?)?;
+        Ok(identity.instance)
+    }
+
+    /// The helper installs the successor ahead; the roll takes it and only publishes it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_roll_takes_the_successor_its_helper_installed() -> anyhow::Result<()> {
+        let base = "test_roll_takes_installed";
+        cleanup_channel_files(base);
+        let mut w = rolling_writer(base)?.helper(Helper::inherit()).build()?;
+        let next = make_channel_file_path(Path::new(base), 1)?;
+        let mut i = 0;
+        while w.next_hdr_pos < w.region_size * 3 / 2 {
+            write_indexed(&mut w, i..i + 1)?;
+            i += 1;
+        }
+        assert!(
+            until(|| next.exists() && lock_ready(&w)),
+            "installed and handed over"
+        );
+        let installed = identity_on_disk(base, 1)?.instance;
+        assert_eq!(std::fs::read(&next)?[STATE_AT as usize], v4::PREPARED);
+        w.roll_file()?;
+        assert_eq!(w.instance, installed, "the same file, published");
+        assert_eq!(std::fs::read(&next)?[STATE_AT as usize], v4::PUBLISHED);
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn lock_ready(w: &Writer) -> bool {
+        let shared = &w.prefault.as_ref().unwrap().shared;
+        prefault::lock(&shared.next_segment).ready.is_some()
+    }
+
+    /// Another attempt installed the successor first: the roll adopts it instead of replacing it.
+    #[test]
+    fn a_roll_adopts_a_successor_installed_first() -> anyhow::Result<()> {
+        let base = "test_roll_adopts_installed";
+        cleanup_channel_files(base);
+        let mut w = rolling_writer(base)?.build()?;
+        write_indexed(&mut w, 0..3)?;
+        let installed = install_successor(&w, w.instance)?;
+        w.roll_file()?;
+        write_indexed(&mut w, 3..4)?;
+        assert_eq!(identity_on_disk(base, 1)?.instance, installed);
+        assert_eq!(w.instance, installed);
+        let attempts = std::fs::read_dir(".")?
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .filter(|n| n.starts_with(base) && n.ends_with(PARTIAL_SUFFIX))
+            .count();
+        assert_eq!(attempts, 0, "the losing attempt is removed");
+        let mut r = ReaderBuilder::new(base).build()?;
+        for i in 0..4 {
+            assert_eq!(r.try_read()?.expect("record").header().user_meta_u64, i);
+        }
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// A file at the successor's name that does not name this one as parent is refused, and the
+    /// writer stays where it was with the Roll uncommitted.
+    #[test]
+    fn a_roll_refuses_a_successor_of_another_parent() -> anyhow::Result<()> {
+        let base = "test_roll_refuses_foreign";
+        cleanup_channel_files(base);
+        let mut w = rolling_writer(base)?.build()?;
+        write_indexed(&mut w, 0..3)?;
+        install_successor(&w, InstanceId::fresh()?)?;
+        let err = w.roll_file().expect_err("refused");
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert!(err.to_string().contains("belongs elsewhere"), "{err}");
+        assert_eq!(w.file_sequence, 0);
+        write_indexed(&mut w, 3..4)?;
+        let mut r = ReaderBuilder::new(base).build()?;
+        for i in 0..4 {
+            assert_eq!(r.try_read()?.expect("record").header().user_meta_u64, i);
+        }
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// Retention leaves a segment the helper may still install, and removes it on a later roll.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn retention_waits_for_an_install_in_flight() -> anyhow::Result<()> {
+        let base = "test_retention_waits_in_flight";
+        cleanup_channel_files(base);
+        let mut w = rolling_writer(base)?
+            .keep_files(1)
+            .helper(Helper::inherit())
+            .build()?;
+        let path = |seq| make_channel_file_path(Path::new(base), seq);
+        w.roll_file()?;
+        let shared = w.prefault.as_ref().unwrap().shared.clone();
+        shared.in_flight.store(1, Ordering::SeqCst);
+        w.roll_file()?;
+        assert!(path(1)?.exists(), "kept while an install may land on it");
+        shared.in_flight.store(prefault::NONE, Ordering::SeqCst);
+        w.roll_file()?;
+        assert!(until(
+            || !path(1).unwrap().exists() && !path(2).unwrap().exists()
+        ));
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    #[test]
+    fn attempt_names_are_swept_and_others_are_not() {
+        let id = "0123456789abcdef0123456789abcdef";
+        for name in [
+            "c.partial".to_string(),
+            "c.3.partial".into(),
+            format!("c.{id}.partial"),
+            format!("c.3.{id}.partial"),
+        ] {
+            assert!(is_partial_segment_name(&name, "c"), "{name}");
+        }
+        for name in [
+            "c.notes.partial".to_string(),
+            "c.3".into(),
+            format!("c.x.{id}.partial"),
+            format!("c.3.{}.partial", &id[1..]),
+            format!("d.3.{id}.partial"),
+        ] {
+            assert!(!is_partial_segment_name(&name, "c"), "{name}");
+        }
     }
 }

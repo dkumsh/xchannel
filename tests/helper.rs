@@ -127,10 +127,10 @@ fn every_record_reads_back_across_regions_and_rolls() {
 fn the_helpers_stop_with_their_writer_and_reader() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let path = channel("stops");
-    let (writers, readers) = (
-        threads_named("xch-prefault"),
-        threads_named("xch-map-ahead"),
-    );
+    // Helpers of the test before may still be exiting.
+    assert!(eventually(|| threads_named("xch-prefault") == 0));
+    assert!(eventually(|| threads_named("xch-map-ahead") == 0));
+    let (writers, readers) = (0, 0);
     let writer = WriterBuilder::new(&path)
         .helper(Helper::inherit())
         .build()
@@ -195,10 +195,9 @@ fn a_helper_on_a_core_runs_there() {
 fn a_core_the_helper_cannot_run_on_fails_the_build() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let path = channel("bad-core");
-    let (writers, readers) = (
-        threads_named("xch-prefault"),
-        threads_named("xch-map-ahead"),
-    );
+    assert!(eventually(|| threads_named("xch-prefault") == 0));
+    assert!(eventually(|| threads_named("xch-map-ahead") == 0));
+    let (writers, readers) = (0, 0);
     let offline = (0..libc::CPU_SETSIZE as usize)
         .rev()
         .find(|&core| !std::path::Path::new(&format!("/sys/devices/system/cpu/cpu{core}")).exists())
@@ -396,7 +395,7 @@ fn a_writer_unmapping_at_file_roll_keeps_a_segment_mapped_until_it_leaves_it() {
             "{} mappings of the first segment",
             mappings_of(&path)
         );
-        while !std::path::Path::new(&format!("{path}.1")).exists() {
+        while writer.file_sequence() == 0 {
             write(&mut writer, 1);
         }
         assert!(
@@ -430,12 +429,15 @@ fn the_next_segment_is_created_before_the_roll() {
         &mut writer,
         per_region * (regions_per_file - 1) + per_region * 3 / 4,
     );
-    let partial = format!("{path}.1.partial");
-    assert!(eventually(|| std::path::Path::new(&partial).exists()));
-    assert!(!std::path::Path::new(&format!("{path}.1")).exists());
+    // Installed under its final name ahead of the roll, but not history yet.
+    assert!(eventually(|| exists(&format!("{path}.1"))));
+    assert_eq!(writer.file_sequence(), 0);
+    assert_eq!(partials(&path), 0);
+    let live = ReaderBuilder::new(&path).live().build().unwrap();
+    assert_eq!(live.file_sequence(), 0);
     write(&mut writer, per_region);
-    assert!(std::path::Path::new(&format!("{path}.1")).exists());
-    assert!(!std::path::Path::new(&partial).exists());
+    assert_eq!(writer.file_sequence(), 1);
+    assert_eq!(partials(&path), 0);
     drop(writer);
 
     let mut reader = ReaderBuilder::new(&path).late_join().build().unwrap();
@@ -501,6 +503,17 @@ fn exists(path: &str) -> bool {
     std::path::Path::new(path).exists()
 }
 
+/// Private attempt files of the channel at `path`.
+fn partials(path: &str) -> usize {
+    let p = std::path::Path::new(path);
+    let name = p.file_name().unwrap().to_str().unwrap().to_owned();
+    std::fs::read_dir(p.parent().unwrap())
+        .unwrap()
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .filter(|n| n.starts_with(&name) && n.ends_with(".partial"))
+        .count()
+}
+
 #[test]
 fn a_writer_with_a_helper_rolls_fast_without_losing_a_segment() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
@@ -522,14 +535,17 @@ fn a_writer_with_a_helper_rolls_fast_without_losing_a_segment() {
 fn a_writer_dropped_with_the_next_segment_prepared_leaves_none_and_resumes() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let path = channel("dropped-prepared");
-    let partial = format!("{path}.1.partial");
+    let next = format!("{path}.1");
     let mut writer = writer_builder(&path, Some(Helper::inherit()))
         .build()
         .unwrap();
     let written = write_from(&mut writer, 0, last_region_three_quarters());
-    assert!(eventually(|| exists(&partial)));
+    assert!(eventually(|| exists(&next)));
     drop(writer);
-    assert!(!exists(&partial));
+    assert!(
+        !exists(&next),
+        "the unpublished successor goes with its writer"
+    );
 
     let mut writer = writer_builder(&path, Some(Helper::inherit()))
         .build()
@@ -553,7 +569,7 @@ fn killed_writer_child() {
         .build()
         .unwrap();
     write_from(&mut writer, 0, last_region_three_quarters());
-    assert!(eventually(|| exists(&format!("{path}.1.partial"))));
+    assert!(eventually(|| exists(&format!("{path}.1"))));
     std::process::abort();
 }
 
@@ -561,7 +577,7 @@ fn killed_writer_child() {
 fn a_writer_killed_with_the_next_segment_prepared_is_recovered() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let path = channel("killed-prepared");
-    let partial = format!("{path}.1.partial");
+    let next = format!("{path}.1");
     let status = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--ignored", "--exact", "killed_writer_child", "--nocapture"])
         .env("XCH_KILLED_WRITER", &path)
@@ -569,14 +585,20 @@ fn a_writer_killed_with_the_next_segment_prepared_is_recovered() {
         .status()
         .unwrap();
     assert!(!status.success());
-    assert!(
-        exists(&partial),
-        "the killed writer left its prepared segment"
+    assert!(exists(&next), "the killed writer left its prepared segment");
+    let live = ReaderBuilder::new(&path).live().build().unwrap();
+    assert_eq!(
+        live.file_sequence(),
+        0,
+        "an unpublished segment is not the tail"
     );
+    drop(live);
 
     for helper in [None, Some(Helper::inherit())] {
         let mut writer = writer_builder(&path, helper).build().unwrap();
-        assert!(!exists(&partial));
+        if helper.is_none() {
+            assert!(!exists(&next), "discarded by the next writer");
+        }
         let mut reader = ReaderBuilder::new(&path).late_join().build().unwrap();
         let from = read_all(&mut reader, None);
         drop(reader);
@@ -598,7 +620,7 @@ fn a_reader_that_opened_an_abandoned_segment_ahead_reads_the_real_one() {
     let per_region = (page_size() * REGION_PAGES / 112) as u64;
     for restarted_helper in [None, Some(Helper::inherit())] {
         let path = channel("abandoned-ahead");
-        let partial = format!("{path}.1.partial");
+        let next = format!("{path}.1");
         let mut writer = writer_builder(&path, Some(Helper::inherit()))
             .build()
             .unwrap();
@@ -608,7 +630,7 @@ fn a_reader_that_opened_an_abandoned_segment_ahead_reads_the_real_one() {
             .build()
             .unwrap();
         let mut written = write_from(&mut writer, 0, last_region_three_quarters());
-        assert!(eventually(|| exists(&partial)));
+        assert!(eventually(|| exists(&next)));
         let mut read = read_all(&mut reader, None);
         assert_eq!(read, written);
         std::thread::sleep(Duration::from_millis(30));
