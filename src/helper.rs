@@ -146,6 +146,15 @@ impl Inject {
         self.0.load(Ordering::Acquire) == 3
     }
 
+    /// Stop in the middle of an iteration, with the writer's pointers read, until `resume`.
+    pub(crate) fn stall_mid_iteration(&self) {
+        self.0.store(4, Ordering::Release);
+    }
+
+    pub(crate) fn stalled_mid_iteration(&self) -> bool {
+        self.0.load(Ordering::Acquire) == 4
+    }
+
     pub(crate) fn error(&self) {
         self.0.store(1, Ordering::Release);
     }
@@ -171,10 +180,10 @@ pub(crate) struct Bounded<T> {
 }
 
 impl<T> Bounded<T> {
-    /// `bound` items fit without allocating; `usize::MAX` grows as needed.
+    /// `bound` items fit without allocating; `usize::MAX` grows as needed (the user's choice).
     pub(crate) fn new(bound: usize) -> Self {
         Self {
-            items: Vec::with_capacity(bound.min(4096)),
+            items: Vec::with_capacity(if bound == usize::MAX { 64 } else { bound }),
             bound,
         }
     }

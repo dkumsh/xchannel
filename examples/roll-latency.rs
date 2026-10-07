@@ -1,6 +1,6 @@
-//! Roll latency: writer `try_reserve`+`commit` time and reader receive latency, for the first
-//! record after each file roll against all other records. Uses only APIs 6.3.0 also has, so the
-//! same file measures both.
+//! Roll latency: writer `try_reserve`+`commit` time, and reader latency from each record's
+//! scheduled send time (so a writer stalled by a roll counts), for the records just after each
+//! file roll against all others. Uses only APIs 6.3.0 also has, so the same file measures both.
 //!
 //! ```text
 //! roll-latency <path> <writer core> <reader core> <helper core> [rolls] [rate/s]
@@ -14,6 +14,8 @@ use xchannel::{Helper, ReaderBuilder, Unmap, WriterBuilder, cleanup_channel_file
 const REGION: usize = 1 << 20;
 const FILE: u64 = 8 << 20;
 const PAYLOAD: usize = 96;
+/// Records after each roll reported apart: enough to cover a writer stalled by the roll.
+const AFTER_ROLL: u64 = 64;
 
 fn pin(core: i64) {
     if core < 0 {
@@ -58,7 +60,7 @@ fn main() -> std::io::Result<()> {
     let rolls = arg(5, 200) as u64;
     let rate = arg(6, 100_000) as u64;
     let helper = (helper_core >= 0).then(|| Helper::on_core(helper_core as usize));
-    let per_file = FILE / (16 + PAYLOAD as u64 + 8);
+    let per_file = FILE / (16 + PAYLOAD as u64); // at most; headers and skips take the rest
     let total = per_file * rolls;
 
     cleanup_channel_files(&path);
@@ -77,12 +79,12 @@ fn main() -> std::io::Result<()> {
     let epoch = Instant::now();
     let reading = {
         let path = path.clone();
-        std::thread::spawn(move || -> std::io::Result<(Vec<u64>, Vec<u64>)> {
+        std::thread::spawn(move || -> std::io::Result<(Vec<u64>, Vec<u64>, u64)> {
             pin(reader_core);
             let _ = path;
             let mut reader = rb.build()?;
-            let (mut first, mut rest) = (Vec::new(), Vec::with_capacity(total as usize));
-            let mut seen = 0u64;
+            let (mut after, mut rest) = (Vec::new(), Vec::with_capacity(total as usize));
+            let (mut seen, mut since_roll) = (0u64, u64::MAX);
             let mut file = reader.file_sequence();
             while seen < total {
                 let Some(m) = reader.try_read()? else {
@@ -92,12 +94,16 @@ fn main() -> std::io::Result<()> {
                 seen += 1;
                 if reader.file_sequence() != file {
                     file = reader.file_sequence();
-                    first.push(lat);
+                    since_roll = 0;
+                }
+                if since_roll < AFTER_ROLL {
+                    after.push(lat);
+                    since_roll += 1;
                 } else {
                     rest.push(lat);
                 }
             }
-            Ok((first, rest))
+            Ok((after, rest, reader.file_sequence()))
         })
     };
     std::thread::sleep(Duration::from_millis(200));
@@ -108,20 +114,21 @@ fn main() -> std::io::Result<()> {
         while Instant::now() < next {
             std::hint::spin_loop();
         }
+        let scheduled = (next - epoch).as_nanos() as u64;
         next += gap;
         let t = Instant::now();
         writer.try_reserve(PAYLOAD)?.fill(1);
-        writer.commit(1, PAYLOAD as u32, now_ns(epoch))?;
+        writer.commit(1, PAYLOAD as u32, scheduled)?;
         commits.push(t.elapsed().as_nanos() as u64);
     }
-    let (first, rest) = reading.join().expect("reader")?;
+    let (after, rest, rolled) = reading.join().expect("reader")?;
     commits.sort_unstable();
-    let slow: Vec<u64> = commits[commits.len() - rolls as usize..].to_vec();
-    println!("{rolls} rolls of {FILE} B files, {rate}/s, helpers {helper:?}");
+    let slow: Vec<u64> = commits[commits.len() - rolled as usize..].to_vec();
+    println!("{rolled} rolls of {FILE} B files, {rate}/s, helpers {helper:?}");
     report("writer commit, all", commits);
-    report("writer commit, slowest/roll", slow);
+    report("writer commit, slowest n=rolls", slow);
     report("reader, other records", rest);
-    report("reader, first after a roll", first);
+    report("reader, 64 after a roll", after);
     drop(writer);
     cleanup_channel_files(&path);
     Ok(())

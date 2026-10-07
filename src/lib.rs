@@ -1227,6 +1227,12 @@ impl Writer {
         };
 
         if !recover_existing {
+            if sequence != 0 {
+                // A rolled file is never created empty: corruption, not a channel to start.
+                return Err(err_invalid_data(format!(
+                    "segment {sequence} at {file_path:?} is empty"
+                )));
+            }
             if existing_meta.is_some() {
                 // 0-byte stub at the final path would block create_new.
                 let _ = std::fs::remove_file(&file_path);
@@ -1657,6 +1663,9 @@ impl Writer {
         }) {
             Some((identity, prepared, worker)) => (identity, prepared, Some(worker)),
             None => {
+                if let Some(p) = &self.prefault {
+                    p.shared.missed.fetch_add(1, Ordering::Relaxed);
+                }
                 let (identity, prepared) = self.prepare_successor(next_seq, generation)?;
                 (identity, prepared, None)
             }
@@ -1721,7 +1730,6 @@ impl Writer {
         self.file_len = new_file_len;
         self.next_hdr_pos = new_next_hdr;
         if let Some(prefault) = &self.prefault {
-            let wp = &self.channel_header().write_position as *const AtomicU64;
             prefault.rolled(
                 prefault::Position {
                     sequence: self.file_sequence,
@@ -1730,8 +1738,6 @@ impl Writer {
                     file_len: self.file_len,
                     region: &mut self.current_region,
                     index: self.current_region_index,
-                    // Safety: `channel_region` is handed to the prefaulter before it is dropped.
-                    write_position: unsafe { &*wp },
                 },
                 [old_channel, old_current],
                 old_file,
@@ -1774,9 +1780,12 @@ impl Writer {
         next_seq: u64,
         generation: u64,
     ) -> io::Result<(Identity, prefault::PreparedSegment)> {
+        let final_path = make_channel_file_path(&self.base_path, next_seq)?;
+        if final_path.try_exists()? {
+            return self.adopt_successor(next_seq, generation, &final_path); // installed ahead
+        }
         let identity = Identity::successor(InstanceId::fresh()?, self.instance, self.file_sequence);
         let attempt = make_attempt_path(&self.base_path, next_seq, identity.instance)?;
-        let final_path = make_channel_file_path(&self.base_path, next_seq)?;
         let segment = Self::prepare_segment_at(
             &attempt,
             next_seq,
@@ -1940,7 +1949,6 @@ impl Writer {
 
     #[inline]
     fn start_prefault(&mut self) -> io::Result<()> {
-        let wp = &self.channel_header().write_position as *const AtomicU64;
         let regions_per_file = match self.file_roll_size {
             0 => None,
             roll => Some(preallocation_len(self.region_size, roll)? / self.region_size as u64),
@@ -1961,8 +1969,6 @@ impl Writer {
                 file_len: self.file_len,
                 region: &mut self.current_region,
                 index: self.current_region_index,
-                // Safety: the header outlives the prefaulter, which is dropped first.
-                write_position: unsafe { &*wp },
             },
             self.region_size,
             regions_per_file,
@@ -2032,6 +2038,18 @@ impl Writer {
     }
 }
 
+impl Drop for Writer {
+    fn drop(&mut self) {
+        // Once the helper has stopped, nothing can install what retention deferred.
+        self.prefault = None;
+        for seq in self.deferred_prune.drain(..) {
+            if let Ok(path) = make_channel_file_path(&self.base_path, seq) {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+}
+
 // ========== Reader ==========
 
 /// Where a new [`Reader`] starts. Non-exhaustive: further modes may be added without a major
@@ -2047,8 +2065,9 @@ pub enum ReaderMode {
     /// `Live`. Opening fails with `ErrorKind::InvalidInput` if `i` is past the head, and with
     /// `ErrorKind::NotFound` if `i` is older than the earliest retained segment (pruned by
     /// `keep_files`); that error carries an [`IndexPruned`] naming the earliest retained index.
-    /// A `NotFound` without it means there is no channel at the path, or that its segments kept
-    /// disappearing under retention during the search.
+    /// A `NotFound` without it means there is no channel at the path, that its segments kept
+    /// disappearing under retention during the search, or that its first file is not published
+    /// yet (a writer is creating it, or died before publishing it; the next writer publishes it).
     ///
     /// Cost: the segment holding `i` is found by binary search over the segments' headers
     /// (one page each); inside it the reader steps over the records before `i` one header at
@@ -9044,6 +9063,91 @@ mod tests {
                 cleanup_channel_files(base);
             }
         }
+        Ok(())
+    }
+
+    /// The writer may unmap what the helper last looked at, its old header page included, while
+    /// the helper is in the middle of an iteration: the helper reads the position through its own
+    /// mapping, and only `madvise`s the writer's, so it neither faults nor fails.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_writer_unmapping_under_a_paused_helper_is_safe() -> anyhow::Result<()> {
+        let base = "test_unmap_under_paused_helper";
+        cleanup_channel_files(base);
+        let mut w = WriterBuilder::new(base)
+            .region_size(page_size())
+            .file_roll_size(page_size() as u64 * 4)
+            .keep_files(2)
+            .helper(Helper::inherit())
+            .build()?;
+        write_indexed(&mut w, 0..200)?;
+        let shared = w.prefault.as_ref().unwrap().shared.clone();
+        shared.inject.stall_mid_iteration();
+        thread::sleep(Duration::from_millis(20)); // paused with the writer's pointers in hand
+        write_indexed(&mut w, 200..20_000)?;
+        assert!(
+            shared.saturated.load(Ordering::Relaxed) > 0,
+            "the writer unmapped itself"
+        );
+        shared.inject.resume();
+        thread::sleep(Duration::from_millis(20));
+        write_indexed(&mut w, 20_000..21_000)?;
+        assert!(w.helper_error().is_none(), "{:?}", w.helper_error());
+        drop((w, shared));
+        cleanup_channel_files(base);
+        Ok(())
+    }
+
+    /// A roll size that is not a whole number of regions, and leaves the roll in the first half
+    /// of the last region, still gets its successor prepared ahead.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_unaligned_roll_size_is_prepared_ahead() -> anyhow::Result<()> {
+        for extra in [0, page_size() / 4, page_size() / 2, page_size() * 3 / 4] {
+            let base = format!("test_unaligned_roll_{extra}");
+            let base = base.as_str();
+            cleanup_channel_files(base);
+            let roll = (page_size() * 4 + extra) as u64;
+            let mut w = WriterBuilder::new(base)
+                .region_size(page_size())
+                .file_roll_size(roll)
+                .helper(Helper::inherit())
+                .build()?;
+            let shared = w.prefault.as_ref().unwrap().shared.clone();
+            let mut i = 0;
+            for _ in 0..20 {
+                // Close to the roll, then give the helper time.
+                let file = w.file_sequence;
+                while w.file_sequence == file && w.next_hdr_pos + 400 < roll as usize {
+                    write_indexed(&mut w, i..i + 1)?;
+                    i += 1;
+                }
+                assert!(until(|| lock_ready(&w)), "{extra}: installed ahead");
+                while w.file_sequence == file {
+                    write_indexed(&mut w, i..i + 1)?;
+                    i += 1;
+                }
+            }
+            assert_eq!(shared.missed.load(Ordering::Relaxed), 0, "{extra}");
+            drop((w, shared));
+            cleanup_channel_files(base);
+        }
+        Ok(())
+    }
+
+    /// An empty file at a later sequence is reported, never replaced by a new initial file.
+    #[test]
+    fn an_empty_newest_segment_is_refused_not_replaced() -> anyhow::Result<()> {
+        let base = "test_empty_newest";
+        rolled_once(base)?;
+        let seg1 = make_channel_file_path(Path::new(base), 1)?;
+        OpenOptions::new().write(true).open(&seg1)?.set_len(0)?;
+        for _ in 0..2 {
+            let err = WriterBuilder::new(base).build().err().expect("refused");
+            assert!(err.to_string().contains("is empty"), "{err}");
+            assert_eq!(std::fs::metadata(&seg1)?.len(), 0, "left as it was");
+        }
+        cleanup_channel_files(base);
         Ok(())
     }
 }

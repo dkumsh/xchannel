@@ -1,5 +1,5 @@
 //! Format v4: the header extension (instance ID, parent, publication state) and the `Roll` body
-//! that names a successor. Layout in FORMAT.md.
+//! that names a successor. Layout: FORMAT.md §3.1 (extension) and §5.1 (`Roll` body).
 
 use std::io::{self, ErrorKind};
 use std::sync::atomic::{AtomicU8, Ordering};

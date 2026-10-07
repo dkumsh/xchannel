@@ -13,16 +13,16 @@
 //! installs it under its final name, still `PREPARED`, so the writer's roll only stamps its base
 //! and publishes it. It also deletes the segments retention drops.
 //!
-//! The thread follows the writer across file rolls. Mappings the writer leaves, the old segment's
-//! included, are unmapped only here and only at the top of an iteration, before the thread reads
-//! the writer's pointers again, so a pointer it has read stays valid until it is done with it.
+//! The thread follows the writer across file rolls. It reads the writer's position through a
+//! mapping of its own, and only passes the writer's mappings to `madvise`, which reports a range
+//! unmapped meanwhile instead of faulting; so the writer may unmap anything at any time.
 //!
 //! If the thread stops early (an error, such as `EINVAL` from `madvise` before Linux 5.14, or a
 //! panic), the writer notices at its next hand-over and from then on unmaps and deletes for itself,
 //! what it queued before included, as it does without a helper.
 
 use crate::helper::{Bounded, Failure, Thread};
-use crate::region::{RegionMapping, Writable, page_size};
+use crate::region::{ReadOnly, RegionMapping, Writable, page_size};
 use crate::v4::{Identity, InstanceId};
 use crate::{
     CHANNEL_NAME_MAX, Helper, Unmap, Writer, make_attempt_path, make_channel_file_path, v4,
@@ -55,6 +55,9 @@ fn retire_bound(unmap: Unmap, regions_per_file: Option<u64>) -> usize {
         (Unmap::AtFileRoll, None) => usize::MAX,
     }
 }
+
+/// `try_lock`s the writer makes for the successor before missing it.
+const TAKE_TRIES: usize = 256;
 
 /// `in_flight` when nothing is being installed.
 pub(crate) const NONE: u64 = u64::MAX;
@@ -138,7 +141,6 @@ pub(crate) struct Shared {
     regions_per_file: Option<u64>,
     unmap: Unmap,
     pub(crate) segment: Mutex<Segment>,
-    write_position: AtomicPtr<AtomicU64>,
     current_ptr: AtomicPtr<u8>,
     current_index: AtomicU64,
     current_sequence: AtomicU64,
@@ -149,12 +151,16 @@ pub(crate) struct Shared {
     queued_files: AtomicUsize,
     /// Hand-overs the writer did itself because a queue was full.
     pub(crate) saturated: AtomicU64,
+    /// Rolls that found no successor installed ahead.
+    pub(crate) missed: AtomicU64,
     /// Set for a rolling channel: its next segment is prepared ahead.
     spec: Option<SegmentSpec>,
     /// Held only to hand a segment over; the writer only `try_lock`s it.
     pub(crate) next_segment: Mutex<NextSegments>,
     /// The newest segment the writer has rolled to, or is rolling to.
     claimed: AtomicU64,
+    /// The segment in `next_segment.ready`, or `NONE`: checked without the lock.
+    ready_sequence: AtomicU64,
     /// The segment the thread may be installing, or `NONE`. With `claimed` (both SeqCst), it
     /// keeps a late install from bringing back a segment retention has removed.
     pub(crate) in_flight: AtomicU64,
@@ -184,8 +190,7 @@ pub(crate) struct Prefaulter {
     thread: Thread,
 }
 
-/// Where the writer is. `write_position` must stay mapped until it is retired through
-/// [`Prefaulter::rolled`] or the prefaulter is dropped.
+/// Where the writer is.
 pub(crate) struct Position<'a> {
     pub(crate) sequence: u64,
     pub(crate) instance: InstanceId,
@@ -193,7 +198,6 @@ pub(crate) struct Position<'a> {
     pub(crate) file_len: u64,
     pub(crate) region: &'a mut RegionMapping<Writable>,
     pub(crate) index: u64,
-    pub(crate) write_position: &'a AtomicU64,
 }
 
 impl Prefaulter {
@@ -219,7 +223,6 @@ impl Prefaulter {
                 file: Arc::new(at.file.try_clone()?),
                 len: at.file_len,
             }),
-            write_position: AtomicPtr::new(at.write_position as *const AtomicU64 as *mut _),
             current_ptr: AtomicPtr::new(at.region.as_mut_ptr()),
             current_index: AtomicU64::new(at.index),
             current_sequence: AtomicU64::new(at.sequence),
@@ -228,6 +231,7 @@ impl Prefaulter {
                 retire_bound(unmap, regions_per_file).saturating_add(2 * SMALL_QUEUE),
             )),
             saturated: AtomicU64::new(0),
+            missed: AtomicU64::new(0),
             queued_files: AtomicUsize::new(0),
             spec,
             next_segment: Mutex::new(NextSegments {
@@ -235,6 +239,7 @@ impl Prefaulter {
                 refused: None,
             }),
             claimed: AtomicU64::new(at.sequence),
+            ready_sequence: AtomicU64::new(NONE),
             in_flight: AtomicU64::new(NONE),
             base_path,
             doomed: Mutex::new(Bounded::new(DOOMED_QUEUE)),
@@ -280,13 +285,24 @@ impl Prefaulter {
         &self,
         sequence: u64,
     ) -> Option<(Identity, PreparedSegment, Arc<File>)> {
-        let mut next = match self.shared.next_segment.try_lock() {
-            Ok(next) => next,
-            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => return None,
-        };
+        let shared = &self.shared;
+        if shared.ready_sequence.load(Ordering::Acquire) != sequence {
+            return None;
+        }
+        // The thread holds the lock only to swap a slot: a short spin, never a wait.
+        let mut next = (0..TAKE_TRIES).find_map(|_| match shared.next_segment.try_lock() {
+            Ok(next) => Some(next),
+            Err(std::sync::TryLockError::Poisoned(e)) => Some(e.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                std::hint::spin_loop();
+                None
+            }
+        })?;
         match next.ready.take() {
-            Some(n) if n.sequence == sequence => Some((n.identity, n.segment, n.worker)),
+            Some(n) if n.sequence == sequence => {
+                shared.ready_sequence.store(NONE, Ordering::Release);
+                Some((n.identity, n.segment, n.worker))
+            }
             other => {
                 next.ready = other;
                 None
@@ -296,7 +312,7 @@ impl Prefaulter {
 
     /// Whether the thread may still install segment `sequence`.
     pub(crate) fn installing(&self, sequence: u64) -> bool {
-        self.shared.in_flight.load(Ordering::SeqCst) == sequence
+        !self.shared.failure.stopped() && self.shared.in_flight.load(Ordering::SeqCst) == sequence
     }
 
     /// Delete segment `sequence` here rather than on the writer.
@@ -354,14 +370,18 @@ impl Prefaulter {
         let mut retired = lock(&self.shared.retired);
         let mut full = false;
         for l in left {
-            if !matches!(l, Left::Region(..)) {
-                if files.load(Ordering::Relaxed) >= 2 * SMALL_QUEUE {
-                    full = true;
-                    continue; // closed here
-                }
-                files.fetch_add(1, Ordering::Relaxed);
+            let file = !matches!(l, Left::Region(..));
+            if file && files.load(Ordering::Relaxed) >= 2 * SMALL_QUEUE {
+                full = true;
+                continue; // closed here
             }
-            full |= retired.push(l).is_err();
+            match retired.push(l) {
+                Ok(()) if file => {
+                    files.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(()) => {}
+                Err(_) => full = true, // released here
+            }
         }
         drop(retired);
         if full {
@@ -413,10 +433,6 @@ impl Prefaulter {
             });
             self.hand_off()
         });
-        shared.write_position.store(
-            at.write_position as *const AtomicU64 as *mut _,
-            Ordering::Release,
-        );
         shared
             .current_ptr
             .store(at.region.as_mut_ptr(), Ordering::Release);
@@ -471,6 +487,7 @@ fn run(shared: &Shared) -> io::Result<()> {
     let mut deleting = Vec::with_capacity(DOOMED_QUEUE);
     let (mut done_at, mut done_to) = ((u64::MAX, u64::MAX), 0usize);
     let mut next_head_done = (u64::MAX, u64::MAX);
+    let mut header: Option<(u64, RegionMapping<ReadOnly>)> = None;
     let (mut since, mut since_at) = (Instant::now(), (u64::MAX, 0u64));
     let mut ahead = AHEAD_MIN;
     loop {
@@ -516,11 +533,21 @@ fn run(shared: &Shared) -> io::Result<()> {
         let sequence = shared.current_sequence.load(Ordering::Acquire);
         let index = shared.current_index.load(Ordering::Acquire);
         let base = shared.current_ptr.load(Ordering::Acquire);
-        // Safety: a `write_position` the writer leaves is retired, and unmapped only at the top
-        // of a later iteration.
-        let wp = unsafe { &*shared.write_position.load(Ordering::Acquire) };
-        let pos = wp.load(Ordering::Acquire) as usize;
+        if header.as_ref().is_none_or(|(s, _)| *s != sequence) {
+            header = map_header(shared, sequence)?.map(|h| (sequence, h));
+        }
+        let Some((_, page0)) = &header else {
+            std::thread::sleep(POLL); // its handle has not been handed over yet
+            continue;
+        };
+        let pos = crate::get_channel_header(page0.as_ptr())
+            .write_position
+            .load(Ordering::Acquire) as usize;
 
+        #[cfg(test)]
+        while shared.inject.stalled_mid_iteration() && !shared.stop.load(Ordering::Acquire) {
+            std::thread::sleep(POLL);
+        }
         let elapsed = since.elapsed();
         if since_at.0 != sequence {
             (since, since_at) = (Instant::now(), (sequence, pos as u64));
@@ -542,7 +569,7 @@ fn run(shared: &Shared) -> io::Result<()> {
         }
         let target = (off + ahead).div_ceil(page).saturating_mul(page).min(size);
         if done_to < target && !base.is_null() {
-            populate(base.wrapping_add(done_to), target - done_to)?;
+            populate_writers(base.wrapping_add(done_to), target - done_to)?;
             done_to = target;
         }
         if off >= size / 2 {
@@ -553,15 +580,14 @@ fn run(shared: &Shared) -> io::Result<()> {
                 .as_ref()
                 .filter(|n| (n.sequence, n.index) == (sequence, index + 1))
                 .map(|n| n.region.as_ptr() as *mut u8);
-            // Taken by the writer or retired meanwhile, the region is still unmapped only here.
             if let Some(head) = head {
-                populate(head, ahead.min(size))?;
+                populate_writers(head, ahead.min(size))?;
                 next_head_done = (sequence, index + 1);
             }
         }
+        // Within half a region of the roll, wherever `file_roll_size` falls in its region.
         if let Some(spec) = &shared.spec
-            && shared.regions_per_file == Some(index + 1)
-            && off >= size / 2
+            && pos as u64 + size as u64 / 2 >= spec.file_roll_size
         {
             prepare_segment(shared, spec, sequence + 1, ahead)?;
         }
@@ -575,6 +601,9 @@ fn prepare_segment(
     sequence: u64,
     ahead: usize,
 ) -> io::Result<()> {
+    if shared.ready_sequence.load(Ordering::Acquire) == sequence {
+        return Ok(()); // ready; no lock, so the writer's try_lock does not collide
+    }
     {
         let mut next = lock(&shared.next_segment);
         if next
@@ -583,6 +612,7 @@ fn prepare_segment(
             .is_some_and(|n| n.sequence <= shared.claimed.load(Ordering::SeqCst))
         {
             next.ready = None; // passed by the writer
+            shared.ready_sequence.store(NONE, Ordering::Release);
         }
         if next.refused == Some(sequence)
             || next.ready.as_ref().is_some_and(|n| n.sequence == sequence)
@@ -616,6 +646,7 @@ fn prepare_segment(
             segment,
             worker,
         });
+        shared.ready_sequence.store(sequence, Ordering::Release);
     }
     #[cfg(test)]
     if shared.fail_after_install.load(Ordering::Acquire) {
@@ -708,6 +739,28 @@ fn prepare(shared: &Shared, sequence: u64, index: u64) {
         region,
     });
     drop(stale);
+}
+
+/// Page 0 of segment `sequence`, mapped from the thread's own handle, for the writer's position.
+/// `None` until the writer has handed that handle over.
+fn map_header(shared: &Shared, sequence: u64) -> io::Result<Option<RegionMapping<ReadOnly>>> {
+    let file = {
+        let segment = lock(&shared.segment);
+        if segment.sequence != sequence {
+            return Ok(None);
+        }
+        segment.file.clone()
+    };
+    RegionMapping::create_read_only(&file, 0, page_size()).map(Some)
+}
+
+/// [`populate`] a range of the writer's mappings, which it may have unmapped since: a range no
+/// longer mapped is skipped, not an error.
+fn populate_writers(at: *mut u8, len: usize) -> io::Result<()> {
+    match populate(at, len) {
+        Err(e) if matches!(e.raw_os_error(), Some(libc::ENOMEM) | Some(libc::EFAULT)) => Ok(()),
+        other => other,
+    }
 }
 
 #[cfg(target_os = "linux")]
