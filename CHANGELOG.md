@@ -1,5 +1,70 @@
 # Changelog
 
+## 7.0.0 (2026-10-07)
+
+A file roll no longer touches the filesystem on the hot thread. Each file is prepared and
+installed under its final name ahead of time, still unpublished, and the writer publishes it with
+one release store; a `Roll` names its successor exactly, so a reader takes the file its helper
+opened ahead without a `stat`. When both helpers have the next file ready, a roll makes no system
+call on the writer or the reader. **Format break:** files are `format_version = 4`; v3 files are
+refused. The Rust API is unchanged apart from one addition.
+
+_Roll measurements pending (server run in progress)._
+
+### Migration
+- **6.x and 7.0 cannot read each other's files.** Upgrade a channel's writer and all its readers
+  together, on a fresh channel path; v3 and v4 do not mix on one channel.
+- **Old captures need a 6.x build to replay.** Keep one for v3 archives.
+- A record now leaves 56 bytes free behind it in its region (room for a `Roll`), not 16, so the
+  largest payload `try_reserve` accepts for a given `region_size` is 40 bytes smaller.
+
+### Behaviour changes
+- **A new `NotFound`:** a channel whose first file is not published yet (a writer is creating it,
+  or died before publishing it, until the next writer does).
+- **Lagging readers get `NotFound` one file later.** A reader whose helper opened the next file
+  before retention deleted it reads that file too, and fails at the one after.
+- **New `InvalidData` at a roll:** a `Roll` with a bad length, CRC or reserved bytes, or a next
+  file that is not the one it names (another instance, parent, sequence, base or generation), is
+  reported instead of being followed. A channel directory copied file by file while a reader
+  follows it can now trigger this if the newest files are copied first; copy oldest first, or with
+  the writer stopped.
+- **Writer open fails closed:** a predecessor whose staged `Roll` does not name the newest file,
+  or an empty file at a later sequence, fails the open instead of being skipped or replaced.
+
+### Format (FORMAT.md)
+- **`ChannelHeaderExt`**, 64 bytes after the `ChannelHeader`: the file's random 128-bit instance
+  ID, its predecessor's ID and sequence, a CRC32C over them, and `publication_state`
+  (`PREPARED` / `PUBLISHED`). The Channel record is 192 bytes; the first record moves from offset
+  144 to 208.
+- **A `Roll` carries a 40-byte body**: the successor's sequence, instance ID and base record
+  index, with a CRC32C. A reader accepts only that file, published, continuing the numbering.
+- **Unpublished files are not history.** Live entry, seek, the head index and retention ignore a
+  newest file that is still `PREPARED`.
+- **Files are built under private names** (`<base>[.<N>].<instance>.partial`) and installed with
+  an atomic no-replace rename, so two attempts at the same file never overwrite each other.
+
+### Changed
+- **The roll** stages the whole `Roll`, publishes the successor, then commits the `Roll`. It reuses
+  the writer's mapping (no second mapping of the old file, no `dup`, no clock read), and with a
+  helper it renames, opens, maps, closes and deletes nothing.
+- **The writer's helper** installs the next file ahead under its final name, within half a region
+  of `file_roll_size` (also when that is not a whole number of regions), and closes the
+  descriptors, unmaps the regions and deletes the files the writer leaves. Its hand-overs never
+  block the writer, and its queues are bounded (a full one is done by the writer instead). It reads
+  the writer's position through a mapping of its own, so the writer may unmap anything at any
+  time.
+- **The reader's helper** opens the next file ahead and validates its header once; the reader
+  checks the committed `Roll` against it in memory.
+- **Writer recovery fails closed.** A newest file left unpublished is removed and the writer
+  resumes before it; a published one has its predecessor's staged `Roll` checked against it and
+  committed. A `Roll` that names any other file is reported as corruption instead of being
+  ignored, and recovering twice changes nothing.
+
+### Added
+- **`Writer::file_sequence()`**, the ordinal of the file being written.
+- **`examples/roll-syscalls.rs`** traces one prepared roll on each hot thread with `strace`;
+  **`examples/roll-latency.rs`** measures roll latency, against 6.3 as well.
+
 ## 6.3.0 (2026-10-06)
 
 Writers and readers can hand their mapping work to a helper thread, so the hot thread never

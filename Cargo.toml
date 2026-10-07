@@ -1,6 +1,6 @@
 [package]
 name = "xchannel"
-version = "6.3.0"
+version = "7.0.0"
 edition = "2024"
 rust-version = "1.88"
 description = "mmap-backed IPC channels with regionized layout, alignment-safe headers, and file rolling."

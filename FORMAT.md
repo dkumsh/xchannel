@@ -5,7 +5,7 @@ non-Rust implementations (readers, validators, archival tools) can interoperate
 with files produced by the Rust crate. The Rust source in `src/channel.rs`
 and `src/lib.rs` is the executable reference; this document is the contract.
 
-Status: **draft, format_version = 3.**
+Status: **draft, format_version = 4.**
 
 ---
 
@@ -30,7 +30,10 @@ Status: **draft, format_version = 3.**
   `ChannelHeader` are advisory only. When a writer publishes them it stores
   `message_count` first and `write_position` second, both with
   `memory_order_release`; a reader that needs them as a consistent pair
-  (`Live` join, §7) acquires `write_position` first.
+  (`Live` join, §7) acquires `write_position` first. A file's
+  `publication_state` (§3.1) is the other synchronization point: the writer
+  sets it with release, and a reader acquires it before trusting
+  `base_record_index`.
 
 ---
 
@@ -46,6 +49,7 @@ file 0                           file 1 (on roll)
 | region 0                 |    | region 0                 |
 |   MessageHeader(Channel) |    |   MessageHeader(Channel) |
 |   ChannelHeader          |    |   ChannelHeader          |
+|   ChannelHeaderExt       |    |   ChannelHeaderExt       |
 |   user records...        |    |   user records...        |
 +--------------------------+    +--------------------------+
 | region 1                 |    | region 1                 |
@@ -59,12 +63,15 @@ file 0                           file 1 (on roll)
 ```
 
 File names: the base file is `<base>`; rolled files are `<base>.1`,
-`<base>.2`, ... A reader follows a `Roll` marker by opening the next
-sequence number.
+`<base>.2`, ... A reader follows a `Roll` marker to the file it names
+(§5.1). A file is built under a private name, `<base>[.<N>].<instance>.partial`
+with its instance ID in 32 hex digits, and installed under its final name only
+when complete. A file under its final name may still be unpublished (§3.1):
+it is not part of the channel's history until it is published.
 
 ---
 
-## 3. ChannelHeader (format_version = 3)
+## 3. ChannelHeader (format_version = 4)
 
 Located at byte offset `16` of file region 0 (immediately after the
 `MessageHeader(Channel)` that opens region 0). Total size: 128 bytes.
@@ -73,11 +80,11 @@ Located at byte offset `16` of file region 0 (immediately after the
 |-------:|-----:|-----------------------|--------|-------------|
 |      0 |    8 | `write_position`      | u64    | Advisory: byte offset (from file start) of the next header slot to be written. Used only by `Live` reader join and writer reopen; not on the read steady-state path. |
 |      8 |    8 | `message_count`       | u64    | Advisory: count of **user** records published in *this file*. Starts at `0`; incremented once per `commit`. Does **not** count the `Channel` header or `Skip` markers. |
-|     16 |    8 | `base_record_index`   | u64    | Absolute index of this file's first user record, counted from channel genesis across all rolls. `0` for a genesis channel; immutable once the file is created. `base_record_index + message_count` is the absolute index of the next user record (the channel head). |
+|     16 |    8 | `base_record_index`   | u64    | Absolute index of this file's first user record, counted from channel genesis across all rolls. `0` for a genesis channel. Final once the file is published (§3.1), immutable after; read it only after acquiring `PUBLISHED`. `base_record_index + message_count` is the absolute index of the next user record (the channel head). |
 |     24 |    8 | `channel_sequence`    | u64    | Rolling file ordinal: `0` for `<base>`, `1` for `<base>.1`, etc. On open, readers and writers verify this equals the sequence parsed from the file's path and refuse a mismatch (catches a renamed/misplaced/swapped segment). |
 |     32 |    4 | `region_size`         | u32    | Region size in bytes. Multiple of OS page size. |
 |     36 |    4 | `mtu`                 | u32    | Max user payload bytes; `0` = unlimited. |
-|     40 |    2 | `format_version`      | u16    | This document describes version `3`. Versions `0`/`1`/`2` are earlier formats this build does not read (see §8). |
+|     40 |    2 | `format_version`      | u16    | This document describes version `4`. Versions `0`–`3` are earlier formats this build does not read (see §8). |
 |     42 |    1 | `endianness`          | u8     | `0x01` = little-endian. Other values reserved. |
 |     43 |    1 | `system_header_size`  | u8     | Size of the system-owned bytes inside `MessageHeader` (`8`). |
 |     44 |    4 | `user_header_kind`    | u32    | Reserved discriminant identifying the layout of the user-metadata bytes. Current writers emit `0` (the default `{message_type:u16, user_meta_u64:u64}` layout described in §4) and current readers refuse anything else. Non-zero values are reserved for future user-defined layouts; a Rust opt-in API for those layouts is intentionally not exposed today. Placed at this 4-aligned offset so the surrounding byte fields need no padding. |
@@ -89,10 +96,34 @@ Located at byte offset `16` of file region 0 (immediately after the
 |    104 |   16 | `_reserved2`          | u8[16] | Reserved for future additive fields. Zero-filled; readers must ignore. Additive, optional, zero-default fields may consume this space **without** a `format_version` bump; any field that changes existing semantics must bump the version. |
 |    120 |    8 | `generation`          | u64    | Opaque incarnation id for the channel, chosen at creation and stamped identically into every segment (immutable, carried across rolls, preserved when a writer reopens). `0` when unset. Distinguishes "this log continues" from "this path was deleted and recreated" — a recreated channel restarts at `channel_sequence = 0` and `base_record_index = 0`, so nothing else tells the two apart, and a persisted cursor would silently refer to unrelated data. A consumer that stores a read position should store this alongside it and treat a change as a different channel, not a gap. xchannel assigns no meaning to the value. Placed **last** so that additive fields consuming `_reserved2` from the front never move it. |
 
-The `MessageHeader(Channel)` at offset `0` covers the bytes `[16, 144)`; its
-`length` field is `128` (size of `ChannelHeader`). Its `committed` byte is
-`1`. The first user record therefore begins at file offset `align_up(16 +
-128)` = `144` (versus `80` in format_version 1).
+The `MessageHeader(Channel)` at offset `0` covers the bytes `[16, 208)`: the
+`ChannelHeader` and the `ChannelHeaderExt` after it. Its `length` field is
+`192` and its `committed` byte is `1`. The first user record therefore begins
+at file offset `208`, and a fresh file's `write_position` is `224`.
+
+### 3.1 ChannelHeaderExt
+
+At file offset `144`, 64 bytes. All of it but `publication_state` is written
+before the file is installed under its final name and never changed.
+
+| File offset | Size | Field                     | Type   | Description |
+|------------:|-----:|---------------------------|--------|-------------|
+|         144 |   16 | `file_instance_id`        | u8[16] | Opaque, nonzero, random per physical file. A file rebuilt at the same sequence gets a new one. |
+|         160 |   16 | `predecessor_instance_id` | u8[16] | The file this one follows; all zero for a channel's initial file. |
+|         176 |    8 | `predecessor_sequence`    | u64    | That file's sequence; `u64::MAX` for the initial file. Zero ID and `u64::MAX` go together. |
+|         184 |    8 | reserved                  | —      | Zero. |
+|         192 |    1 | `publication_state`       | u8     | `0` = `PREPARED`: complete, safe to open and map, not history. `1` = `PUBLISHED`: published by the writer; `base_record_index` is final. Other values are invalid. Release store by the writer, acquire load by readers. |
+|         193 |    3 | reserved                  | —      | Zero. |
+|         196 |    4 | `identity_crc32c`         | u32    | CRC32C of file bytes `[144, 184)`. |
+|         200 |    8 | reserved                  | —      | Zero. |
+
+Readers refuse a file whose extension has a zero instance ID, nonzero reserved
+bytes, a CRC mismatch, or only one of the two initial-file sentinels.
+
+CRC32C throughout is the standard Castagnoli CRC: reflected polynomial
+`0x82F63B78`, initial value and final XOR `0xFFFFFFFF`, stored little-endian.
+`"123456789"` gives `0xE3069283`. It detects torn or malformed metadata; it is
+not authentication.
 
 ---
 
@@ -123,12 +154,32 @@ user-owned bytes but must preserve the system fields at their fixed offsets.
 
 | Value | Name      | Meaning |
 |------:|-----------|---------|
-|     0 | `Channel` | First record in region 0. Followed by a `ChannelHeader`. Length = 128. |
+|     0 | `Channel` | First record in region 0. Followed by a `ChannelHeader` and a `ChannelHeaderExt`. Length = 192. |
 |     1 | `User`    | User payload record. Length = payload bytes. |
 |     2 | `Skip`    | Padding to the end of the current region. Length = bytes of padding (excluding the 16-byte header itself). Readers skip past `16 + length` bytes. |
-|     3 | `Roll`    | Last record in this file. Length = 0. Readers open the next file (`<base>.<n+1>`) and continue from offset 0. |
+|     3 | `Roll`    | Last record in this file. Length = 40 (§5.1). Readers open the file it names and continue from its offset 0. `user_meta_u64` is 0. |
 
 Other values are invalid and must cause readers to fail.
+
+### 5.1 Roll body
+
+| Body offset | Size | Field                    | Type   |
+|------------:|-----:|--------------------------|--------|
+|           0 |    8 | `next_sequence`          | u64    |
+|           8 |   16 | `next_file_instance_id`  | u8[16] |
+|          24 |    8 | `next_base_record_index` | u64    |
+|          32 |    4 | `body_crc32c`            | u32, CRC32C of body bytes `[0, 32)` |
+|          36 |    4 | reserved                 | zero   |
+
+A reader accepts the file after a committed `Roll` only if it is published,
+its `channel_sequence` is `next_sequence` (the old file's plus one), its
+`file_instance_id` is `next_file_instance_id`, its predecessor fields name the
+old file, its `base_record_index` is `next_base_record_index`, and that equals
+the old file's `base_record_index + message_count`. Generation, geometry and
+format must match too. A `Roll` with a bad length, CRC or reserved bytes is
+corruption. The successor is identified by these bytes, not by its path: a file
+a reader opened ahead remains the successor even after retention unlinks the
+name, and a file replaced at the same name is not.
 
 ---
 
@@ -196,8 +247,11 @@ well-formed (though not necessarily committed) header.
 
 ### 6.1 Region boundary
 
-If a record plus a pre-installed next-header slot does not fit in the
-remaining region, the writer publishes a `Skip` record at the current
+Every record must leave **56 bytes** free behind it in its region: room for a
+`Roll` (16-byte header, 40-byte body), so a roll can be staged at the next
+header slot whenever it happens, including a manual one. If a record plus those
+56 bytes does not fit in the remaining region, the writer publishes a `Skip`
+record at the current
 position covering the remaining bytes of the region, then begins record
 `i` at offset 0 of the next region. A `Skip` is not a user record: the
 writer advances `write_position` but does **not** increment
@@ -205,59 +259,66 @@ writer advances `write_position` but does **not** increment
 
 ### 6.2 File boundary
 
-If a record would exceed `file_roll_size`, the writer publishes a `Roll`
-record (length 0) at the current position in the old file, then begins
-record `i` at offset 0 of region 0 of file `<base>.<seq+1>`, after that
-file's `Channel` record and `ChannelHeader`.
+If a record would exceed `file_roll_size`, the writer rolls: it publishes a
+`Roll` (§5.1) at the current header slot of the old file, then begins record
+`i` at offset 208 of file `<base>.<seq+1>`.
 
-The order of a roll is part of the contract:
+A file is prepared before it is published:
 
-1. Create and fully initialise `<base>.<seq+1>` under a temporary name.
-2. Stage the `Roll` header in the old file with `committed = 0`.
-3. Rename the new file to its final name.
-4. Store `committed = 1` on the `Roll` (release).
-5. Advance the old file's `write_position` one slot **past** the `Roll`.
-6. If the writer wakes readers, increment the **old** file's `wake_word` and
-   wake its waiters, so readers asleep on it follow the `Roll` (§6.3). The
-   new file's `wake_flags` is set before step 3, so readers find it set from
-   the start.
+1. Build the successor under a private name: sized, `ChannelHeader` and
+   `ChannelHeaderExt` written (a fresh instance ID, the old file as
+   predecessor, `PREPARED`), first header slot pre-installed.
+2. Install it under its final name, atomically and never replacing an
+   existing file (`renameat2(RENAME_NOREPLACE)`, or link and unlink). If a
+   file is already there, a writer may adopt it only if it is an empty
+   `PREPARED` file naming the old file as predecessor, with the same geometry,
+   generation, MTU and name; otherwise it fails. Steps 1–2 may happen long
+   before the roll, on another thread.
 
-A reader that sees the `Roll` committed can therefore always open the next
-file. A reader that finds the next file present knows a `Roll` is at least
-staged in the old one. After step 5, the old file's `write_position - 16` is
-not a record slot at all, and when the `Roll` took the file's last slot it
-lies beyond the end of the file.
+The roll itself, in this order:
 
-**A writer that crashes mid-roll.**
+3. Stage the old file's `Roll` with `committed = 0`, its whole body written.
+4. Stamp the successor's `base_record_index` and `wake_flags`, then store
+   `publication_state = PUBLISHED` (release).
+5. Store `committed = 1` on the `Roll` (release).
+6. Store the old file's `write_position` as `roll + 16 + 56`: one slot past
+   the whole `Roll`. That is not a record slot, and may lie past the end of
+   the file.
+7. If the writer wakes readers, increment the **old** file's `wake_word` and
+   wake its waiters (§6.3).
 
-- **Before step 3:** the new file is still a temporary; the old file is
-  still the newest, and the next writer resumes in it (and removes the
-  temporary).
-- **Between steps 3 and 4:** the old file ends in a staged `Roll` that
-  nothing will commit, and the next writer opens the new file, since it is
-  the newest. So that writer must finish the roll. When it opens segment
-  `seq`, it checks segment `seq-1`, and acts only if all of these hold:
-  - `seq-1` has the same `generation`;
-  - its `base_record_index + message_count` equals `seq`'s
-    `base_record_index`, so it really is the predecessor;
-  - the slot at its `write_position - 16` is where the record chain ends,
-    uncommitted, holding a `Roll` header with length 0. The writer walks the
-    chain from the start of that slot's region to be sure, so leftover
-    payload bytes are never taken for a `Roll`.
+A committed `Roll` therefore always names a published file. A `PREPARED` file
+contributes nothing to history: no records, no tail, no seek range, no
+retention count. Retention never removes a file the writer's own preparation
+might still install.
 
-  It then commits the `Roll` and advances `write_position` past it (steps 4
-  and 5). The advance is conditional on `write_position` still pointing at
-  the staged slot, so doing this twice advances it once. A file shorter than
-  one region is not a predecessor and is never extended.
-- **Between steps 4 and 5:** `write_position - 16` is the committed `Roll`.
-  That is a valid state: readers follow the `Roll` (§7), and the recovery
-  above leaves it alone.
+**A writer that crashes mid-roll.** The next writer, before writing:
+
+- **Before step 2:** removes the private file (a startup sweep of `.partial`
+  names) and resumes in the old file.
+- **After step 2, before step 4:** the newest final file is `PREPARED`. It
+  unlinks it (never truncates it, so a reader's speculative mapping stays
+  valid) and resumes in the old file; a staged `Roll` there is overwritten by
+  the next record. The next roll prepares a new file with a new instance ID,
+  so a stale mapping of the old one can never be mistaken for it.
+- **After step 4:** the successor is published and is the newest file; the
+  writer resumes in it. It walks the old file's record chain from the region
+  `write_position` names, requires the record there to be a `Roll` whose body
+  names the successor exactly (§5.1) and whose old file is that successor's
+  predecessor, commits it if still staged, and moves `write_position` to the
+  terminal hint (steps 5–7, waking unconditionally). A `Roll` naming anything
+  else, or no `Roll`, is corruption and fails the open; it is never repaired by
+  guessing. A complete roll is left untouched, so recovering twice changes
+  nothing. A predecessor already removed by retention is not an error.
+
+A channel's initial file is installed `PREPARED` and published at once (its
+base is final at creation); the next writer publishes one left unpublished.
 
 ### 6.3 Waking readers (optional)
 
 A writer may let readers sleep instead of polling. It sets `wake_flags`
 bit 0 in every segment it creates or reopens, and after every commit (§6
-step 8) and every `Roll` (§6.2 step 6) it increments that segment's
+step 8) and every `Roll` (§6.2 step 7) it increments that segment's
 `wake_word` with release semantics and wakes all waiters. Readers only read
 the word, so they keep read-only mappings.
 
@@ -291,11 +352,15 @@ finishes it, unconditionally.
 
 ## 7. Reader algorithms (informative)
 
+Only published files are history. Every algorithm below skips a newest file
+that is still `PREPARED`, and acquires `PUBLISHED` before reading a file's
+`base_record_index`.
+
 **LateJoin:** open the earliest-sequence file, start scanning at offset 0,
 follow `Skip`/`Roll`/`Channel` records transparently, deliver `User`
 records to the application.
 
-**Live:** open the latest-sequence file, read `ChannelHeader.write_position`
+**Live:** open the latest published file, read `ChannelHeader.write_position`
 once, start scanning from the header slot at `write_position - 16`, follow
 records as above. Subsequent reads do not need `write_position`.
 
@@ -304,20 +369,21 @@ reads the pair as follows:
 
 1. Acquire `write_position` (`w`), then acquire `message_count` (`c`).
 2. **Check that this segment is still the tail.** If `<base>.<seq+1>`
-   exists, or this segment's own path no longer does, a roll has happened.
-   (Retention unlinks oldest first, so a pruned successor means this segment
-   was pruned before it.) After a roll, `w - 16` is not a record slot (§6.2
-   step 5): it may hold leftovers of an earlier payload, or lie past the end
-   of the file. Do not read it; open the newest segment instead and start
-   over. The check must come after the acquire of `w`: a roll that finished
-   before that load renamed its next segment in earlier still, so the check
-   cannot miss it.
+   exists **and is published**, or this segment's own path no longer does, a
+   roll has happened. (Retention unlinks oldest first, so a pruned successor
+   means this segment was pruned before it.) A successor that is only
+   installed, still `PREPARED`, does not count. After a roll, `w - 16` is not
+   a record slot (§6.2 step 6): it may hold leftovers of an earlier payload, or
+   lie past the end of the file. Do not read it; open the newest published
+   segment instead and start over. The check must come after the acquire of
+   `w`: the successor was published before the `Roll` was committed and `w`
+   moved past it, so the check cannot miss it.
 3. Acquire `committed` of the slot at `w - 16`.
    - **Uncommitted:** start there, at index `base_record_index + c` exactly.
      The acquire of `w` guarantees `c` is at least as new as `w`, and had
      `c` already counted the record at `w - 16`, its commit would be visible.
-   - **Committed `Roll`:** the rename and the commit both landed after the
-     check in step 2. This is terminal, not transient. Start on the `Roll`
+   - **Committed `Roll`:** the publication and the commit both landed after
+     the check in step 2. This is terminal, not transient. Start on the `Roll`
      with index `base_record_index + c`; `c` is final, since no user record
      follows a `Roll`. Do not retry: the writer is about to move
      `write_position` past it.
@@ -327,9 +393,10 @@ reads the pair as follows:
      after a bounded wait the reader counts the user records before `w - 16`
      by walking the segment instead.
 
-**Start at index `i`:** list the segments; the earliest one's
-`base_record_index` is the oldest index still retained, and the latest one's
-`base_record_index + message_count` is the head. Indices outside
+**Start at index `i`:** list the segments, leaving out a newest one that is
+still `PREPARED`; the earliest one's `base_record_index` is the oldest index
+still retained, and the latest one's `base_record_index + message_count` is
+the head. Indices outside
 `[oldest, head]` are refused. Otherwise binary-search the segments for the
 last one whose `base_record_index <= i`, then scan it from offset 0 stepping
 over records by `length` (headers only), counting `User` records, and start
@@ -348,7 +415,16 @@ transitions to `1`.
 
 ## 8. Versioning and forward compatibility
 
-xchannel 5.0 introduces `format_version = 3`, which widens `channel_name`
+xchannel 7.0 introduces `format_version = 4`, which separates a file's
+preparation from its publication: the `ChannelHeaderExt` (§3.1) after the
+`ChannelHeader`, so the Channel record is 192 bytes and the first user record
+moves from offset 144 to 208; a 40-byte `Roll` body naming the successor
+(§5.1); and every record leaving 56 bytes for a `Roll`. A v4 file under its
+final name may be unpublished, which a v3 reader would take for history, so v4
+is **greenfield**: no in-place migration, and no mixing of v3 and v4 on one
+channel. Upgrade a channel's writer and readers together, on a fresh path.
+
+xchannel 5.0 introduced `format_version = 3`, which widens `channel_name`
 from 20 to 48 bytes, taking the space from `_reserved2`. The header stays 128
 bytes and every other field — including `generation`, pinned at offset 120 —
 keeps its offset, so a v2 file is structurally readable. It is still a version
@@ -362,11 +438,10 @@ to 128 bytes (adding `base_record_index` and reserved space) and redefined
 `message_count` as a per-file user-record count. Because the header grew,
 the records area shifted (first user record at offset 144 instead of 80).
 
-Files at `format_version` `0`, `1`, or `2` are not read by this build —
-regenerate them with a 5.0 writer, or keep using an older crate version to
-read them.
+Files at `format_version` `0` to `3` are not read by this build — keep using
+an older crate version (6.x reads v3) to read them.
 
-- A reader that sees `format_version != 3` must refuse the file.
+- A reader that sees `format_version != 4` must refuse the file.
 - A reader that sees `endianness != 0x01` must refuse the file. (Only
   little-endian is defined today; values are reserved for future use.)
 - A reader that sees `user_header_kind != 0` must refuse the file unless
@@ -393,3 +468,8 @@ alternative `user_header_kind` layout must preserve them:
 6. The writer pre-installs the next header slot before committing the
    current one; readers may rely on the next slot being well-formed
    (even if `committed = 0`).
+7. Every header slot has at least 56 bytes before the end of its region, so
+   a `Roll` fits at any of them.
+8. A file is published before any committed `Roll` leads to it; its
+   identity fields never change after installation, nor its
+   `base_record_index` after publication.

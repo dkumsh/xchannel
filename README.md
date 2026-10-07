@@ -467,13 +467,14 @@ readers refuse anything else.
 
 The on-disk format is identified by `ChannelHeader.format_version`; a reader
 refuses any file whose version it does not implement. The current version is
-**3** (128-byte `ChannelHeader` with `base_record_index`, `generation` and a
-48-byte `channel_name`; see `FORMAT.md`).
+**4**: the 128-byte `ChannelHeader` followed by a 64-byte extension carrying
+each file's instance ID, its predecessor's, and a `PREPARED` / `PUBLISHED`
+state, and a `Roll` that names its successor exactly (see `FORMAT.md`).
 
-Format **3 is greenfield**, like 2 before it: files written at earlier
-versions are not read in place and there is no in-place migration.
-Regenerate channels with a current writer, or read old archives with the
-crate version that produced them.
+Format **4 is greenfield**, like 3 and 2 before it: files written at earlier
+versions are not read in place and there is no in-place migration. Upgrade a
+channel's writer and all its readers together, on a fresh channel path; read
+old archives with the crate version that produced them (6.x reads v3).
 
 ---
 
@@ -1121,10 +1122,12 @@ let mut reader = ReaderBuilder::new(path)
 
 - **The writer's helper** keeps the pages just ahead of the writer faulted
   in, maps the next region before the writer reaches it, and near the end of
-  a segment creates the next one under its `.partial` name, so a roll only
-  stamps and renames it. It also deletes the segments `keep_files` drops.
+  a segment creates the next one and installs it under its final name, still
+  unpublished, so a roll only stamps and publishes it. It also deletes the
+  segments `keep_files` drops and closes what the writer leaves.
 - **The reader's helper** maps and faults in the next region, and opens the
-  next segment ahead of the roll.
+  next segment ahead of the roll; the reader checks it against the `Roll` in
+  memory, without a `stat`.
 - **`Unmap::AtFileRoll`** keeps the regions moved past mapped until the
   segment rolls, so nothing is unmapped mid-segment.
 - **Name the core.** A thread inherits the CPU mask of the thread that
@@ -1141,8 +1144,12 @@ helpers on a third:
 | no helpers | 4.4 µs | 6.4 µs | 994 | 2.8 ms |
 | both helpers, `Unmap::AtFileRoll` | 393 ns | 597 ns | 5 | 113 µs |
 
-A roll still renames the new segment on the writer's thread, tens of
-microseconds once per segment.
+When both helpers have the next segment ready, a roll makes no system call
+on the writer or the reader (`examples/roll-syscalls.rs` traces it; with
+`wake_readers` the writer makes its one futex wake). Without a helper, or when
+it falls behind, the hot thread prepares, opens and maps it itself, as before.
+
+_Roll measurements pending (server run in progress)._
 
 The helpers are Linux only and need kernel 5.14+ for `MADV_POPULATE_*`. On
 an older kernel a helper stops at once, `helper_error()` says why, and the
@@ -1165,9 +1172,11 @@ demo.xch.2
 
 Process:
 
-1. writer creates the next file under a `.partial` name (ahead of time, with a helper)
-2. writer writes the **Roll marker**, renames the next file into place, and commits the marker
-3. readers follow automatically
+1. the next file is built under a private name and installed under its final
+   name, unpublished (ahead of time, by the writer's helper)
+2. the writer stages the **Roll marker** naming that file, publishes the file,
+   and commits the marker
+3. readers follow automatically, to exactly the file the marker names
 
 ---
 
