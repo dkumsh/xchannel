@@ -23,6 +23,7 @@ mod helper;
 mod map_ahead;
 mod prefault;
 mod region;
+mod v4;
 mod wake;
 
 use channel::{
